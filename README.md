@@ -21,7 +21,12 @@ system design, including:
 - The X3DH-over-OpenPGP session establishment handshake.
 - The Double Ratchet message layer and key lifecycle (what's single-use,
   what's rotated, what's discarded, and when).
-- Client architecture (Tauri + Rust) and threat model.
+- Peer identity verification via in-person QR exchange or a remote
+  single-use pairing code (`username#NNNN` addressing).
+- Per-conversation message recovery — off by default, opt-in only with
+  mutual consent from both participants.
+- Client architecture (Tauri + Rust, one codebase for Windows/macOS/Linux)
+  and threat model.
 
 ## License
 

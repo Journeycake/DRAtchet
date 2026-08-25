@@ -46,6 +46,10 @@ per-message asymmetric operation.
    auditable, exportable, and interoperable with existing OpenPGP tooling),
    but never as a per-message bottleneck.
 6. Native desktop app on Windows, macOS, Linux from one codebase.
+7. Peer identity is authenticated out-of-band (in-person QR, or a remote
+   single-use pairing code) rather than trusted on lookup alone.
+8. Message history is unrecoverable by default; recovery is only ever an
+   explicit, mutual, per-conversation opt-in.
 
 ## 3. Cryptographic protocol
 
@@ -108,20 +112,48 @@ Once the root key exists, per-message crypto is entirely symmetric:
 | One-time prekey | Single session handshake | Immediately after session establishment |
 | DH ratchet keypair | Until the peer's next reply | Replaced by next DH ratchet step |
 | Per-message symmetric key | Single message | Immediately after that message is encrypted/decrypted |
+| Remote pairing code (§6.4) | Single verification attempt, ~10 min TTL | On first successful match, or expiry — whichever first |
+| Conversation recovery key (§7, opt-in only) | Life of the conversation's recoverable-mode setting | Only if recovery is later disabled *and* the user explicitly deletes backups; otherwise persists by design |
 
-### 3.5 OpenPGP wire-format decision
+### 3.5 Message wire format: full OpenPGP vs. lightweight custom envelope
 
-Recommendation: use **OpenPGP key formats** (RFC 9580 packets) for identity
-keys, signed prekeys, and one-time prekeys — so keys are portable/inspectable
-and could interoperate with existing OpenPGP tooling for identity purposes.
-Message payloads themselves use a lightweight custom envelope (ratchet
-header + AEAD ciphertext), *not* OpenPGP's own public-key-encrypted-session-key
-packet per message — wrapping every message in full OpenPGP would reintroduce
-the per-message asymmetric-op cost problem this design exists to avoid. Flag
-this as an open decision if full OpenPGP wire compatibility for message
-bodies turns out to be a hard requirement — it's possible but meaningfully
-more expensive and still needs a ratchet-derived session key underneath to
-stay queue-depth-safe.
+Two different things can be "OpenPGP" here, and it's worth separating them:
+**key material** (identity keys, prekeys — already specified as OpenPGP
+packets in §3.1/3.2) vs. **message bodies** (the ciphertext for an individual
+chat message). This section is only about the latter.
+
+**Full OpenPGP wire format** means every message is itself a valid OpenPGP
+message: a Public-Key Encrypted Session Key (PKESK) packet (or, to actually
+carry a ratchet-derived key, a repurposed Symmetric-Key Encrypted Session Key
+/ SKESK packet) followed by a Symmetrically Encrypted Integrity Protected
+Data (SEIPD) packet per RFC 9580 — the same packet structure as a `.pgp`
+file GnuPG produces.
+
+**Lightweight custom envelope** means a minimal, application-defined
+structure: a fixed ratchet header (sender's current DH public key, message
+number `N`, previous chain length `PN`) followed by an AEAD ciphertext +
+tag. Nothing about it is OpenPGP-packet-shaped; only the *keys* (§3.1/3.2)
+are OpenPGP objects.
+
+| | Full OpenPGP wire format | Lightweight custom envelope |
+|---|---|---|
+| **Per-message overhead** | Multiple packet headers + MPI-encoded fields — noticeably larger than the payload for short chat messages | Fixed ~40–50 byte header (32-byte pubkey + two counters) + ciphertext + 16-byte tag — minimal |
+| **Where ratchet metadata lives** | No natural home — the DH pubkey/counters would have to be smuggled into Notation Data subpackets or a custom packet type, which itself breaks strict standard-compliance | First-class fields in a header designed exactly for what Double Ratchet needs |
+| **Real interoperability** | Looks standard, but a generic OpenPGP/GnuPG client still can't decrypt it — the "session key" is ratchet-derived, not produced by a normal public-key encryption step, so the compatibility is mostly cosmetic | None claimed — doesn't pretend to be readable by outside tools |
+| **Parsing surface / attack surface** | Larger — full packet parser, MPI decoding, subpacket handling per message | Small, fully controlled, easy to fuzz/test exhaustively |
+| **Engineering cost** | Reuses a standardized format for *framing*, but key derivation is custom either way — you inherit format complexity without shedding protocol-design responsibility | Faster to implement correctly; entire format fits in a page |
+| **Future flexibility** | If a hard requirement later appears to bridge to PGP/MIME email or produce gpg-decryptable archives, this gets partway there | Would need a translation layer built later if that requirement ever appears |
+| **Tooling** | Can reuse existing OpenPGP packet inspectors for debugging | Debug/inspection tooling must be custom-built (small effort given the format's size) |
+
+**Recommendation (decided, revisit only if a concrete interop requirement
+appears):** OpenPGP packet format for identity keys and prekey bundles
+(§3.1/3.2), lightweight custom envelope for message bodies. The claimed
+interoperability benefit of full OpenPGP message framing is largely
+illusory — a stock OpenPGP client still can't decrypt a ratchet-derived
+session key — so it doesn't justify the extra size, parsing surface, and
+awkward header-metadata fit. Message bodies never leave the app anyway
+(they're deleted from the ratchet the instant they're used, per §3.4), so
+there's no real-world scenario where a generic PGP tool needs to read one.
 
 ## 4. System architecture
 
@@ -141,8 +173,11 @@ stay queue-depth-safe.
 
 ## 5. Client / platform architecture
 
-Recommendation: **Tauri (Rust core) + web-based UI**, one codebase for
-Windows/macOS/Linux.
+**Decided:** one stack, one codebase, for all three target platforms —
+**Tauri (Rust core) + web-based UI**, shipping natively on Windows, macOS,
+and Linux. No per-OS fork and no separate Electron track; platform
+differences are handled as integration details within the single core, not
+as different stacks.
 
 - Rust core handles all cryptography and ratchet state — no crypto in the UI
   layer. Candidate crates: `sequoia-openpgp` (OpenPGP identity/prekeys),
@@ -160,8 +195,147 @@ Windows/macOS/Linux.
 - IPC between the web UI and Rust core stays within Tauri's command bridge;
   the UI never handles raw key material, only decrypted message text and
   metadata.
+- **Per-platform integration points** (same core logic, different OS glue):
+  - *Windows*: DPAPI-backed secret storage; camera access for QR scanning
+    (§6) via the WebView2 webview's `getUserMedia`.
+  - *macOS*: Keychain Services-backed secret storage; camera access via
+    WKWebView's `getUserMedia` (requires the standard camera-usage
+    entitlement/Info.plist string).
+  - *Linux*: Secret Service API (libsecret) for secret storage; camera
+    access via WebKitGTK's `getUserMedia`. Caveat: not every Linux desktop
+    environment runs a Secret Service provider by default (minimal window
+    managers, some headless/remote setups) — the client needs a graceful
+    fallback (e.g., a local passphrase-derived key-encryption-key) rather
+    than failing to start when libsecret is unavailable.
+  - QR display/scanning itself needs no native camera code on any platform
+    — a webview `getUserMedia` call plus in-app QR encode/decode (pure
+    Rust or JS library) covers all three.
 
-## 6. Threat model
+## 6. Identity addressing & peer authentication
+
+### 6.1 Addressing: `username#NNNN`
+
+Each account has a self-chosen **username** plus a server-assigned random
+**4-digit discriminator**, e.g. `alice#4821` — regenerated on collision
+within that username (Discord's original scheme). The directory server maps
+`username#NNNN` → account ID → current prekey bundle (§3.2). This address is
+how you *locate* someone's prekey bundle; it is **not** proof of who
+controls it — the server could in principle be compromised or coerced into
+serving a substituted bundle, which is exactly what §6.2 defends against.
+(Namespace note: a 4-digit discriminator caps a single username at 10,000
+accounts before it runs out — fine at the scale this project is targeting;
+flagged in §9 as revisitable if that ever becomes a real constraint.)
+
+### 6.2 Trust levels
+
+Every contact is either:
+
+- **Unverified** (default, TOFU — trust-on-first-use): the client has a
+  prekey bundle for `username#NNNN` fetched from the directory server, but
+  its fingerprint hasn't been independently confirmed. The UI should flag
+  this clearly (a persistent banner in the conversation, similar to Signal's
+  unverified-safety-number indicator) without blocking sending — flagging
+  risk beats blocking usability.
+- **Verified**: the identity key's fingerprint has been confirmed through
+  one of the two paths below, and is pinned locally. If the peer's identity
+  key later changes, the contact reverts to "unverified — identity changed"
+  and must be re-verified, the same way Signal treats a safety-number change.
+
+### 6.3 Path 1 — in-person QR exchange (strongest)
+
+Each device can render a QR code encoding `username#NNNN` + the SHA-256
+fingerprint of its current identity key (+ a short random nonce so a stale
+photographed code is visibly different from a fresh one). Both people scan
+each other's codes in the same physical session; each client compares the
+scanned fingerprint against the bundle it already has (or fetches fresh) for
+that address — match marks the contact **Verified**; mismatch is a hard
+stop, never silently marked verified. Because the fingerprint came straight
+from a physically-present device, this path doesn't need to trust the
+directory server at all — it's the strongest of the two.
+
+### 6.4 Path 2 — remote pairing via username + single-use code
+
+For contacts who aren't in the same room:
+
+1. Initiator looks up `username#NNNN` on the directory server and fetches
+   the prekey bundle — this alone is TOFU, no stronger than any first
+   contact today.
+2. The recipient's app generates a random, single-use, short-TTL numeric
+   pairing code (e.g. 6 digits, ~10-minute expiry; generating a new one
+   invalidates the previous code).
+3. The recipient reads that code to the initiator over a channel they
+   already trust more than the directory server (phone call, an existing
+   verified DRAtchet conversation, in person, etc.) — the code is the "MFA"
+   factor here: proof that the person on the other end of that channel
+   currently controls the account, demonstrated by generating and reading
+   it out.
+4. The initiator enters the code in-app. The client sends it back bound to
+   the current handshake's key material (so it can't be replayed against a
+   different session); the recipient's device checks the match, and both
+   sides are marked **Verified**.
+5. The code is consumed (deleted) on first successful match or on expiry,
+   whichever comes first; a fresh code is required for another attempt, and
+   attempts are rate-limited — a 6-digit space is brute-forceable without
+   that limit.
+
+Be precise about what this does and doesn't prove: it authenticates that
+whoever generated the code controls the account being paired with, and its
+security rests entirely on the secrecy/integrity of whatever side channel
+carried the code — the same property Signal's "compare safety number over a
+phone call" verification has. It is not stronger than the channel used to
+convey the code.
+
+## 7. Per-conversation message recovery
+
+**Default: unrecoverable.** Pure Double Ratchet behavior from §3.3 — every
+message key is deleted immediately after one use, nothing is escrowed or
+backed up anywhere. Losing a device loses that conversation's history from
+that point on; this is forward secrecy working as intended, not a missing
+feature.
+
+**Opt-in recoverable mode**, negotiated per conversation, requires
+**mutual** consent:
+
+- Either participant can *propose* enabling recovery (a signed in-app
+  proposal message). Recovery activates only once **both** sides explicitly
+  accept — if only one side agrees, the conversation stays unrecoverable
+  (the default holds, per the requirement that it takes both parties).
+- Either side can later revoke consent, stopping backup for *future*
+  messages. Revoking does not retroactively delete what's already been
+  backed up — say this plainly in the UI, and offer a separate "delete my
+  backups for this conversation" action rather than implying revoke does it
+  automatically.
+
+**Mechanism**, once mutually enabled — deliberately layered *on top of* the
+ratchet rather than changing it:
+
+- The normal ratchet encrypt/decrypt path (§3.3) is untouched — per-message
+  keys are still single-use and discarded exactly as in the default case.
+- A separate **conversation recovery key** is derived once, at the moment
+  both sides confirm opt-in, via HKDF over fresh randomness contributed by
+  *both* sides (so neither party unilaterally controls it) plus the current
+  root key.
+- After the normal send/receive path completes, each client additionally
+  encrypts the plaintext under the conversation recovery key (AEAD) and
+  uploads that ciphertext to a backup store. This keeps forward secrecy
+  intact for the live ratchet layer — recoverability is an explicit, opted-in
+  second copy, not a weakening of the ratchet itself.
+- The conversation recovery key must itself survive a lost device to be
+  useful, which means it needs to be escrowed somewhere. Two options,
+  covered in §9 as an open decision:
+  a. **Self-custodied recovery phrase** (BIP39-style words), shown once,
+     stored by the user — the server never holds anything decryptable.
+     Strongest privacy, worst UX (permanently lost if the user loses it).
+  b. **Server-escrowed, passphrase-protected** blob (Argon2id-derived key,
+     Signal-SVR/WhatsApp-backup-key style) — better UX, but needs a
+     rate-limited, tamper-resistant attempt counter (typically an HSM/secure
+     enclave) to resist offline brute force against the escrowed blob —
+     nontrivial infra.
+  - Recommendation for v1: (a), self-custodied — no secure-enclave
+    infrastructure required to ship; revisit (b) later if user demand for
+    better recovery UX justifies building that infra.
+
+## 8. Threat model
 
 In scope:
 - Passive network eavesdropping.
@@ -177,26 +351,40 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
 - Metadata protection (who talks to whom, timing) — would need sealed-sender
   style techniques later.
 - Multi-device and group messaging (see Roadmap).
+- Recoverable-mode conversations (§7) intentionally accept a narrower threat
+  model by design and by mutual consent: a durable, decryptable-with-the-
+  recovery-key copy of plaintext exists somewhere once both sides opt in.
+  That's a deliberate trade the *users* made for that conversation, not a
+  general weakening of DRAtchet's default guarantees — the UI must state
+  this plainly at the moment of opt-in, not just in this document.
+- Peer-authentication paths (§6) are only as strong as their inputs: Path 1
+  is strong (physical presence); Path 2 is only as strong as the side
+  channel used to convey the pairing code. Neither path protects a user who
+  verifies against a channel an attacker also controls.
 
-## 7. Roadmap
+## 9. Roadmap
 
 1. **v0 — crypto core**: identity keys, X3DH handshake, Double Ratchet
    engine, unit + property tests (including out-of-order/skipped-key tests
    simulating queue depth), no UI.
 2. **v1 — desktop MVP**: Tauri app, 1:1 chat only, relay server, local
-   encrypted storage, manual fingerprint verification (safety-number style).
+   encrypted storage, QR and remote-pairing-code verification (§6),
+   per-conversation opt-in recovery with self-custodied recovery phrase (§7).
 3. **v2**: multi-device support, group chat (sender-keys), prekey bundle
-   auto-replenishment, push notifications.
+   auto-replenishment, push notifications, optional server-escrowed
+   passphrase-protected recovery (§7 option b).
 
-## 8. Open decisions for confirmation
+## 10. Open decisions for confirmation
 
-- Full OpenPGP wire compatibility for *message bodies* (not just identity),
-  vs. the lighter custom envelope recommended above — recommend the latter
-  unless interop with existing PGP/GPG clients for message content is a hard
-  requirement.
-- Tauri/Rust vs. Electron/TypeScript (with `openpgp.js`) — recommend Tauri/
-  Rust for the reasons in §5; Electron is faster to prototype in JS but has
-  a weaker track record on crypto-safe defaults and ships a much larger
-  binary.
+- Recovery-key escrow: self-custodied recovery phrase (recommended for v1)
+  vs. server-escrowed passphrase-protected blob (§7) — the latter needs
+  secure-enclave-backed rate limiting to be safe, deferred to v2 pending
+  demand.
+- Discriminator namespace: 4 digits (10,000 accounts/username) is the
+  Discord-style default requested; revisit only if a username's collision
+  rate becomes an actual product problem.
+- Pairing-code parameters (§6.4): code length (6 digits assumed), TTL
+  (~10 minutes assumed), and attempt rate limit — reasonable defaults
+  chosen, tune once there's real usage data.
 - Relay server hosting model (self-hosted vs. managed) — not yet decided,
   doesn't block crypto-core work.
