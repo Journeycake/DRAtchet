@@ -27,12 +27,24 @@ for v1 rather than four, per the open decision in `ARCHITECTURE.md` §10:
    clients can establish a direct Tier 0 connection.
 3. Tier 1 mailbox: hold ratchet message envelopes transiently (TTL'd) when
    the recipient isn't reachable for direct delivery (`ARCHITECTURE.md`
-   §4.2).
+   §4.2), addressed by the per-conversation-direction `mailbox_id`
+   described there — not a per-device inbox (see `ARCHITECTURE.md` §11.1
+   for why).
 4. **Presence**: track and broadcast online/offline status to verified
    contacts — the new piece this section specifies.
 
 None of these require the service to see plaintext, ratchet state, or
 long-term private key material.
+
+**Abuse resistance is part of this job list, not an afterthought:**
+one-time prekeys (job 1) are consumed per session-establishment attempt, so
+the service should rate-limit prekey fetches per requesting identity —
+otherwise a malicious actor can repeatedly initiate handshakes against a
+victim to exhaust their published one-time prekeys, forcing later real
+handshakes to silently degrade to X3DH-without-a-one-time-prekey (weaker
+forward secrecy on that session's setup, per the optional field in §3 of
+`MESSAGE_SCHEMA.md`). See `ARCHITECTURE.md` §11.8 for the fuller treatment,
+including account-registration abuse (username squatting).
 
 ### 1.2 Connection & authentication
 

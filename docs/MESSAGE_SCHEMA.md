@@ -67,7 +67,16 @@ sent in clear text. This is the standard Double Ratchet trade-off: `dh_pub`,
 wire, including a relay if one is in the path. That's a metadata leak
 (reveals turn-taking and rough message volume, though not content), tracked
 as a known gap in `ARCHITECTURE.md` §8 and as an open decision (header
-encryption, §9 below) rather than solved here.
+encryption) in `ARCHITECTURE.md` §10, rather than solved here.
+
+**Padding:** plaintext is padded to a fixed bucket size before encryption
+— e.g. the next multiple of 160 bytes, up to a cap, beyond which it pads to
+the next larger bucket — so `ciphertext_len` doesn't directly reveal exact
+message length (distinguishing a one-word reply from a longer message by
+size alone, or fingerprinting content by its exact byte count). Padding is
+stripped after decryption and never transmitted as a separate field — it's
+just part of what gets encrypted. Inspired by Signal's message padding;
+see §11.3 of `ARCHITECTURE.md` for the full rationale.
 
 **Nonce:** not transmitted. The AEAD encryption key *and* the 12-byte nonce
 are both derived from the per-message key via HKDF (`HKDF(message_key) →

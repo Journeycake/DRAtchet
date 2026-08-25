@@ -37,6 +37,9 @@ storage). Highlights:
   participants themselves control rather than a DRAtchet-run service.
 - Client architecture (Tauri + Rust, one codebase for Windows/macOS/Linux)
   and threat model.
+- Security hardening pulled from prior art: Signal (sealed sender, message
+  padding, PQXDH, Key Transparency), Apple iMessage's PQ3, Briar (Tor-based
+  P2P, panic response), and OTR (message deniability).
 
 ## License
 

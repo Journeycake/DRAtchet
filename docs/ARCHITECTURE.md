@@ -161,6 +161,9 @@ awkward header-metadata fit. Message bodies never leave the app anyway
 (they're deleted from the ratchet the instant they're used, per §3.4), so
 there's no real-world scenario where a generic PGP tool needs to read one.
 
+There's a second reason to prefer AEAD over an OpenPGP-signed message that
+has nothing to do with size: **deniability**. See §11.6.
+
 ## 4. System architecture: a serverless-first, tiered model
 
 The earlier draft assumed a single always-present relay server doing three
@@ -197,6 +200,11 @@ schemas referenced below are in
   this path holding ciphertext, so there's nothing to recover from if a
   device is lost. This is the mode the task description means by "even if
   that means foregoing the possibility of recovering messages."
+- **Trade-off worth naming plainly: direct P2P reveals IP addresses between
+  the two people talking**, unlike a centrally-routed service (Signal,
+  WhatsApp) where users never learn each other's IP. This is the flip side
+  of removing the server from the path — see §11.2 for the mitigation
+  (a user-facing toggle to force relaying even when direct is possible).
 
 ### 4.2 Tier 1 — ephemeral relay-assisted (pragmatic default)
 
@@ -211,12 +219,16 @@ without becoming a durable archive.
 - Holds ciphertext **transiently**: short TTL (days, not months) and/or
   auto-wipe on delivery acknowledgment — a mailbox, not an archive. The
   relay envelope wraps the opaque ratchet message envelope with only
-  routing metadata: an opaque `mailbox_id` (a rotating per-device id,
-  deliberately not the username, to limit long-term correlation), a TTL,
-  and a delivery token. This wrapper is a thin, tier-specific addition on
-  top of the ratchet message envelope defined in §2 of
-  `MESSAGE_SCHEMA.md`, which stays identical across all tiers — the relay
-  never needs to understand it, only pass it along.
+  routing metadata: a `mailbox_id`, a TTL, and a delivery token. `mailbox_id`
+  is **not** a static per-device inbox — it's derived per conversation
+  *direction* from ratchet state (`HKDF(root_key, "mailbox" ‖ direction)`,
+  rotating in step with the DH ratchet) — see §11.1 for why: a static
+  per-device id would let the relay trivially see "how many distinct
+  contacts write to this device," which a derived, unguessable-without-the-
+  handshake id avoids. This wrapper is a thin, tier-specific addition on
+  top of the ratchet message envelope defined in §2 of `MESSAGE_SCHEMA.md`,
+  which stays identical across all tiers — the relay never needs to
+  understand it, only pass it along.
 - This is the recommended **default** for v1: pure Tier 0 is more
   privacy-strict but has a materially worse offline-delivery experience for
   an MVP; Tier 1's relay never sees plaintext or ratchet state and holds
@@ -444,7 +456,13 @@ In scope:
 - A compromised or malicious Tier 1 relay, or a compromised signaling/
   directory service (§4) — neither ever sees plaintext, ratchet state, or
   long-term key material; the relay's ciphertext access is also
-  time-bounded by its TTL (§4.2), not indefinite.
+  time-bounded by its TTL (§4.2), not indefinite, and its ability to link
+  mailbox writes to a specific device is reduced (not eliminated — see
+  §11.1) by deriving `mailbox_id` from ratchet state instead of using a
+  static per-device value.
+- A recipient being unable to prove message authorship to a third party
+  even if they wanted to — the AEAD-based message authentication (§3.5)
+  is deniable by design, the same property OTR pioneered; see §11.6.
 - A TURN relay (Tier 0/1 NAT-traversal fallback) seeing encrypted traffic
   metadata (packet timing/size) without seeing content — tracked as a
   metadata concern, not a content-confidentiality one (see below).
@@ -473,6 +491,11 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
   plaintext — contained to whichever user's store it is under the
   recommended per-participant model, but see `SERVERS.md` §2.3 for the
   cross-party hosting case where that containment breaks down.
+- **Tier 0 IP exposure between contacts** (§4.1, §11.2): accepted as the
+  default trade of a serverless P2P design, mitigated but not eliminated by
+  the v1 always-relay toggle — a user who hasn't enabled it is knowingly (if
+  the UI states it clearly) trading IP privacy for the latency/no-third-party
+  benefits of direct P2P.
 - Multi-device and group messaging (see Roadmap).
 - Recoverable-mode conversations (§7) intentionally accept a narrower threat
   model by design and by mutual consent: a durable, decryptable-with-the-
@@ -492,16 +515,25 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
    unit + property tests (including out-of-order/skipped-key tests
    simulating queue depth), no UI, no transport yet.
 2. **v1 — desktop MVP**: Tauri app, 1:1 chat only, Tier 1 delivery
-   (ephemeral relay-assisted, §4.2) as the default with Tier 0 direct P2P
-   attempted first when reachable, the Signaling & Presence Service
-   (`SERVERS.md` §1, combined with the Tier 1 mailbox for v1 simplicity),
-   local encrypted storage, QR and remote-pairing-code verification (§6),
+   (ephemeral relay-assisted, §4.2, using ratchet-derived `mailbox_id`s per
+   §11.1) as the default with Tier 0 direct P2P attempted first when
+   reachable, the Signaling & Presence Service (`SERVERS.md` §1, combined
+   with the Tier 1 mailbox for v1 simplicity, prekey-fetch rate limiting
+   and registration proof-of-work per §11.8), local encrypted storage, QR
+   and remote-pairing-code verification (§6), message padding (§11.3),
+   an "always relay, never direct-connect" per-contact privacy toggle
+   (§11.2), per-conversation disappearing-message timers (§11.5),
    per-conversation opt-in Tier 2 recovery with a self-custodied recovery
    phrase, deployment profile A — the purpose-built server (§7,
    `SERVERS.md` §2.1).
-3. **v2**: multi-device support, group chat (sender-keys), prekey bundle
+3. **v2**: multi-device support, group chat (MLS/RFC 9420-style group key
+   management — TreeKEM's tree-based scaling is the better-established
+   approach today vs. naive pairwise sender-keys fan-out), prekey bundle
    auto-replenishment, push notifications, optional managed/server-escrowed
-   passphrase-protected recovery option (§7 option b, §4.3).
+   passphrase-protected recovery option (§7 option b, §4.3), post-quantum
+   hybrid handshake (§11.4).
+4. **Research track, not scheduled**: Tor/onion-routed transport (§11.2),
+   key transparency for the directory (§11.7), duress response (§11.9).
 
 ## 10. Open decisions for confirmation
 
@@ -543,3 +575,184 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
   `SERVERS.md`, recommended for v1 — better delete/rate-limit control) vs.
   direct S3-compatible bucket writes (§2.2, zero custom server code) —
   worth offering both eventually; v1 ships profile A first.
+
+## 11. Security hardening: lessons from prior art
+
+A pass through what other secure-messaging systems do differently, each
+tied to a specific gap in the design above rather than adopted for its own
+sake. Dispositions are marked **v1**, **v2**, **research**, or
+**documentation-only** (no protocol change, just stating an existing
+property explicitly).
+
+### 11.1 Sender unlinkability at the Tier 1 mailbox — inspired by Signal's *sealed sender* — **v1**
+
+Gap: as originally described, a device's Tier 1 mailbox was a static
+per-device `mailbox_id`. Even though the relay never sees plaintext, a
+static id lets it observe *how many distinct contacts write to a given
+device and how often* — real metadata, not nothing. Signal's sealed-sender
+design solves an adjacent problem (the server shouldn't need to know who's
+sending) using server-issued unlinkable certificates; DRAtchet doesn't need
+that machinery because it's not trying to hide sender identity from the
+*recipient*, only from the *relay*.
+
+Adopted fix (already folded into §4.2 above): `mailbox_id` is derived from
+ratchet state — `HKDF(root_key, "mailbox" ‖ direction)` — rotating in step
+with the DH ratchet rather than being a fixed per-device value. Writing to
+a mailbox requires having done the X3DH handshake that produced the root
+key; the relay can't compute it from the outside and can't tell that two
+different `mailbox_id`s at different times belong to the same device.
+Residual gap, stated plainly rather than overclaimed: connection-level
+metadata (source IP, timing) can still let a relay operator correlate
+writes even without a stable id — this is a partial mitigation, not
+sealed-sender's full guarantee, and doesn't need Signal's server-issued
+certificate infrastructure to deliver most of the benefit.
+
+### 11.2 Direct-P2P IP exposure between contacts — inspired by Briar (Tor-based P2P) vs. Signal/WhatsApp's always-relayed model — **v1 (toggle), research (Tor transport)**
+
+Gap, stated plainly in §4.1: Tier 0 WebRTC gives each side the other's IP
+(or the TURN relay's, if NAT traversal falls back to relaying). Centrally
+routed services never expose this between users; a serverless P2P design
+inherently can, unless every connection is forced through a relay.
+
+- **v1**: a user-facing, per-conversation-or-global toggle — "always relay,
+  never connect directly to this contact" — forces every ICE negotiation to
+  use TURN even when a direct path is available, masking IP behind the TURN
+  operator at a bandwidth/latency cost. Direct precedent: Signal ships
+  exactly this as a calls-privacy setting ("Always Relay Calls"), for
+  exactly this reason. Default **off** (best latency, matches the
+  serverless-P2P default elsewhere), opt-in per contact.
+- **Research, not v1**: Tor/onion-routed transport (Briar's approach — no
+  central server at all, direct connections over Tor hidden services) would
+  close the gap without needing to trust a TURN operator either. Realistic
+  in Rust via `arti` (the native Rust Tor implementation), but real latency
+  and engineering cost — worth a dedicated spike once the base protocol and
+  Tier 0/1 delivery are solid, not before.
+
+### 11.3 Message padding — inspired by Signal's padding scheme — **v1**
+
+Gap: the ratchet envelope's `ciphertext_len` (§2 of `MESSAGE_SCHEMA.md`)
+exposed exact plaintext length before this pass — enough to distinguish a
+one-word reply from a paragraph, or fingerprint content by size, without
+breaking confidentiality of the content itself.
+
+Adopted fix (folded into `MESSAGE_SCHEMA.md` §2): pad plaintext to a fixed
+bucket size before encryption, same approach Signal uses. Cheap, mechanical,
+no protocol-version implications — there's no reason this waits for v2.
+
+### 11.4 Post-quantum hybrid handshake — inspired by Signal's PQXDH and Apple iMessage's PQ3 — **v2, design-now**
+
+Gap: X3DH's session establishment (§3.2) is pure classical ECDH
+(Curve25519). A passive adversary recording today's handshake traffic could
+decrypt it later once cryptographically relevant quantum computers exist
+("harvest now, decrypt later") — the initial key agreement is the part of
+Double-Ratchet-family protocols most exposed to this, since it happens once
+and its output seeds everything downstream. Signal shipped **PQXDH**
+(hybrid X25519 + ML-KEM-768) in 2023; Apple's **PQ3** (2024) goes further
+with periodic post-quantum rekeying through the session, not just at setup.
+
+- **v2**: adopt a PQXDH-style hybrid handshake — combine the existing X25519
+  DH outputs with an ML-KEM-768 encapsulation via concatenated HKDF, so
+  security only *improves* relative to classical-only X3DH (a break of one
+  primitive doesn't break the handshake, since both contribute to the root
+  key).
+- **Design now, so v2 isn't a breaking change**: reserve the `version` byte
+  in the ratchet envelope (§2 of `MESSAGE_SCHEMA.md`) and structure the
+  root-key HKDF to accept an additional input cleanly, so adding the PQ term
+  later doesn't force a second protocol-version fork on top of the one v2
+  will already need for multi-device/groups.
+- **Further out, not currently scoped**: PQ3's periodic-rekeying-through-
+  the-session idea (vs. PQ only at handshake time) is a real hardening step
+  beyond PQXDH parity — worth revisiting once the v2 hybrid handshake has
+  shipped and proven out.
+
+### 11.5 On-device message retention — inspired by Signal/WhatsApp/Telegram disappearing messages — **v1**
+
+Gap, currently unaddressed by anything else in this document: the Double
+Ratchet's forward secrecy protects against a *future* key compromise, but
+says nothing about the plaintext that's already been decrypted and sits in
+the local SQLCipher-encrypted database (§5) once a conversation has history.
+An unlocked device, or a compromised local database key, exposes all
+retained history regardless of how aggressively ratchet keys themselves get
+discarded — a different threat than anything §3.4's key-lifecycle table
+covers, because it's about the *client's own* durable copy, not a
+third party's.
+
+- **v1**: per-conversation disappearing-message timer, user-configurable,
+  default "keep until manually deleted" but easy to set short (an hour, a
+  day, a week — standard presets). On expiry, the client deletes the local
+  plaintext row.
+- **Explicit interaction to surface in the UI, not just this document**: a
+  disappearing-message timer and Tier 2 recovery (§7) can be in tension — a
+  short local timer does not retroactively purge an already-agreed,
+  already-uploaded recovery backup entry. That's the existing, separate
+  "delete my backups" action from §7, not something a local timer triggers
+  automatically. A user enabling both features without understanding this
+  could reasonably believe "disappearing" means gone everywhere; the UI
+  needs to make the distinction visible at the point both settings are
+  live together, not leave it to this document.
+
+### 11.6 Deniability — the OTR (Off-the-Record Messaging) lineage — **documentation-only**
+
+No protocol change here — this restates something already true given the
+§3.5 decision, worth saying explicitly given the project's OpenPGP
+heritage. Classic OpenPGP messages are typically **signed**: verifiable
+proof of authorship a recipient can show a third party. That's the opposite
+of what a private messenger usually wants. DRAtchet, like Signal and OTR
+before it, authenticates message content with a **symmetric** MAC/AEAD tag
+under a key both participants derived — a recipient can be sure a message
+came from within their own session, but can't prove that to anyone else,
+since they hold the same key material and could in principle have produced
+it themselves. This deniability property is a direct inheritance from OTR
+(the protocol that first made it a design goal, well before Signal), and is
+worth naming as an intentional property of DRAtchet's message layer, not
+just a byproduct of the §3.5 wire-format decision.
+
+### 11.7 Key transparency for the directory — inspired by Signal's Key Transparency / CONIKS — **research**
+
+Gap: §6.4's Path 2 (remote pairing) has a real TOFU window before the
+pairing code closes it — a malicious or compromised directory could, in
+principle, serve a substituted identity key on that first lookup. An
+append-only, publicly auditable, Merkle-tree-backed transparency log
+(Certificate-Transparency-style, applied to identity-key bindings instead
+of TLS certs) would let clients detect a directory that serves different
+keys to different observers — catching substitution even before a user
+manually verifies.
+
+Flagged as **research**, not v2-committed: Signal's own Key Transparency
+effort took years to ship, and it's real infrastructure (log operators,
+audit tooling, gossip/consistency protocols) disproportionate to build
+before the base protocol and both peer-verification paths (§6.3/6.4) have
+shipped and been used. Worth revisiting once there's a real directory
+service in production and evidence of the TOFU gap mattering in practice.
+
+### 11.8 Directory abuse resistance — **v1**
+
+Two related gaps beyond the prekey-exhaustion point already folded into
+`SERVERS.md` §1.1:
+
+- **One-time-prekey exhaustion** (cross-referenced from `SERVERS.md` §1.1):
+  rate-limit prekey fetches per requesting identity; treat repeated
+  exhaustion attempts against one account as a signal worth surfacing to
+  that user ("someone is repeatedly trying to start sessions with you"),
+  not just a resource-management concern.
+- **Username squatting/impersonation**: `username#NNNN` (§6.1) has no
+  Sybil resistance beyond first-come-first-served registration — a
+  deliberate trade against Signal/WhatsApp's phone-number-based identity,
+  made to avoid requiring real-world PII. That trade still needs *some*
+  floor against mass-registration to squat popular usernames or impersonate
+  accounts: a lightweight proof-of-work challenge on registration raises
+  the cost of automation without requiring any identifying information,
+  unlike a phone number or CAPTCHA-with-tracking. Precedent for
+  PII-free, cost-based Sybil resistance in decentralized messaging systems
+  goes back to Bitmessage's proof-of-work-gated message sends; applying the
+  same idea at registration time (rather than per-message) keeps it a
+  one-time cost for a legitimate user instead of an ongoing tax.
+
+### 11.9 Duress response — inspired by Briar's panic-button integration — **v2, optional**
+
+Lighter-weight than the rest of this section: a configurable duress
+PIN/trigger that wipes local key material or shows a decoy empty state on
+entry, the way Briar integrates with a separate panic-trigger app. Genuinely
+useful for some threat models, but a UX feature layered on top of the core
+protocol rather than something that changes it — flagged for v2
+consideration, not designed further here.
