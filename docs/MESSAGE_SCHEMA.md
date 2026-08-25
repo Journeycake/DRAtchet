@@ -144,7 +144,7 @@ ratchet envelope above.
 ## 5. Recovery backup entry (CBOR) — §7 opt-in recovery
 
 Written to whichever recovery store an account has configured for itself
-(§2.1 of `SERVERS.md` — per-participant, not shared). One entry per
+(§3.1 of `SERVERS.md` — per-participant, not shared). One entry per
 message, independent of the ratchet's own `n`/`pn` counters so recovery
 ordering never depends on live ratchet internals.
 
@@ -154,7 +154,7 @@ ordering never depends on live ratchet internals.
 | `seq` | uint64 | monotonic per-conversation sequence number, assigned locally |
 | `ciphertext` | bytes | `AEAD(plaintext)` under the conversation recovery key, independent key from any ratchet message key |
 | `created_at` | uint64 | unix seconds |
-| `written_by` | 1 byte enum: `0 = self`, `1 = peer` | who authored the underlying message, from the perspective of whichever account owns this store. This field now does double duty beyond its original dedup role: it's what a client checks against the conversation's *effective* recovery profile (`ARCHITECTURE.md` §7.2) to decide whether an entry may be written at all (effective Profile B skips `written_by = peer` entries entirely), and it's the selector the Recovery Store's filtered delete uses to purge only peer-authored entries on a tightening from effective Profile A to B (`SERVERS.md` §2.2, `ARCHITECTURE.md` §7.3) |
+| `written_by` | 1 byte enum: `0 = self`, `1 = peer` | who authored the underlying message, from the perspective of whichever account owns this store. This field now does double duty beyond its original dedup role: it's what a client checks against the conversation's *effective* recovery profile (`ARCHITECTURE.md` §7.2) to decide whether an entry may be written at all (effective Profile B skips `written_by = peer` entries entirely), and it's the selector the Recovery Store's filtered delete uses to purge only peer-authored entries on a tightening from effective Profile A to B (`SERVERS.md` §3.2, `ARCHITECTURE.md` §7.3) |
 
 ## 6. Presence protocol (CBOR, over the Signaling & Presence Service's WebSocket)
 
@@ -166,7 +166,7 @@ held in-memory only, never logged.
 |---|---|---|---|
 | `AuthChallenge` (service → client, on connect) | `nonce` | bytes (32) | fresh per connection |
 | `AuthResponse` (client → service) | `identity_fingerprint` | bytes (32) | identifies the connecting account |
-| | `signature` | bytes | signature over `nonce` using the identity key (or per-device subkey — `SERVERS.md` §4) |
+| | `signature` | bytes | signature over `nonce` using the identity key (or per-device subkey — `SERVERS.md` §5) |
 | `PresenceAnnounce` (client → service) | `state` | 1 byte enum | `0 = online`, `1 = away` |
 | `PresenceUpdate` (service → subscribed contacts' clients) | `identity_fingerprint` | bytes (32) | whose presence changed |
 | | `state` | 1 byte enum | `0 = online`, `1 = away`, `2 = offline` |

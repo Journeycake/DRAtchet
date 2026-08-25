@@ -17,8 +17,9 @@ Status: **v0 crypto core implemented and tested** (`core/`) — X3DH handshake
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full protocol and
 system design, [`docs/MESSAGE_SCHEMA.md`](docs/MESSAGE_SCHEMA.md) for the
 concrete wire formats, and [`docs/SERVERS.md`](docs/SERVERS.md) for the two
-optional server components (signaling/presence, and per-user recovery
-storage). Highlights:
+optional 1:1-model server components (signaling/presence, and per-user
+recovery storage) plus the mandatory Group Coordination Service that group
+chat (v2) adds. Highlights:
 
 - Why a literal per-message PGP-keypair rotation isn't feasible under
   message queueing, and how Double Ratchet solves it.
@@ -38,6 +39,10 @@ storage). Highlights:
   per conversation with the more restrictive side always winning, and
   hostable on storage the participants themselves control rather than a
   DRAtchet-run service.
+- Group chat roadmap (v2): MLS/TreeKEM (RFC 9420) over a custom group
+  ratchet, why a Group Coordination Service becomes mandatory once
+  membership changes need one agreed-upon ordering, and how the same
+  most-restrictive-wins recovery policy extends from two participants to N.
 - Client architecture (Tauri + Rust, one codebase for Windows/macOS/Linux)
   and threat model.
 - Security hardening pulled from prior art: Signal (sealed sender, message

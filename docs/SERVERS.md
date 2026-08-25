@@ -5,14 +5,22 @@ Status: **design draft, no code yet**. Companion to
 tiered delivery model) and [`MESSAGE_SCHEMA.md`](MESSAGE_SCHEMA.md) (wire
 formats referenced below).
 
-DRAtchet has exactly two optional server-side components, and neither is a
-single always-on backend the way "server" usually implies:
+DRAtchet's 1:1 model has exactly two *optional* server-side components,
+neither a single always-on backend the way "server" usually implies:
 
 1. **Signaling & Presence Service** — small, mostly-ephemeral, needed for
    Tier 0/Tier 1 delivery (rendezvous, prekey bundle discovery) and for
    online-status.
 2. **Recovery Store** — only exists at all if a conversation has opted into
    Tier 2 recovery, and then it's owned by one participant, not shared.
+
+Group chat (v2, `ARCHITECTURE.md` §13) adds a third component that is
+**not optional**:
+
+3. **Group Coordination Service** (§2 below) — required for any group to
+   function at all, since group membership changes need a single agreed-
+   upon ordering that direct peer-to-peer coordination can't provide on its
+   own (`ARCHITECTURE.md` §13.2). Still never sees message content.
 
 ## 1. Signaling & Presence Service
 
@@ -132,13 +140,101 @@ server-based deployment model:
   longer without it turning into an accidental durable archive.
 
 No protocol or schema difference between the two — same message formats
-(§3 below, and `MESSAGE_SCHEMA.md` §6–7), same "never sees plaintext"
+(§4 below, and `MESSAGE_SCHEMA.md` §6–7), same "never sees plaintext"
 guarantee. The difference is entirely operational: uptime SLA, TTL policy,
 and whether Tier 0 is attempted at all.
 
-## 2. Recovery Store (Tier 2)
+## 2. Group Coordination Service
 
-### 2.1 Per-participant, not shared — and why
+Required for group chat (v2, `ARCHITECTURE.md` §13) — not optional the way
+§1 and §3 are. Section §13.2 of `ARCHITECTURE.md` explains *why* a group
+needs this at all: without a single agreed-upon ordering for membership
+changes, two participants proposing conflicting adds/removes at the same
+time can fork the group into two views of its own membership, and pure
+peer-to-peer coordination has no way to resolve that on its own. This
+service is that single ordering point — nothing more.
+
+### 2.1 Responsibilities
+
+1. **KeyPackage directory**: publish/fetch MLS `KeyPackage`s (RFC 9420) by
+   `username#NNNN`, the group-chat analog of §1.1 job 1's prekey bundle
+   directory. A `KeyPackage` is what lets an existing group member add a new
+   one without an interactive round-trip with that new member first.
+2. **Commit ordering**: for each group (identified by its MLS group ID),
+   maintain a single authoritative, strictly increasing epoch sequence.
+   Exactly one `Commit` is accepted per epoch; the service's only real job
+   here is rejecting a second `Commit` racing against one it already
+   accepted for that epoch, so every member converges on the same next
+   state instead of forking. The service does not construct, approve, or
+   understand the content of a `Commit` — it only decides which one, of
+   possibly several submitted concurrently, wins the race for a given
+   epoch.
+3. **Welcome/Proposal relay**: deliver `Welcome` messages to newly-added
+   members and relay `Proposal` messages among current members, the same
+   way §1.1 job 3's Tier 1 mailbox relays ordinary ratchet envelopes.
+4. **Group roster**: hold the minimal membership list (which identities are
+   in which group) needed to know who to relay `Welcome`/`Proposal`/`Commit`
+   traffic to. This is new metadata exposure relative to the 1:1 model,
+   where a conversation is an opaque `conversation_id` to any server that
+   handles it (`ARCHITECTURE.md` §13.4 names this trade-off explicitly
+   rather than letting it inherit §8's 1:1 threat model silently).
+
+None of these require the service to see plaintext message content, group
+message keys, or the MLS group secret — same guarantee as §1.
+
+### 2.2 Authentication & authorization
+
+- Connection and identity authentication reuse the same nonce-signature
+  handshake as §1.2 — no separate account system for groups either.
+- **Authorization is not this service's job.** Whether a given member is
+  allowed to propose an add/remove, and whether a `Commit` is validly
+  signed by a current member, is enforced cryptographically by MLS itself
+  (`ARCHITECTURE.md` §13.1/§13.4) — every `Commit` and `Proposal` is signed
+  by its sender's identity key, and every client verifies that signature
+  independently on receipt. The service orders and relays; it does not
+  decide who may change group membership. This keeps the service's own
+  compromise or misbehavior from being able to forge a membership change —
+  at worst it can reorder, delay, or refuse to relay, not fabricate.
+
+### 2.3 Abuse resistance
+
+- Rate-limit `Commit` and `Proposal` submission per group per identity —
+  the group-chat analog of §1.1's one-time-prekey exhaustion protection and
+  `ARCHITECTURE.md` §11.8's fuller treatment. Otherwise a single malicious
+  or compromised member could spam `Commit`s to churn every other member's
+  group state or deny the group forward progress.
+- KeyPackage directory abuse resistance mirrors §1.1 job 1 directly (rate
+  limits per requesting identity), since it's the same kind of resource.
+
+### 2.4 Minimal deployment shape
+
+Less purely stateless than §1's presence table: Commit ordering needs at
+least one durable, monotonically-advancing counter per group epoch — a
+race between two concurrently-submitted `Commit`s for the same epoch has to
+resolve the same way even if the service restarts mid-decision. In
+practice this is still small (one counter/log per active group, not a full
+message store): a KV store with compare-and-swap semantics (e.g. the same
+Cloudflare Durable Objects tier §1.4 already uses, or a small
+Postgres/SQLite table keyed by `(group_id, epoch)`) is enough — no general
+message durability requirement beyond the brief relay window for
+`Welcome`/`Proposal`/`Commit` traffic itself.
+
+### 2.5 What this deliberately does not do
+
+- Never sees plaintext group message content — those are encrypted under
+  MLS application keys the service never holds, exactly like §1 and §3.
+- Never decides group membership — only orders and relays already-signed,
+  independently-verifiable protocol messages (§2.2).
+- Does not retroactively grant a newly-added member access to messages from
+  before they joined — `ARCHITECTURE.md` §13.3 covers why (an MLS `Welcome`
+  only conveys the current epoch's state, consistent with forward secrecy).
+- Roster visibility (§2.1 job 4) is the one new thing this component sees
+  that §1 and §3 don't — accepted and named explicitly rather than treated
+  as equivalent to the 1:1 model's opacity.
+
+## 3. Recovery Store (Tier 2)
+
+### 3.1 Per-participant, not shared — and why
 
 Each user who opts into recovery for a conversation configures their
 **own** recovery destination. Mutual consent (`ARCHITECTURE.md` §7) still
@@ -173,7 +269,7 @@ whatever content the effective content-profile allows gets hosted; the two
 are independent choices and reusing the same letters for both would make
 every cross-reference ambiguous.
 
-### 2.2 Storage option 1 — minimal purpose-built server (recommended for v1)
+### 3.2 Storage option 1 — minimal purpose-built server (recommended for v1)
 
 Small, self-hostable HTTP service (e.g. Rust + `axum`). Single-tenant (one
 user's own instance) or lightly multi-tenant (e.g. a household or small
@@ -194,7 +290,7 @@ operator, not a cross-party trust relationship.
   already-encrypted bytes: flat files, SQLite, or any KV store all work
   equally well server-side.
 
-### 2.3 Storage option 2 — zero-custom-code (direct object storage)
+### 3.3 Storage option 2 — zero-custom-code (direct object storage)
 
 - Client writes directly to an S3-compatible bucket the user already
   controls, using credentials scoped to a `recovery/{conversation_id}/*`
@@ -211,7 +307,7 @@ operator, not a cross-party trust relationship.
   tooling gives you, not purpose-built. Recommend option 1 once a user
   wants more control than "store and fetch blobs."
 
-### 2.4 Cross-party hosting caveat
+### 3.4 Cross-party hosting caveat
 
 If one participant offers to host the recovery store the *other*
 participant uses — rather than each hosting their own — the trust model
@@ -221,9 +317,9 @@ conversations too, if that store is reused across multiple contacts.
 Recommend the app default to "each participant configures their own store"
 and treat "use my contact's store" as an explicit, clearly-labeled advanced
 option — never a default flow, since it quietly weakens exactly the
-isolation §2.1 exists to provide.
+isolation §3.1 exists to provide.
 
-## 3. Message schemas
+## 4. Message schemas
 
 Presence protocol messages (`PresenceAnnounce`, `PresenceUpdate`) referenced
 in §1.3 above are specified in [`MESSAGE_SCHEMA.md`](MESSAGE_SCHEMA.md) §6.
@@ -231,17 +327,22 @@ Rendezvous and mailbox control messages (`RendezvousOffer`/`Answer`,
 `MailboxWrite`/`Fetch`/`Delete`) referenced in §1.1's job list, and the
 `DeliveryAck` payload they eventually carry, are in `MESSAGE_SCHEMA.md` §7.
 Recovery Store request/response bodies reuse the `RecoveryBackupEntry`
-schema from `MESSAGE_SCHEMA.md` §5 directly — the HTTP layer in §2.2 above
+schema from `MESSAGE_SCHEMA.md` §5 directly — the HTTP layer in §3.2 above
 adds only routing (`conversation_id`/`seq` in the URL, plus the
 `written_by` filter on delete) and auth, no new payload shape.
 `RecoveryProfileAnnounce` (`MESSAGE_SCHEMA.md` §8) is exchanged directly
 between the two conversation participants, not with this service — it
 never touches the Recovery Store or the Signaling & Presence Service.
+Group Coordination Service traffic (§2 above) — `KeyPackage` publication,
+`Welcome`/`Proposal`/`Commit` relay — adopts RFC 9420's own wire encoding
+directly rather than a DRAtchet-specific schema, per the decision recorded
+in `ARCHITECTURE.md` §13.1; `MESSAGE_SCHEMA.md` does not duplicate that
+format, only notes where it's carried.
 
-## 4. Open questions
+## 5. Open questions
 
 These are also tracked in `ARCHITECTURE.md` §10 alongside the rest of the
-project's open decisions; kept here too since they're specific to these two
+project's open decisions; kept here too since they're specific to these
 services.
 
 - **Signing key for the presence handshake (§1.2):** reuse the long-term
@@ -255,8 +356,13 @@ services.
   keep it to a simpler online/offline-only signal until there's a concrete
   UX reason for the extra state? Low-stakes, doesn't block other work.
 - **Recovery Store hosting default:** ship storage option 1, the
-  purpose-built server (§2.2), only for v1, or also document option 2,
-  direct object storage (§2.3), as a supported path from day one?
+  purpose-built server (§3.2), only for v1, or also document option 2,
+  direct object storage (§3.3), as a supported path from day one?
   Recommend option 1 first since it gives cleaner delete/rate-limit
   behavior; option 2 is a natural v2 addition once there's a reason to
   support it.
+- **Commit-ordering durability tier for the Group Coordination Service
+  (§2.4):** is a KV store with compare-and-swap enough at real scale, or
+  does per-group Commit ordering need a dedicated small database once
+  groups are common? Deferred until there's usage data; not a blocker for
+  the v2.0 MVP phasing in `ARCHITECTURE.md` §13.5.

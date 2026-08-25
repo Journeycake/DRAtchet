@@ -7,7 +7,9 @@ See [`MESSAGE_SCHEMA.md`](MESSAGE_SCHEMA.md) for the concrete wire formats
 referenced throughout (prekey bundle, ratchet message envelope, X3DH init,
 pairing messages, presence protocol, recovery backup entry), and
 [`SERVERS.md`](SERVERS.md) for the two optional server components (the
-Signaling & Presence Service, and the Tier 2 Recovery Store) in full detail.
+Signaling & Presence Service, and the Tier 2 Recovery Store) in full
+detail, plus the Group Coordination Service (§13, v2) that group chat adds
+as a mandatory third.
 
 ## 1. Recap: why "a fresh PGP keypair every message" doesn't work
 
@@ -342,14 +344,14 @@ Layers on top of *either* Tier 0 or Tier 1 — orthogonal to which delivery
 tier is in use. This is exactly the §7 recovery design, restated with the
 hosting question now answered: the durable, decryptable-with-the-recovery-
 key backup store doesn't need to be a DRAtchet-operated service at all, and
-— now specified in full in [`SERVERS.md`](SERVERS.md) §2 — it doesn't need
+— now specified in full in [`SERVERS.md`](SERVERS.md) §3 — it doesn't need
 to be *shared* between the two participants either. Each side configures
 their **own** recovery destination (their own self-hosted server or cloud
 bucket); what actually gets written there is governed by the conversation's
 *effective* policy — the more restrictive of the two sides' Profile A/B/C
 choices (§7.2) — but the storage itself stays single-owner, which keeps
 blast radius, deletion semantics, and auth all simpler than a shared store
-would — see `SERVERS.md` §2 for the full reasoning and API.
+would — see `SERVERS.md` §3 for the full reasoning and API.
 
 Tier 2's activation is a conversation-level outcome computed from both
 sides' recovery profiles (§7), not a manual accept step — it never happens
@@ -563,14 +565,15 @@ convey the code.
 message key is deleted immediately after one use, nothing is escrowed or
 backed up anywhere. Losing a device loses that conversation's history from
 that point on; this is forward secrecy working as intended, not a missing
-feature.
+feature. (This section is written for two participants; §13.3 extends the
+same `min`-based policy to group conversations without weakening it.)
 
 ### 7.1 Three recovery profiles, not a binary switch
 
 Each account sets its own **Recovery Profile**, ranked here from most to
 least data retained:
 
-| Profile | What gets stored (in *that user's own* store, §2.1 of `SERVERS.md`) | Restrictiveness |
+| Profile | What gets stored (in *that user's own* store, §3.1 of `SERVERS.md`) | Restrictiveness |
 |---|---|---|
 | **A — Full** | Everything that user's client has plaintext for: messages they sent *and* received | Least restrictive |
 | **B — Sent-only** | Only messages that user authored — nothing they received from the other party | Middle |
@@ -659,7 +662,7 @@ as before:
   becomes more restrictive (A→B, B→C, or A→C), each client purges whatever
   it's holding that the new effective policy no longer permits —
   `written_by = peer` entries on an A→B tightening, everything on a
-  transition to C. The Recovery Store API supports this directly (§2.2 of
+  transition to C. The Recovery Store API supports this directly (§3.2 of
   `SERVERS.md`, filtered delete). The UI surfaces this as a visible
   notice ("N previously backed-up messages were deleted because your
   contact updated their recovery setting"), not a silent background
@@ -747,6 +750,10 @@ safety-number-changed notice (§6.2).
 
 ## 8. Threat model
 
+Scoped to the 1:1 model this document mostly describes; group chat (§13,
+v2) adds a coordinating server with a different, explicitly-named
+visibility trade-off (§13.4) rather than inheriting this section silently.
+
 In scope:
 - Passive network eavesdropping.
 - A compromised or malicious Tier 1 relay, or a compromised signaling/
@@ -795,10 +802,10 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
   *operator* is not scoped at all — this is a real trust concession to
   running any presence feature and is worth stating plainly rather than
   implying presence is as contained as the rest of the design.
-- A Recovery Store operator (`SERVERS.md` §2) sees that user's own backup
+- A Recovery Store operator (`SERVERS.md` §3) sees that user's own backup
   metadata (conversation cadence, sizes, timing) even though it never sees
   plaintext — contained to whichever user's store it is under the
-  recommended per-participant model, but see `SERVERS.md` §2.4 for the
+  recommended per-participant model, but see `SERVERS.md` §3.4 for the
   cross-party hosting case where that containment breaks down.
 - **Tier 0 IP exposure between contacts** (§4.1, §11.2): accepted as the
   default trade of a serverless P2P design, mitigated but not eliminated by
@@ -853,13 +860,13 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
    conversation disappearing-message timers (§11.5), the three-level Tier 2
    recovery profile system (§7) with a self-custodied recovery phrase,
    hosted via storage option 1, the purpose-built server (`SERVERS.md`
-   §2.2).
-3. **v2**: multi-device support, group chat (MLS/RFC 9420-style group key
-   management — TreeKEM's tree-based scaling is the better-established
-   approach today vs. naive pairwise sender-keys fan-out), prekey bundle
-   auto-replenishment, push notifications, optional managed/server-escrowed
-   passphrase-protected recovery option (§7 option b, §4.3), post-quantum
-   hybrid handshake (§11.4).
+   §3.2).
+3. **v2**: multi-device support, group chat (MLS/RFC 9420 — full roadmap,
+   including why a coordinating server becomes mandatory and how recovery
+   extends to N members, in §13), prekey bundle auto-replenishment, push
+   notifications, optional managed/server-escrowed passphrase-protected
+   recovery option (§7 option b, §4.3), post-quantum hybrid handshake
+   (§11.4).
 4. **Research track, not scheduled**: Tor/onion-routed transport (§11.2),
    key transparency for the directory (§11.7), duress response (§11.9),
    federated (multi-operator) server-based deployments (§12.4).
@@ -900,10 +907,10 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
 - Presence "away" heuristic (idle timeout before online → away) and whether
   it ships at all in v1 vs. a simpler online/offline-only signal —
   unresolved, low-stakes, doesn't block other work.
-- Recovery Store hosting: purpose-built minimal server (`SERVERS.md` §2.2,
+- Recovery Store hosting: purpose-built minimal server (`SERVERS.md` §3.2,
   recommended for v1 — better delete/rate-limit control, including the
   filtered peer-authored-only purge §7.3 needs) vs. direct S3-compatible
-  bucket writes (§2.3, zero custom server code) — worth offering both
+  bucket writes (§3.3, zero custom server code) — worth offering both
   eventually; v1 ships the server option first.
 - Per-conversation override UI for the recovery content profile (§7.1):
   v1 assumed to ship both a global per-account default and a per-
@@ -1186,3 +1193,184 @@ as a **research track**, not scoped for v1 or v2 — worth a real look once
 a single-operator server-based deployment exists and there's a concrete
 reason (multiple communities wanting to run their own, interoperating
 infrastructure) to justify the added complexity.
+
+## 13. Group chat roadmap (v2)
+
+Everything above this section is the 1:1 design — serverless-first,
+Double Ratchet, a server that's always optional (Tier 1) or absent (Tier
+0). Groups break that premise on purpose, not by oversight: **a
+coordinating server is required** for group chat, not optional the way
+Tier 1 is for 1:1. This section is why, what that server actually does,
+and how the existing recovery and security commitments extend to more
+than two participants without being watered down to get there.
+
+### 13.1 Mechanism: MLS (RFC 9420), not a home-grown group ratchet
+
+Double Ratchet is a *pairwise* protocol — its DH ratchet step assumes
+exactly two parties taking turns. Extending it to groups naively (a
+separate pairwise ratchet per member pair, or Signal-style "sender keys"
+fanned out to everyone) costs `O(n)` or `O(n²)` work per membership change
+or key rotation and gets harder to reason about with every member added.
+**MLS (Messaging Layer Security, RFC 9420)** is the IETF-standardized
+answer to this, built specifically to generalize what Double Ratchet does
+for two parties to many: forward secrecy, post-compromise security, and
+efficient `O(log n)` group operations via **TreeKEM** — members sit at the
+leaves of a binary tree, each internal node holds a secret derived (via
+HPKE) from its two children, and the root's secret is the group's shared
+secret for the current **epoch**. A membership change or key rotation
+**Commit** re-derives the path from the changed leaf to the root, touching
+`O(log n)` nodes instead of the whole membership.
+
+Adopting MLS rather than designing a custom group ratchet is itself the
+decision worth stating plainly: unlike the pairwise Double Ratchet — where
+the published spec is closer to reference pseudocode and DRAtchet already
+made real, custom framing decisions on top of it (§3.5) — MLS is a
+complete, standardized wire protocol with its own TLS-style encoding.
+There's no "wrapping tax" to avoid the way there was with OpenPGP framing
+for 1:1 messages (§3.5): **group wire messages should adopt RFC 9420's own
+encoding directly**, not get a DRAtchet-specific envelope. Reinventing
+group cryptography from scratch, for a property this security-critical, is
+exactly the kind of shortcut the rest of this project has deliberately
+avoided (§3.1's identity-key-separation note is the same instinct at
+smaller scale).
+
+MLS credentials reuse the existing OpenPGP identity key's signing
+capability (§3.1) rather than introducing a second identity system — a
+member's MLS `Credential` is backed by the same identity certificate
+everything else in this document already trusts.
+
+### 13.2 Why a server becomes mandatory
+
+In 1:1, either side can originate a DH ratchet step and the other simply
+processes whatever arrives — there's no ordering conflict because there
+are only two parties and message order within a chain is enough. In a
+group, an MLS **Commit** advances the *entire group* to a new epoch at
+once, and only **one** Commit can be accepted per epoch. If two members
+independently Commit at the same time with no arbiter, the group **forks**
+— some members apply Commit A, others apply Commit B, and their tree
+states (and therefore their epoch secrets) silently diverge. Resolving
+this without a coordinating point requires a consensus protocol among
+members, which is real distributed-systems complexity this project isn't
+taking on for a v2 feature. A **Group Coordination Service** (`SERVERS.md`
+§2, new) is the arbiter instead: it serializes Commits, rejects a second
+Commit against an already-superseded epoch, and is also where the "public
+key exchange and hosting" the group needs lives —
+
+- **Key exchange**: each member publishes an MLS `KeyPackage` (their
+  identity credential + a fresh HPKE init key) to the same kind of
+  directory the 1:1 prekey bundle already uses (§3.2, `MESSAGE_SCHEMA.md`
+  §1) — adding someone to a group means fetching their `KeyPackage`, the
+  group-scale equivalent of fetching a prekey bundle to start a 1:1
+  session.
+- **Hosting**: `Welcome` messages (what lets a newly added member compute
+  the current epoch secret without having witnessed any prior history —
+  see §13.4) and `Proposal`/`Commit` traffic all route through this
+  service, since it's the thing enforcing a single, agreed-upon Commit
+  order for everyone.
+
+This is a **capability**, not a **confidentiality** difference from the
+1:1 model: the service still never sees message content or the epoch
+secret — HPKE-wrapped `Welcome`s and MLS's own message encryption keep
+that true — but it *does* see the group roster (who's a member) and Commit
+timing, which 1:1's opaque `conversation_id` (§2 of `MESSAGE_SCHEMA.md`)
+was specifically designed to avoid exposing. That trade-off is inherent to
+having a single ordering authority at all, not a corner that got cut —
+tracked explicitly in the threat model (§13.5) rather than glossed over.
+
+### 13.3 Recovery: the same lattice, extended to N members
+
+§7's three-profile recovery system (Full / Sent-only / None,
+most-restrictive-wins) generalizes to groups by extending the same `min`
+operation from two participants to all current members:
+
+```
+effective(group) = min(profile(member_1), profile(member_2), ..., profile(member_n))
+```
+
+Nothing about the mechanism changes otherwise:
+
+- Every member still announces their own profile (`RecoveryProfileAnnounce`,
+  §8 of `MESSAGE_SCHEMA.md`) — now as an MLS Application message to the
+  group rather than a 1:1 ratchet payload, but the same fail-closed-to-C
+  default applies to any member whose profile hasn't been observed yet.
+- **A single member choosing Profile C still overrides everyone else's
+  choice for the whole group** — exactly the pairwise behavior in §7.2,
+  now at group scale. Adding a new member recomputes the `min` to include
+  their profile immediately; if they're on C, the group's effective policy
+  tightens the moment they join, with the same purge-on-tightening
+  behavior from §7.3 applying to every existing member's own store.
+- A member *leaving* the group is a recomputation too, not a one-way
+  ratchet — the `min` is taken over *current* members, so the effective
+  policy can loosen once someone whose stricter setting was governing it
+  departs. This only affects messages sent *after* the recomputation, same
+  principle as "loosening never retroactively creates history" in §7.3.
+- Storage stays per-member, not shared (§7 already established this isn't
+  a shared resource even for two people; a group is the same idea with
+  more members, not a different one) — each member who's part of an
+  effective-A-or-B group writes to *their own* configured recovery store.
+- The one real schema gap: `RecoveryBackupEntry`'s `written_by` field
+  (§5 of `MESSAGE_SCHEMA.md`) is currently a binary self/peer flag, which
+  doesn't generalize past two parties. It needs to become an identity
+  fingerprint (whose message this is, from the *storing* member's point of
+  view) before groups ship — a schema evolution flagged here, not solved
+  in this pass.
+
+**New members and history — deliberately, not accidentally, no
+retroactive access.** MLS's `Welcome` message conveys the *current*
+epoch's secret, not any prior epoch's — a newly added member cannot derive
+the keys for messages sent before they joined, full stop, regardless of
+anyone's recovery profile. This is forward secrecy working exactly as
+intended (the same principle §7's "default: unrecoverable" rests on), and
+it should be stated as a design commitment, not just an implementation
+detail someone could "fix" later: a new member's own recovery profile,
+however permissive, only ever governs messages from their join point
+forward.
+
+### 13.4 Threat model additions for groups
+
+Extends §8 rather than replacing it — everything already in scope there
+(passive eavesdropping, a compromised relay/directory not seeing content,
+forward secrecy, deniability, honest-client-only profile enforcement)
+still holds. New, group-specific items:
+
+- **Group roster visibility to the Group Coordination Service** — named
+  plainly in §13.2, not implied. A 1:1 conversation's server-visible
+  surface is an opaque `conversation_id`; a group's coordinating service
+  necessarily knows the membership list to route `Welcome`/`Commit`
+  traffic. Out of scope for v2 to hide this from a single coordinating
+  service — tracked as a real, accepted trade for centralizing Commit
+  ordering (§13.2), not overlooked.
+- **Split-view / forking resilience** — a malicious or compromised Group
+  Coordination Service could, in principle, tell different members
+  different things about the current epoch. MLS's own spec discusses this
+  and the standard mitigation is an out-of-band **epoch authenticator**
+  (a short tree-state hash members can compare) — the group-scale
+  equivalent of the QR/pairing-code identity verification in §6, and
+  flagged the same way: v2+ hardening, not required to ship an MVP, but a
+  known gap rather than an unconsidered one.
+- **Sender authentication independent of the coordinating service** — every
+  MLS `Commit` and Application message is signed by its sender's own
+  credential (§13.1), so the coordinating service can reorder or drop
+  traffic but can't forge a message or Commit on a member's behalf, even
+  though it controls delivery ordering.
+- **Delivery Service abuse resistance** — the same instinct as §11.8's
+  prekey-exhaustion protections, applied to Commit submission: rate-limit
+  Commit attempts per member to prevent one member (malicious or buggy)
+  from starving the group with a flood of competing Commits.
+
+### 13.5 Phasing
+
+1. **v2.0 — groups MVP**: `KeyPackage` directory (extends the existing
+   prekey bundle directory, §3.2), the Group Coordination Service
+   (`SERVERS.md` §2) for Commit ordering and `Welcome`/`Proposal` relay,
+   basic add/remove-member operations, N-way recovery-profile `min` (§13.3).
+   RFC 9420 wire format adopted directly (§13.1) — no DRAtchet-specific
+   group envelope.
+2. **v2.1 — groups hardening**: epoch authenticator / manual group-state
+   verification (split-view detection, §13.4), Delivery Service abuse
+   resistance (§13.4), group-aware disappearing-message timers (§11.5,
+   extended the same way recovery was).
+3. **Research track**: federated (multi-operator) Group Coordination
+   Services — the group-chat analog of §12.4's single-operator-vs-
+   federation axis, deferred for the identical reason (real added
+   complexity, no concrete need yet).
