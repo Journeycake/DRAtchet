@@ -136,6 +136,13 @@ Once the root key exists, per-message crypto is entirely symmetric:
 | Remote pairing code (§6.4) | Single verification attempt, ~10 min TTL | On first successful match, or expiry — whichever first |
 | Conversation recovery key (§7, only while the *effective* policy is A or B) | Life of the conversation's effective recovery policy | Automatically, the moment the effective policy reaches Profile C (§7.2/7.3) — individual stored entries are also auto-purged at that point, not just the key |
 
+**"Discarded" means zeroized in memory, not just dropped from scope**
+(v0, `core/src/ratchet.rs`): the root key, chain keys, and skipped-message
+keys are wrapped in `zeroize::Zeroizing`, and DH secrets (`StaticSecret`,
+`SharedSecret`) zeroize themselves via x25519-dalek's `"zeroize"` feature —
+both overwrite their storage on drop rather than leaving key material
+sitting in freed memory for a debugger or core dump to find.
+
 ### 3.5 Message wire format: full OpenPGP vs. lightweight custom envelope
 
 Two different things can be "OpenPGP" here, and it's worth separating them:
@@ -743,6 +750,19 @@ In scope:
 - A recipient being unable to prove message authorship to a third party
   even if they wanted to — the AEAD-based message authentication (§3.5)
   is deniable by design, the same property OTR pioneered; see §11.6.
+- **An unauthenticated forged envelope corrupting ratchet state.** Found and
+  fixed during implementation, not just designed against: an early version
+  of `decrypt_raw` applied the DH ratchet step's state mutation (§3.3)
+  *before* the AEAD tag was checked, so a single envelope carrying an
+  arbitrary `dh_pub` an attacker made up — no real key needed — would
+  desynchronize the conversation for both legitimate parties even though
+  that envelope itself was correctly rejected. This is exactly the kind of
+  packet a malicious or compromised Tier 1 relay (already in scope above)
+  or anyone able to inject a message into a live session could send.
+  `decrypt_raw` (`core/src/ratchet.rs`) is now transactional: every derived
+  key and potential ratchet step is computed into local variables first,
+  and `self` is only mutated after the AEAD tag actually verifies —
+  regression-tested in `ratchet::tests::garbage_envelope_does_not_desync_the_ratchet`.
 - A TURN relay (Tier 0/1 NAT-traversal fallback) seeing encrypted traffic
   metadata (packet timing/size) without seeing content — tracked as a
   metadata concern, not a content-confidentiality one (see below).

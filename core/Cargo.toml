@@ -7,8 +7,9 @@ license = "GPL-3.0-only"
 
 [dependencies]
 sequoia-openpgp = { version = "1", default-features = false, features = ["crypto-openssl"] }
-x25519-dalek = { version = "2", features = ["static_secrets"] }
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+# "zeroize": StaticSecret and its Diffie-Hellman output zeroize their bytes on drop
+# instead of leaving key material sitting in freed memory.
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
 hkdf = "0.12"
 hmac = "0.12"
 sha2 = "0.10"

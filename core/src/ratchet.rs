@@ -15,6 +15,7 @@ use hmac::{Hmac, Mac};
 use rand_core::OsRng;
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::Zeroizing;
 
 use crate::envelope::Envelope;
 use crate::error::{Error, Result};
@@ -34,22 +35,30 @@ type HmacSha256 = Hmac<Sha256>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct DhPubBytes([u8; 32]);
 
+/// A `(chain index, derived key)` pair — the unit `skip_and_derive` produces.
+type ChainKeyEntry = (u32, [u8; 32]);
+/// A skipped-message-key cache entry, keyed the same way `RatchetState::skipped` is.
+type SkippedEntry = ((DhPubBytes, u32), Zeroizing<[u8; 32]>);
+
 pub struct RatchetState {
     conversation_id: [u8; 16],
     max_skip: u32,
 
-    root_key: [u8; 32],
+    // Key material lives in `Zeroizing` wrappers (and `StaticSecret`, which zeroizes
+    // itself via x25519-dalek's "zeroize" feature) so it's overwritten on drop rather
+    // than left sitting in freed memory — e.g. for a debugger or core dump to find.
+    root_key: Zeroizing<[u8; 32]>,
     dh_self: Option<(StaticSecret, PublicKey)>,
     dh_remote: Option<PublicKey>,
 
-    sending_chain_key: Option<[u8; 32]>,
-    receiving_chain_key: Option<[u8; 32]>,
+    sending_chain_key: Option<Zeroizing<[u8; 32]>>,
+    receiving_chain_key: Option<Zeroizing<[u8; 32]>>,
 
     send_n: u32,
     recv_n: u32,
     prev_chain_len: u32,
 
-    skipped: HashMap<(DhPubBytes, u32), [u8; 32]>,
+    skipped: HashMap<(DhPubBytes, u32), Zeroizing<[u8; 32]>>,
 }
 
 impl RatchetState {
@@ -70,10 +79,10 @@ impl RatchetState {
         RatchetState {
             conversation_id,
             max_skip,
-            root_key: new_root,
+            root_key: Zeroizing::new(new_root),
             dh_self: Some((dh_self_secret, dh_self_public)),
             dh_remote: Some(responder_dh_public),
-            sending_chain_key: Some(sending_chain_key),
+            sending_chain_key: Some(Zeroizing::new(sending_chain_key)),
             receiving_chain_key: None,
             send_n: 0,
             recv_n: 0,
@@ -95,7 +104,7 @@ impl RatchetState {
         RatchetState {
             conversation_id,
             max_skip,
-            root_key,
+            root_key: Zeroizing::new(root_key),
             dh_self: Some((own_dh_secret, own_dh_public)),
             dh_remote: None,
             sending_chain_key: None,
@@ -115,12 +124,14 @@ impl RatchetState {
             .as_ref()
             .map(|(_, public)| *public)
             .ok_or(Error::RatchetNotInitialized("dh_self"))?;
-        let chain_key = self
-            .sending_chain_key
-            .ok_or(Error::RatchetNotInitialized("sending_chain_key"))?;
+        let chain_key = copy_secret(
+            self.sending_chain_key
+                .as_ref()
+                .ok_or(Error::RatchetNotInitialized("sending_chain_key"))?,
+        );
 
         let (next_chain_key, message_key) = kdf_ck(&chain_key);
-        self.sending_chain_key = Some(next_chain_key);
+        self.sending_chain_key = Some(Zeroizing::new(next_chain_key));
 
         // `header_bytes()`'s `ciphertext_len` field must match what the *decoded*
         // envelope will actually carry, since it's part of the AEAD associated data —
@@ -149,30 +160,113 @@ impl RatchetState {
     /// Decrypt a received envelope, tagged plaintext still tag+padded — callers get the
     /// raw `(payload_type, content)` via `payload::untag_and_unpad` on the returned bytes,
     /// or use [`RatchetState::decrypt_payload`] to do that in one step.
+    ///
+    /// **Transactional by construction:** every derived key and potential DH ratchet
+    /// step is computed into local variables first; `self` is only mutated *after* the
+    /// AEAD tag has actually verified. A forged or corrupted envelope — carrying an
+    /// arbitrary `dh_pub` an attacker made up — must be rejected without leaving any
+    /// trace in the ratchet state. Applying the DH ratchet step before authentication
+    /// would let a single unauthenticated envelope permanently desynchronize the
+    /// conversation for both legitimate parties, even though that envelope itself gets
+    /// correctly rejected — see `tests::garbage_envelope_does_not_desync_the_ratchet`.
     pub fn decrypt_raw(&mut self, envelope: &Envelope) -> Result<Vec<u8>> {
-        if let Some(mk) = self.take_skipped_key(&envelope.dh_pub, envelope.n) {
-            let header_bytes = envelope.header_bytes();
-            return aead_decrypt(&mk, &header_bytes, &envelope.ciphertext);
+        let skipped_id = (DhPubBytes(envelope.dh_pub), envelope.n);
+
+        // Fast path: an already-cached skipped-message key. Peek, don't remove, until
+        // decryption actually succeeds — a failed attempt (corrupted transit, forged
+        // envelope) must not discard a legitimately cached key that a correctly
+        // retransmitted copy of the same message might still need.
+        if let Some(message_key) = self.skipped.get(&skipped_id) {
+            let plaintext =
+                aead_decrypt(message_key, &envelope.header_bytes(), &envelope.ciphertext)?;
+            self.skipped.remove(&skipped_id);
+            return Ok(plaintext);
         }
 
         let incoming_dh = PublicKey::from(envelope.dh_pub);
-        if self.dh_remote != Some(incoming_dh) {
-            // Exhaust (and cache) the remaining keys of the *old* receiving chain up to
-            // the sender-reported previous chain length, then perform the DH ratchet step.
-            self.skip_message_keys(envelope.pn)?;
-            self.dh_ratchet_step(incoming_dh);
+        let ratchets = self.dh_remote != Some(incoming_dh);
+        let mut newly_skipped: Vec<SkippedEntry> = Vec::new();
+
+        // Exhaust (derive-and-stage, not yet commit) the remaining keys of the *old*
+        // receiving chain up to the sender-reported previous chain length — matches
+        // the reference algorithm's `SkipMessageKeys(state, header.pn)`, computed
+        // against the *current* (pre-ratchet) chain key and remote key. `.as_ref()`
+        // throughout this method: nothing is moved out of `self` until the commit at
+        // the end, so a `?` bailing out early never leaves `self` half-mutated.
+        if ratchets {
+            if let (Some(old_chain_key), Some(old_dh_remote)) =
+                (self.receiving_chain_key.as_ref(), self.dh_remote)
+            {
+                let (_, keys) = skip_and_derive(
+                    self.recv_n,
+                    copy_secret(old_chain_key),
+                    envelope.pn,
+                    self.max_skip,
+                )?;
+                newly_skipped.extend(
+                    keys.into_iter().map(|(n, k)| {
+                        ((DhPubBytes(old_dh_remote.to_bytes()), n), Zeroizing::new(k))
+                    }),
+                );
+            }
         }
 
-        self.skip_message_keys(envelope.n)?;
+        let ratchet_step = if ratchets {
+            let (dh_self_secret, _) = self
+                .dh_self
+                .as_ref()
+                .ok_or(Error::RatchetNotInitialized("dh_self"))?;
+            Some(compute_dh_ratchet_step(
+                &self.root_key,
+                dh_self_secret,
+                &incoming_dh,
+            ))
+        } else {
+            None
+        };
 
-        let chain_key = self
-            .receiving_chain_key
-            .ok_or(Error::RatchetNotInitialized("receiving_chain_key"))?;
-        let (next_chain_key, message_key) = kdf_ck(&chain_key);
-        self.receiving_chain_key = Some(next_chain_key);
-        self.recv_n += 1;
+        let (receiving_chain_key_before_n, recv_n_before_n) = match &ratchet_step {
+            Some(step) => (step.new_receiving_chain_key, 0),
+            None => (
+                copy_secret(
+                    self.receiving_chain_key
+                        .as_ref()
+                        .ok_or(Error::RatchetNotInitialized("receiving_chain_key"))?,
+                ),
+                self.recv_n,
+            ),
+        };
+        let (chain_key_at_n, keys) = skip_and_derive(
+            recv_n_before_n,
+            receiving_chain_key_before_n,
+            envelope.n,
+            self.max_skip,
+        )?;
+        newly_skipped.extend(
+            keys.into_iter()
+                .map(|(n, k)| ((DhPubBytes(incoming_dh.to_bytes()), n), Zeroizing::new(k))),
+        );
+        let (final_receiving_chain_key, message_key) = kdf_ck(&chain_key_at_n);
 
-        aead_decrypt(&message_key, &envelope.header_bytes(), &envelope.ciphertext)
+        // The only fallible step from here on is AEAD verification — everything above
+        // was pure computation. Nothing has touched `self` yet.
+        let plaintext = aead_decrypt(&message_key, &envelope.header_bytes(), &envelope.ciphertext)?;
+
+        // Commit: the tag verified, so this envelope is authentic. Apply every staged
+        // change now.
+        if let Some(step) = ratchet_step {
+            self.root_key = Zeroizing::new(step.new_root_key);
+            self.dh_self = Some((step.new_dh_self_secret, step.new_dh_self_public));
+            self.dh_remote = Some(incoming_dh);
+            self.prev_chain_len = self.send_n;
+            self.send_n = 0;
+            self.sending_chain_key = Some(Zeroizing::new(step.new_sending_chain_key));
+        }
+        self.receiving_chain_key = Some(Zeroizing::new(final_receiving_chain_key));
+        self.recv_n = envelope.n + 1;
+        self.skipped.extend(newly_skipped);
+
+        Ok(plaintext)
     }
 
     pub fn decrypt_payload(&mut self, envelope: &Envelope) -> Result<(u8, Vec<u8>)> {
@@ -183,56 +277,6 @@ impl RatchetState {
     pub fn encrypt_payload(&mut self, payload_type: u8, content: &[u8]) -> Result<Envelope> {
         let tagged = payload::tag_and_pad(payload_type, content)?;
         self.encrypt(&tagged)
-    }
-
-    fn take_skipped_key(&mut self, dh_pub: &[u8; 32], n: u32) -> Option<[u8; 32]> {
-        self.skipped.remove(&(DhPubBytes(*dh_pub), n))
-    }
-
-    fn skip_message_keys(&mut self, until: u32) -> Result<()> {
-        let Some(chain_key) = self.receiving_chain_key else {
-            // No receiving chain yet (e.g. responder before the first message) — nothing
-            // to skip ahead in; `until` should be 0 in that case, which is a no-op.
-            return Ok(());
-        };
-        if self.recv_n.saturating_add(self.max_skip) < until {
-            return Err(Error::MaxSkipExceeded(self.max_skip));
-        }
-        let Some(dh_remote) = self.dh_remote else {
-            return Ok(());
-        };
-
-        let mut chain_key = chain_key;
-        while self.recv_n < until {
-            let (next_chain_key, message_key) = kdf_ck(&chain_key);
-            self.skipped
-                .insert((DhPubBytes(dh_remote.to_bytes()), self.recv_n), message_key);
-            chain_key = next_chain_key;
-            self.recv_n += 1;
-        }
-        self.receiving_chain_key = Some(chain_key);
-        Ok(())
-    }
-
-    fn dh_ratchet_step(&mut self, incoming_dh: PublicKey) {
-        self.prev_chain_len = self.send_n;
-        self.send_n = 0;
-        self.recv_n = 0;
-        self.dh_remote = Some(incoming_dh);
-
-        let (dh_self_secret, _) = self.dh_self.as_ref().expect("dh_self always set");
-        let dh_output = dh_self_secret.diffie_hellman(&incoming_dh);
-        let (root_after_recv, receiving_chain_key) = kdf_rk(&self.root_key, dh_output.as_bytes());
-        self.root_key = root_after_recv;
-        self.receiving_chain_key = Some(receiving_chain_key);
-
-        let new_secret = StaticSecret::random_from_rng(OsRng);
-        let new_public = PublicKey::from(&new_secret);
-        let dh_output = new_secret.diffie_hellman(&incoming_dh);
-        let (root_after_send, sending_chain_key) = kdf_rk(&self.root_key, dh_output.as_bytes());
-        self.root_key = root_after_send;
-        self.sending_chain_key = Some(sending_chain_key);
-        self.dh_self = Some((new_secret, new_public));
     }
 
     #[cfg(test)]
@@ -268,6 +312,73 @@ fn kdf_ck(chain_key: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
     let message_key: [u8; 32] = mac_mk.finalize().into_bytes().into();
 
     (next_chain_key, message_key)
+}
+
+/// Extract a plain, `Copy`-able array from a zeroizing wrapper, for handing to the
+/// pure (non-`self`-touching) helper functions below — the wrapper stays intact and
+/// still zeroizes its own storage on drop; this only copies its *current* value out
+/// for one short-lived local computation.
+fn copy_secret(z: &Zeroizing<[u8; 32]>) -> [u8; 32] {
+    let borrowed: &[u8; 32] = z;
+    *borrowed
+}
+
+/// Derive-and-return message keys for chain indices `[from, until)` — exclusive of
+/// `until` — advancing `chain_key` via `KDF_CK` at each step, without mutating any
+/// ratchet state. Returns the derived `(index, message_key)` pairs plus the chain key
+/// state *after* deriving through index `until - 1`. Bounded by `max_skip`, same as
+/// the reference algorithm's `SkipMessageKeys`.
+fn skip_and_derive(
+    from: u32,
+    chain_key: [u8; 32],
+    until: u32,
+    max_skip: u32,
+) -> Result<([u8; 32], Vec<ChainKeyEntry>)> {
+    if from.saturating_add(max_skip) < until {
+        return Err(Error::MaxSkipExceeded(max_skip));
+    }
+    let mut chain_key = chain_key;
+    let mut keys = Vec::new();
+    let mut n = from;
+    while n < until {
+        let (next_chain_key, message_key) = kdf_ck(&chain_key);
+        keys.push((n, message_key));
+        chain_key = next_chain_key;
+        n += 1;
+    }
+    Ok((chain_key, keys))
+}
+
+/// The result of a (not-yet-committed) DH ratchet step — pure computation, no `&mut
+/// self`, so a caller can discard it entirely if authentication ultimately fails.
+struct RatchetStep {
+    new_root_key: [u8; 32],
+    new_receiving_chain_key: [u8; 32],
+    new_sending_chain_key: [u8; 32],
+    new_dh_self_secret: StaticSecret,
+    new_dh_self_public: PublicKey,
+}
+
+fn compute_dh_ratchet_step(
+    root_key: &[u8; 32],
+    dh_self_secret: &StaticSecret,
+    incoming_dh: &PublicKey,
+) -> RatchetStep {
+    let dh_output = dh_self_secret.diffie_hellman(incoming_dh);
+    let (root_after_recv, receiving_chain_key) = kdf_rk(root_key, dh_output.as_bytes());
+
+    let new_secret = StaticSecret::random_from_rng(OsRng);
+    let new_public = PublicKey::from(&new_secret);
+    let dh_output = new_secret.diffie_hellman(incoming_dh);
+    let (root_after_send, sending_chain_key) = kdf_rk(&root_after_recv, dh_output.as_bytes());
+
+    RatchetStep {
+        new_root_key: root_after_send,
+        new_receiving_chain_key: receiving_chain_key,
+        new_sending_chain_key: sending_chain_key,
+        new_dh_self_secret: new_secret,
+        new_dh_self_public: new_public,
+    }
 }
 
 /// Derive the AEAD encryption key and nonce from a single-use message key, per
@@ -354,6 +465,58 @@ mod tests {
         let envelope = alice.encrypt(&chat("hello")).unwrap();
         let plaintext = bob.decrypt_raw(&envelope).unwrap();
         assert_eq!(read_chat(&plaintext), "hello");
+    }
+
+    /// Every other test in this module passes `Envelope` structs directly between
+    /// `encrypt`/`decrypt_raw` in memory — that's never how a message actually travels.
+    /// This is the one test that puts the fixed-layout wire encoding (`Envelope::encode`/
+    /// `decode`, `docs/MESSAGE_SCHEMA.md` §2) in the loop the way a real transport would:
+    /// bytes out, bytes in, across several turns including a DH ratchet step.
+    #[test]
+    fn survives_the_actual_wire_encoding_across_several_turns() {
+        let (mut alice, mut bob) = matched_pair();
+
+        let wire = alice.encrypt(&chat("turn 1")).unwrap().encode();
+        let received = Envelope::decode(&wire).unwrap();
+        assert_eq!(read_chat(&bob.decrypt_raw(&received).unwrap()), "turn 1");
+
+        let wire = bob.encrypt(&chat("turn 2")).unwrap().encode();
+        let received = Envelope::decode(&wire).unwrap();
+        assert_eq!(read_chat(&alice.decrypt_raw(&received).unwrap()), "turn 2");
+
+        let wire = alice.encrypt(&chat("turn 3")).unwrap().encode();
+        let received = Envelope::decode(&wire).unwrap();
+        assert_eq!(read_chat(&bob.decrypt_raw(&received).unwrap()), "turn 3");
+    }
+
+    /// The security property the whole "single-use message key" design rests on,
+    /// checked directly rather than only implied by other tests passing: iterating
+    /// `KDF_CK` never produces a repeated message key or chain key. A repeated message
+    /// key would mean a repeated (key, nonce) pair handed to ChaCha20-Poly1305 — a
+    /// catastrophic AEAD failure (nonce reuse breaks both confidentiality and
+    /// authentication for the two messages involved). This can't be proven for all
+    /// possible inputs by a test, but 100,000 consecutive steps from a fixed starting
+    /// point give real confidence against a gross implementation bug (e.g. an
+    /// accidentally-constant key, or the chain key not actually advancing).
+    #[test]
+    fn chain_key_derivation_never_repeats_across_many_iterations() {
+        use std::collections::HashSet;
+
+        let mut chain_key = [7u8; 32];
+        let mut seen_message_keys = HashSet::new();
+        let mut seen_chain_keys = HashSet::new();
+        for step in 0..100_000 {
+            let (next_chain_key, message_key) = kdf_ck(&chain_key);
+            assert!(
+                seen_message_keys.insert(message_key),
+                "message key repeated at step {step} — would mean AEAD key/nonce reuse"
+            );
+            assert!(
+                seen_chain_keys.insert(chain_key),
+                "chain key repeated at step {step} — the ratchet chain would be cycling"
+            );
+            chain_key = next_chain_key;
+        }
     }
 
     #[test]
@@ -485,5 +648,89 @@ mod tests {
             bob.decrypt_raw(&last.unwrap()),
             Err(Error::MaxSkipExceeded(5))
         ));
+    }
+
+    /// Regression test for a real vulnerability found while reviewing this module: an
+    /// unauthenticated attacker who doesn't hold any real key can still cause a DH
+    /// ratchet step by sending an envelope with an arbitrary `dh_pub` (a fresh,
+    /// unrelated keypair) and garbage ciphertext. Before the fix, `decrypt_raw` applied
+    /// the DH ratchet step's state mutation *before* checking the AEAD tag, so even
+    /// though the forged envelope itself was correctly rejected, the receiver's ratchet
+    /// state was already corrupted — `dh_remote` now pointed at the attacker's bogus
+    /// key, permanently desynchronizing the conversation the next time the real peer
+    /// sent a legitimate message. `decrypt_raw` is now transactional: everything is
+    /// computed into locals and only committed to `self` after the AEAD tag verifies.
+    #[test]
+    fn garbage_envelope_does_not_desync_the_ratchet() {
+        let (mut alice, mut bob) = matched_pair();
+
+        let e0 = alice.encrypt(&chat("message 1")).unwrap();
+        assert_eq!(read_chat(&bob.decrypt_raw(&e0).unwrap()), "message 1");
+
+        // An attacker with no knowledge of any real key forges an envelope using a
+        // freshly generated, completely unrelated keypair.
+        let attacker_secret = StaticSecret::random_from_rng(OsRng);
+        let attacker_public = PublicKey::from(&attacker_secret);
+        let forged = Envelope {
+            version: crate::envelope::CURRENT_VERSION,
+            conversation_id: [1u8; 16],
+            dh_pub: attacker_public.to_bytes(),
+            pn: 0,
+            n: 0,
+            ciphertext: vec![0u8; 48],
+        };
+        assert!(
+            matches!(bob.decrypt_raw(&forged), Err(Error::Aead)),
+            "a forged envelope must be rejected as an AEAD failure"
+        );
+
+        // Alice, unaware anything happened, sends her next real message using her
+        // unchanged keypair. It must still decrypt cleanly — the rejected forgery
+        // must have left no trace in Bob's ratchet state.
+        let e1 = alice.encrypt(&chat("message 2")).unwrap();
+        assert_eq!(
+            read_chat(&bob.decrypt_raw(&e1).unwrap()),
+            "message 2",
+            "a single rejected forged envelope must not desynchronize the conversation"
+        );
+
+        // And the conversation keeps working normally afterward, in both directions.
+        let e2 = bob.encrypt(&chat("message 3")).unwrap();
+        assert_eq!(read_chat(&alice.decrypt_raw(&e2).unwrap()), "message 3");
+    }
+
+    /// The same probe, but the forged envelope arrives *instead of* — not alongside —
+    /// a legitimate first contact from an unknown-to-Bob key, and with a `pn` that
+    /// claims a large previous chain length. Before the fix this could also be used to
+    /// force a large, wasted skipped-key derivation as a side effect of a step that
+    /// ultimately gets discarded; confirms the bound still applies and nothing is
+    /// committed on failure.
+    #[test]
+    fn garbage_envelope_with_inflated_pn_is_rejected_without_side_effects() {
+        let (mut alice, mut bob) = matched_pair();
+        let e0 = alice.encrypt(&chat("hi")).unwrap();
+        assert_eq!(read_chat(&bob.decrypt_raw(&e0).unwrap()), "hi");
+
+        let attacker_secret = StaticSecret::random_from_rng(OsRng);
+        let attacker_public = PublicKey::from(&attacker_secret);
+        let forged = Envelope {
+            version: crate::envelope::CURRENT_VERSION,
+            conversation_id: [1u8; 16],
+            dh_pub: attacker_public.to_bytes(),
+            pn: 10_000_000,
+            n: 0,
+            ciphertext: vec![0u8; 48],
+        };
+        // Either an AEAD failure or a MaxSkipExceeded is an acceptable rejection here —
+        // what matters is that it's rejected, and rejected without mutating state.
+        assert!(bob.decrypt_raw(&forged).is_err());
+        assert_eq!(
+            bob.skipped_key_count(),
+            0,
+            "a rejected forgery must not populate the skipped-key cache"
+        );
+
+        let e1 = alice.encrypt(&chat("still fine")).unwrap();
+        assert_eq!(read_chat(&bob.decrypt_raw(&e1).unwrap()), "still fine");
     }
 }
