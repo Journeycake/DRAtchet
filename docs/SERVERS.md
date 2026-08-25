@@ -165,7 +165,15 @@ plaintext for a conversation, their own store ends up holding a full copy
 of that conversation regardless — mutual consent governs whether that
 happens at all, not how many independent copies exist once it does.
 
-### 2.2 Deployment profile A — minimal purpose-built server (recommended for v1)
+**Naming note:** the two storage options below are labeled 1/2, deliberately
+*not* "profile A/B" — `ARCHITECTURE.md` §7.1 already uses Profile A/B/C for
+a different axis entirely (how much conversation *content* gets stored:
+full, sent-only, or none). These two options are only about *where and how*
+whatever content the effective content-profile allows gets hosted; the two
+are independent choices and reusing the same letters for both would make
+every cross-reference ambiguous.
+
+### 2.2 Storage option 1 — minimal purpose-built server (recommended for v1)
 
 Small, self-hostable HTTP service (e.g. Rust + `axum`). Single-tenant (one
 user's own instance) or lightly multi-tenant (e.g. a household or small
@@ -176,7 +184,8 @@ operator, not a cross-party trust relationship.
 |---|---|
 | `PUT /v1/recovery/{conversation_id}/{seq}` | Upload one entry — body is the CBOR `RecoveryBackupEntry` (§5 of `MESSAGE_SCHEMA.md`); `Authorization: Bearer <owner's API key>` |
 | `GET /v1/recovery/{conversation_id}?since_seq=N` | Fetch entries after `N`, paginated |
-| `DELETE /v1/recovery/{conversation_id}` | Purge all stored entries for one conversation (used on revoke, `ARCHITECTURE.md` §7) |
+| `DELETE /v1/recovery/{conversation_id}` | Purge **all** stored entries for one conversation (used when the effective content-profile reaches Profile C, `ARCHITECTURE.md` §7.3) |
+| `DELETE /v1/recovery/{conversation_id}?written_by=peer` | Purge only peer-authored entries (used on an A→B content-profile tightening, `ARCHITECTURE.md` §7.3 — leaves this account's own authored entries in place) |
 | `DELETE /v1/recovery` | Purge everything under this API key (full account wipe) |
 
 - Auth is a plain bearer API key the store's owner generates for their own
@@ -185,16 +194,21 @@ operator, not a cross-party trust relationship.
   already-encrypted bytes: flat files, SQLite, or any KV store all work
   equally well server-side.
 
-### 2.3 Deployment profile B — zero-custom-code (direct object storage)
+### 2.3 Storage option 2 — zero-custom-code (direct object storage)
 
 - Client writes directly to an S3-compatible bucket the user already
   controls, using credentials scoped to a `recovery/{conversation_id}/*`
   prefix (bucket policy or short-lived STS-issued credentials).
 - No server binary to run at all — for users who want self-hosted recovery
   without operating a service.
-- Trade-off vs. profile A: rate limiting, precise delete-everything
+- The filtered-delete behavior above (peer-authored-only purge) has to be
+  done client-side here — list objects under the conversation's prefix,
+  inspect each entry's `written_by` field, delete the matching ones — since
+  a plain bucket has no server-side filter to call. Client complexity is
+  the trade for zero server code.
+- Trade-off vs. option 1: rate limiting, precise delete-everything
   semantics, and audit logging are whatever the cloud provider's bucket
-  tooling gives you, not purpose-built. Recommend profile A once a user
+  tooling gives you, not purpose-built. Recommend option 1 once a user
   wants more control than "store and fetch blobs."
 
 ### 2.4 Cross-party hosting caveat
@@ -218,8 +232,11 @@ Rendezvous and mailbox control messages (`RendezvousOffer`/`Answer`,
 `DeliveryAck` payload they eventually carry, are in `MESSAGE_SCHEMA.md` §7.
 Recovery Store request/response bodies reuse the `RecoveryBackupEntry`
 schema from `MESSAGE_SCHEMA.md` §5 directly — the HTTP layer in §2.2 above
-adds only routing (`conversation_id`/`seq` in the URL) and auth, no new
-payload shape.
+adds only routing (`conversation_id`/`seq` in the URL, plus the
+`written_by` filter on delete) and auth, no new payload shape.
+`RecoveryProfileAnnounce` (`MESSAGE_SCHEMA.md` §8) is exchanged directly
+between the two conversation participants, not with this service — it
+never touches the Recovery Store or the Signaling & Presence Service.
 
 ## 4. Open questions
 
@@ -237,7 +254,9 @@ services.
 - **Presence "away" state:** ship the idle-timeout `away` state in v1, or
   keep it to a simpler online/offline-only signal until there's a concrete
   UX reason for the extra state? Low-stakes, doesn't block other work.
-- **Recovery Store deployment profile default:** ship profile A (§2.2) only
-  for v1, or also document profile B (§2.3) as a supported path from day
-  one? Recommend A first since it gives cleaner delete/rate-limit behavior;
-  B is a natural v2 addition once there's a reason to support it.
+- **Recovery Store hosting default:** ship storage option 1, the
+  purpose-built server (§2.2), only for v1, or also document option 2,
+  direct object storage (§2.3), as a supported path from day one?
+  Recommend option 1 first since it gives cleaner delete/rate-limit
+  behavior; option 2 is a natural v2 addition once there's a reason to
+  support it.

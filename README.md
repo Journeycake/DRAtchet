@@ -32,9 +32,11 @@ storage). Highlights:
 - Presence: contacts-only online-status, held in memory only by the same
   minimal signaling service used for peer-to-peer rendezvous — never
   logged, never queryable for arbitrary accounts.
-- Per-conversation message recovery — off by default, opt-in only with
-  mutual consent from both participants, and hostable on storage the
-  participants themselves control rather than a DRAtchet-run service.
+- Per-conversation message recovery — off by default, graded into three
+  profiles (full, sent-only, none) each account sets for itself, composed
+  per conversation with the more restrictive side always winning, and
+  hostable on storage the participants themselves control rather than a
+  DRAtchet-run service.
 - Client architecture (Tauri + Rust, one codebase for Windows/macOS/Linux)
   and threat model.
 - Security hardening pulled from prior art: Signal (sealed sender, message

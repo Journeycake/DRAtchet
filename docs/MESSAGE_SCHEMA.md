@@ -71,12 +71,13 @@ encryption) in `ARCHITECTURE.md` §10, rather than solved here.
 
 **Payload type:** the plaintext (before padding, inside what becomes
 `ciphertext`) starts with a 1-byte `payload_type` tag: `0 = chat message`,
-`1 = DeliveryAck` (§7), reserved values for future control payloads
-(e.g. a `ReadReceipt`, `ARCHITECTURE.md` §4.6). This is what lets a
-recipient tell a chat message apart from a control message like
-`DeliveryAck` after decrypting — both travel inside the same ratchet
-envelope and get the same confidentiality/padding treatment; nothing about
-a control message is distinguishable on the wire before decryption.
+`1 = DeliveryAck` (§7), `2 = RecoveryProfileAnnounce` (§8), reserved values
+for future control payloads (e.g. a `ReadReceipt`, `ARCHITECTURE.md` §4.6).
+This is what lets a recipient tell a chat message apart from a control
+message like `DeliveryAck` or `RecoveryProfileAnnounce` after decrypting —
+all travel inside the same ratchet envelope and get the same
+confidentiality/padding treatment; nothing about a control message is
+distinguishable on the wire before decryption.
 
 **Padding:** the tagged plaintext (`payload_type` + content) is padded to a
 fixed bucket size before encryption — e.g. the next multiple of 160 bytes,
@@ -133,11 +134,10 @@ ratchet envelope above.
 
 ## 5. Recovery backup entry (CBOR) — §7 opt-in recovery
 
-Written to whatever recovery store the two participants agreed on
-(self-hosted cloud storage or, later, a managed option — see
-`ARCHITECTURE.md` §4 Tier 2). One entry per message, independent of the
-ratchet's own `n`/`pn` counters so recovery ordering never depends on live
-ratchet internals.
+Written to whichever recovery store an account has configured for itself
+(§2.1 of `SERVERS.md` — per-participant, not shared). One entry per
+message, independent of the ratchet's own `n`/`pn` counters so recovery
+ordering never depends on live ratchet internals.
 
 | Field | Type | Notes |
 |---|---|---|
@@ -145,7 +145,7 @@ ratchet internals.
 | `seq` | uint64 | monotonic per-conversation sequence number, assigned locally |
 | `ciphertext` | bytes | `AEAD(plaintext)` under the conversation recovery key, independent key from any ratchet message key |
 | `created_at` | uint64 | unix seconds |
-| `written_by` | 1 byte | which participant uploaded this entry (sender uploads by default; either side may also upload as redundancy — dedup by `(conversation_id, seq)`) |
+| `written_by` | 1 byte enum: `0 = self`, `1 = peer` | who authored the underlying message, from the perspective of whichever account owns this store. This field now does double duty beyond its original dedup role: it's what a client checks against the conversation's *effective* recovery profile (`ARCHITECTURE.md` §7.2) to decide whether an entry may be written at all (effective Profile B skips `written_by = peer` entries entirely), and it's the selector the Recovery Store's filtered delete uses to purge only peer-authored entries on a tightening from effective Profile A to B (`SERVERS.md` §2.2, `ARCHITECTURE.md` §7.3) |
 
 ## 6. Presence protocol (CBOR, over the Signaling & Presence Service's WebSocket)
 
@@ -205,3 +205,19 @@ session, so they're plain CBOR over the WebSocket with no ratchet
 encryption of their own — the service has to be able to read routing
 metadata to do its job (§4.1/§4.2 of `ARCHITECTURE.md`), unlike message
 content.
+
+## 8. Recovery profile negotiation (CBOR) — §7.2/§7.3 of `ARCHITECTURE.md`
+
+| Field | Type | Notes |
+|---|---|---|
+| `profile` | 1 byte enum: `0 = C (None)`, `1 = B (Sent-only)`, `2 = A (Full)` | the announcing account's *current* recovery profile for this conversation — either its global default or an active per-conversation override; the recipient doesn't need to know which |
+
+Like `DeliveryAck`, `RecoveryProfileAnnounce` is CBOR-encoded content
+carried inside a ratchet envelope, tagged `payload_type = 2` (§2) — sent at
+session establishment and again any time the announcing account's profile
+for that conversation changes. A recipient who has never received one for
+a given conversation treats the counterpart as Profile C (fail-closed,
+`ARCHITECTURE.md` §7.2) rather than assuming a default. The effective
+policy — `min(own profile, last-announced peer profile)` — is computed
+independently and identically by both clients; no response message is
+needed, and there's no proposal to accept or reject.

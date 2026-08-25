@@ -119,7 +119,7 @@ Once the root key exists, per-message crypto is entirely symmetric:
 | DH ratchet keypair | Until the peer's next reply | Replaced by next DH ratchet step |
 | Per-message symmetric key | Single message | Immediately after that message is encrypted/decrypted |
 | Remote pairing code (§6.4) | Single verification attempt, ~10 min TTL | On first successful match, or expiry — whichever first |
-| Conversation recovery key (§7, opt-in only) | Life of the conversation's recoverable-mode setting | Only if recovery is later disabled *and* the user explicitly deletes backups; otherwise persists by design |
+| Conversation recovery key (§7, only while the *effective* policy is A or B) | Life of the conversation's effective recovery policy | Automatically, the moment the effective policy reaches Profile C (§7.2/7.3) — individual stored entries are also auto-purged at that point, not just the key |
 
 ### 3.5 Message wire format: full OpenPGP vs. lightweight custom envelope
 
@@ -305,23 +305,25 @@ sequenceDiagram
 - See §4.5 for the exact retry/backoff parameters and §4.6 for how
   `DeliveryAck` prunes the sender's local outbox.
 
-### 4.3 Tier 2 — opt-in recovery layer (mutual consent, self-hostable)
+### 4.3 Tier 2 — opt-in recovery layer (graded profiles, self-hostable)
 
 Layers on top of *either* Tier 0 or Tier 1 — orthogonal to which delivery
 tier is in use. This is exactly the §7 recovery design, restated with the
 hosting question now answered: the durable, decryptable-with-the-recovery-
 key backup store doesn't need to be a DRAtchet-operated service at all, and
 — now specified in full in [`SERVERS.md`](SERVERS.md) §2 — it doesn't need
-to be *shared* between the two participants either. Each side who opts in
-configures their **own** recovery destination (their own self-hosted server
-or cloud bucket); mutual consent still gates whether backup happens at all
-for that conversation, but the storage itself is single-owner, which keeps
+to be *shared* between the two participants either. Each side configures
+their **own** recovery destination (their own self-hosted server or cloud
+bucket); what actually gets written there is governed by the conversation's
+*effective* policy — the more restrictive of the two sides' Profile A/B/C
+choices (§7.2) — but the storage itself stays single-owner, which keeps
 blast radius, deletion semantics, and auth all simpler than a shared store
 would — see `SERVERS.md` §2 for the full reasoning and API.
 
-Activating Tier 2 is a conversation-level, mutual, explicit decision (§7) —
-it never happens as a side effect of picking a delivery tier, and picking
-Tier 0 for delivery doesn't preclude Tier 2 for recovery or vice versa.
+Tier 2's activation is a conversation-level outcome computed from both
+sides' recovery profiles (§7), not a manual accept step — it never happens
+as a side effect of picking a delivery tier, and picking Tier 0 for
+delivery doesn't preclude Tier 2 for recovery or vice versa.
 
 ### 4.4 Cross-cutting notes
 
@@ -532,36 +534,119 @@ backed up anywhere. Losing a device loses that conversation's history from
 that point on; this is forward secrecy working as intended, not a missing
 feature.
 
-**Opt-in recoverable mode**, negotiated per conversation, requires
-**mutual** consent:
+### 7.1 Three recovery profiles, not a binary switch
 
-- Either participant can *propose* enabling recovery (a signed in-app
-  proposal message). Recovery activates only once **both** sides explicitly
-  accept — if only one side agrees, the conversation stays unrecoverable
-  (the default holds, per the requirement that it takes both parties).
-- Either side can later revoke consent, stopping backup for *future*
-  messages. Revoking does not retroactively delete what's already been
-  backed up — say this plainly in the UI, and offer a separate "delete my
-  backups for this conversation" action rather than implying revoke does it
-  automatically.
+Each account sets its own **Recovery Profile**, ranked here from most to
+least data retained:
 
-**Mechanism**, once mutually enabled — deliberately layered *on top of* the
-ratchet rather than changing it:
+| Profile | What gets stored (in *that user's own* store, §2.1 of `SERVERS.md`) | Restrictiveness |
+|---|---|---|
+| **A — Full** | Everything that user's client has plaintext for: messages they sent *and* received | Least restrictive |
+| **B — Sent-only** | Only messages that user authored — nothing they received from the other party | Middle |
+| **C — None** | Nothing. Full wipe: no recovery for this conversation, by either side | Most restrictive |
+
+Profile B exists for a real, distinct reason from "off": a user may be
+comfortable being the custodian of a durable copy of *their own* words but
+not want to hold a durable copy of what someone else sent them — courtesy,
+deniability-adjacent, or a support/professional context where retaining a
+counterpart's content carries its own liability. It's a genuinely different
+point on the spectrum, not a watered-down version of A.
+
+### 7.2 Effective policy: most restrictive wins
+
+The two participants' profiles are not independent settings that each
+quietly do their own thing — they compose into one **effective policy for
+that conversation**, and composition always favors the more restrictive
+side:
+
+```
+effective(conversation) = min(profile(A-side), profile(B-side))
+      ordering: C (0, most restrictive) < B (1) < A (2, least restrictive)
+```
+
+Worked example (the one in the requirement): Alice sets Profile B (store
+what I send). Bob sets Profile C (store nothing). `min(B, C) = C`. The
+effective policy is **C for the conversation** — Alice does **not** get to
+keep her own sent messages either, because Bob's more restrictive choice
+governs the whole conversation, not just Bob's own store. A party can
+always unilaterally make a conversation *more* restrictive by choosing C or
+B; no one can unilaterally make it *less* restrictive than their
+counterpart allows.
+
+This replaces the earlier binary "propose, then both sides explicitly
+accept" flow with something simpler and deadlock-free: there's no proposal
+to leave hanging. Each side continuously publishes its own current profile
+(§7.3); the effective policy is a pure, deterministic function of both,
+recomputed live. Silence/unknown fails closed to **C**, never to A or B —
+an account whose counterpart hasn't announced a profile yet (e.g., an
+old client, or the announcement hasn't arrived) is treated as if that
+counterpart chose C, so ambiguity can never accidentally produce more
+storage than intended.
+
+**UX requirement, not just a protocol note:** if a user's own profile is
+more permissive than the conversation's effective policy, the client must
+say so plainly ("You've set Full Recovery, but this conversation is
+storing nothing because your contact has chosen not to recover messages")
+— otherwise a user could reasonably believe they have a backup they don't.
+
+### 7.3 Mechanism
+
+Deliberately layered *on top of* the ratchet rather than changing it, same
+as before:
 
 - The normal ratchet encrypt/decrypt path (§3.3) is untouched — per-message
   keys are still single-use and discarded exactly as in the default case.
-- A separate **conversation recovery key** is derived once, at the moment
-  both sides confirm opt-in, via HKDF over fresh randomness contributed by
-  *both* sides (so neither party unilaterally controls it) plus the current
-  root key.
-- After the normal send/receive path completes, each client additionally
-  encrypts the plaintext under the conversation recovery key (AEAD) and
-  uploads that ciphertext to a backup store. This keeps forward secrecy
-  intact for the live ratchet layer — recoverability is an explicit, opted-in
-  second copy, not a weakening of the ratchet itself.
+- Each account announces its current profile via `RecoveryProfileAnnounce`
+  (§8 of `MESSAGE_SCHEMA.md`) — sent at session establishment, and again
+  whenever the local profile changes (a global default, with an optional
+  per-conversation override — the announcement carries whichever is
+  currently active for that conversation). Like `DeliveryAck` (§4.6), this
+  travels as an ordinary ratchet payload — authenticated between the two
+  parties, invisible to any relay.
+- The moment the effective policy is anything other than C for a
+  conversation for the first time, a **conversation recovery key** is
+  derived via HKDF over fresh randomness contributed by *both* sides plus
+  the current root key — same derivation as before, just triggered by the
+  computed effective policy rather than an explicit accept step.
+- **Write-time filtering, driven by the effective policy, not the local
+  profile alone:** after the normal send/receive path completes, a client
+  encrypts the plaintext under the conversation recovery key and uploads it
+  to its own store — but only if the effective policy allows storing *that
+  particular message*. Under effective A, both sent and received messages
+  are written. Under effective B, only messages that account authored are
+  written (the `written_by` field already in `RecoveryBackupEntry`, §5 of
+  `MESSAGE_SCHEMA.md`, is what a client checks against its own identity to
+  decide). Under effective C, nothing is written, ever.
+- **Tightening purges retroactively — this supersedes the earlier
+  "revoke doesn't delete automatically" note.** With three graded levels
+  instead of a binary switch, leaving already-stored entries in place after
+  the effective policy tightens would mean a store silently holds more than
+  the current mutual agreement covers, undermining the reason profiles
+  compose at all. So: the moment the effective policy for a conversation
+  becomes more restrictive (A→B, B→C, or A→C), each client purges whatever
+  it's holding that the new effective policy no longer permits —
+  `written_by = peer` entries on an A→B tightening, everything on a
+  transition to C. The Recovery Store API supports this directly (§2.2 of
+  `SERVERS.md`, filtered delete). The UI surfaces this as a visible
+  notice ("N previously backed-up messages were deleted because your
+  contact updated their recovery setting"), not a silent background
+  cleanup — a purge is exactly the kind of action that needs to stay
+  legible to the user even though it doesn't need their confirmation to
+  proceed (the whole point is that a counterpart's more restrictive choice
+  doesn't require anyone's permission to take effect).
+- **Loosening never retroactively creates history.** Going B→A doesn't
+  reconstruct previously-skipped received messages — filtering is a
+  write-time decision, not stored-then-hidden, so there's nothing to
+  reveal. Only genuinely new writes going forward benefit from a loosened
+  policy.
+- **The conversation recovery key itself** is discarded when the effective
+  policy reaches C (nothing left for it to protect), but persists across an
+  A↔B tightening/loosening — only *which* entries get written changes,
+  not the key underneath them.
 - The conversation recovery key must itself survive a lost device to be
-  useful, which means it needs to be escrowed somewhere. Two options,
-  covered in §9 as an open decision:
+  useful, which means it needs to be escrowed somewhere (only relevant once
+  the effective policy is A or B for at least one side). Two options,
+  covered in §10 as an open decision:
   a. **Self-custodied recovery phrase** (BIP39-style words), shown once,
      stored by the user — the server never holds anything decryptable.
      Strongest privacy, worst UX (permanently lost if the user loses it).
@@ -573,6 +658,21 @@ ratchet rather than changing it:
   - Recommendation for v1: (a), self-custodied — no secure-enclave
     infrastructure required to ship; revisit (b) later if user demand for
     better recovery UX justifies building that infra.
+
+### 7.4 The honest limit of any of this
+
+Worth stating plainly, not just implying: **profiles are enforced by
+honest-client conformance, not cryptography.** Every message already
+reaches the recipient's client as plaintext, by construction of end-to-end
+messaging — nothing stops a modified or malicious client from retaining
+everything regardless of the announced or effective profile, the same way
+nothing stops a screenshot. `RecoveryProfileAnnounce` and the effective-
+policy computation are a real, meaningful commitment between two honest
+clients — not a technical guarantee against a party who chooses not to
+honor it. This is the same category of limit the original recoverable-mode
+threat-model note (§8) already flags; the three-profile system doesn't
+change the category, just gives honest clients a more precise agreement to
+honor.
 
 ## 8. Threat model
 
@@ -614,7 +714,7 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
 - A Recovery Store operator (`SERVERS.md` §2) sees that user's own backup
   metadata (conversation cadence, sizes, timing) even though it never sees
   plaintext — contained to whichever user's store it is under the
-  recommended per-participant model, but see `SERVERS.md` §2.3 for the
+  recommended per-participant model, but see `SERVERS.md` §2.4 for the
   cross-party hosting case where that containment breaks down.
 - **Tier 0 IP exposure between contacts** (§4.1, §11.2): accepted as the
   default trade of a serverless P2P design, mitigated but not eliminated by
@@ -623,11 +723,20 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
   benefits of direct P2P.
 - Multi-device and group messaging (see Roadmap).
 - Recoverable-mode conversations (§7) intentionally accept a narrower threat
-  model by design and by mutual consent: a durable, decryptable-with-the-
-  recovery-key copy of plaintext exists somewhere once both sides opt in.
-  That's a deliberate trade the *users* made for that conversation, not a
-  general weakening of DRAtchet's default guarantees — the UI must state
-  this plainly at the moment of opt-in, not just in this document.
+  model by design, scoped to whatever the conversation's *effective*
+  profile actually permits (§7.2): under effective Profile A, a durable,
+  decryptable-with-the-recovery-key copy of the full conversation exists in
+  each opted-in side's own store; under effective Profile B, only each
+  side's own authored messages do; under effective Profile C, none does,
+  regardless of what either side's individual profile requested. That's a
+  deliberate trade the *users* made for that conversation, bounded by
+  whichever side chose to be more restrictive — not a general weakening of
+  DRAtchet's default guarantees, and not something either side can grant
+  themselves more of than the other allows. The UI must state the resulting
+  effective policy plainly, not just each side's own setting (§7.2). And
+  as §7.4 states outright: this is enforced by honest-client conformance,
+  not cryptography — no protocol design stops a modified client from
+  ignoring the agreed profile entirely.
 - Peer-authentication paths (§6) are only as strong as their inputs: Path 1
   is strong (physical presence); Path 2 is only as strong as the side
   channel used to convey the pairing code. Neither path protects a user who
@@ -652,9 +761,10 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
    direct-connect" per-contact privacy toggle (§11.2 — this is also what
    turns a v1 install into the server-based deployment model from §12 when
    paired with running the relay on durable infrastructure), per-
-   conversation disappearing-message timers (§11.5), per-conversation
-   opt-in Tier 2 recovery with a self-custodied recovery phrase, deployment
-   profile A — the purpose-built server (§7, `SERVERS.md` §2.1).
+   conversation disappearing-message timers (§11.5), the three-level Tier 2
+   recovery profile system (§7) with a self-custodied recovery phrase,
+   hosted via storage option 1, the purpose-built server (`SERVERS.md`
+   §2.2).
 3. **v2**: multi-device support, group chat (MLS/RFC 9420-style group key
    management — TreeKEM's tree-based scaling is the better-established
    approach today vs. naive pairwise sender-keys fan-out), prekey bundle
@@ -701,10 +811,16 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
 - Presence "away" heuristic (idle timeout before online → away) and whether
   it ships at all in v1 vs. a simpler online/offline-only signal —
   unresolved, low-stakes, doesn't block other work.
-- Recovery Store deployment profile: purpose-built minimal server (§2.1 of
-  `SERVERS.md`, recommended for v1 — better delete/rate-limit control) vs.
-  direct S3-compatible bucket writes (§2.2, zero custom server code) —
-  worth offering both eventually; v1 ships profile A first.
+- Recovery Store hosting: purpose-built minimal server (`SERVERS.md` §2.2,
+  recommended for v1 — better delete/rate-limit control, including the
+  filtered peer-authored-only purge §7.3 needs) vs. direct S3-compatible
+  bucket writes (§2.3, zero custom server code) — worth offering both
+  eventually; v1 ships the server option first.
+- Per-conversation override UI for the recovery content profile (§7.1):
+  v1 assumed to ship both a global per-account default and a per-
+  conversation override, since the protocol (`RecoveryProfileAnnounce`)
+  doesn't distinguish the two — the open question is purely the settings
+  UI/UX for setting an override, not a protocol gap.
 - `ReadReceipt` (§4.6): whether it ships at all in v1 alongside
   `DeliveryAck`, and if so, defaulting off with a per-conversation toggle —
   leaning toward shipping it, but off-by-default is the part that isn't
