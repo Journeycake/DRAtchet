@@ -74,13 +74,15 @@ fn full_handshake_with_one_time_prekey_then_ratchet_conversation() {
         init.root_key,
         bob_bundle.signed_prekey.public,
         DEFAULT_MAX_SKIP,
-    );
+    )
+    .unwrap();
     let mut bob_ratchet = RatchetState::init_as_responder(
         conv_id,
         bob_root_key,
         bob_account.signed_prekey_secret().clone(),
         DEFAULT_MAX_SKIP,
-    );
+    )
+    .unwrap();
 
     let e0 = alice_ratchet.encrypt(&chat("hello, Bob")).unwrap();
     assert_eq!(

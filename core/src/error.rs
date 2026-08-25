@@ -11,6 +11,9 @@ pub enum Error {
     #[error("skipped-message key cache would exceed MAX_SKIP ({0}); refusing to derive further")]
     MaxSkipExceeded(u32),
 
+    #[error("max_skip {got} is out of the supported configurable range [{min}, {max}]")]
+    InvalidMaxSkip { got: u32, min: u32, max: u32 },
+
     #[error("no matching message key found for this header (already used, or too old)")]
     UnknownMessageKey,
 

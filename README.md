@@ -56,6 +56,12 @@ the exact CI setup. `core/tests/queue_depth.rs` is the test that actually
 checks the queue-depth claim above against arbitrarily-ordered delivery,
 including a property test over random burst sizes and delivery orderings.
 
+Fuzz targets for the two parsers that handle untrusted bytes off the wire
+(`Envelope::decode`, `payload::untag_and_unpad`) live in `core/fuzz/` — see
+[`core/fuzz/README.md`](core/fuzz/README.md). CI runs a 60-second smoke pass
+on each per PR; a longer local run is worth doing before any change to
+either parser.
+
 ## License
 
 GPL-3.0 — see [`LICENSE`](LICENSE).

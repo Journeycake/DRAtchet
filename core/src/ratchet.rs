@@ -24,7 +24,22 @@ use crate::payload;
 /// Bound on how many message keys may be derived-ahead-and-cached for a single
 /// receiving chain before `decrypt` refuses and returns an error rather than
 /// growing the cache unboundedly. Matches `MAX_SKIP` in `docs/ARCHITECTURE.md` §3.3.
-pub const DEFAULT_MAX_SKIP: u32 = 1000;
+/// Configurable per session within [`MIN_MAX_SKIP`, `MAX_MAX_SKIP`] — see
+/// [`RatchetState::init_as_initiator`]/[`RatchetState::init_as_responder`].
+pub const DEFAULT_MAX_SKIP: u32 = 100;
+
+/// Lower bound on a configurable `max_skip`: below this, an ordinary burst of queued
+/// messages (the scenario this whole project exists to handle — see
+/// `docs/ARCHITECTURE.md` §1) risks tripping `MaxSkipExceeded` in normal use, not just
+/// under attack.
+pub const MIN_MAX_SKIP: u32 = 50;
+
+/// Upper bound on a configurable `max_skip`: the skipped-key cache is a per-DH-key
+/// `HashMap` a peer's own client has to hold in memory (and an unauthenticated forged
+/// envelope's `pn` field, per §11.8 of `docs/ARCHITECTURE.md`, can force derivation up
+/// to this bound before the AEAD check ultimately rejects it) — this caps how large a
+/// single hostile or corrupted `pn`/`n` can force that derivation to grow.
+pub const MAX_MAX_SKIP: u32 = 150;
 
 /// ChaCha20-Poly1305's authentication tag length; its ciphertext is always exactly
 /// `plaintext.len() + AEAD_TAG_LEN` bytes.
@@ -65,18 +80,23 @@ impl RatchetState {
     /// The X3DH initiator's ratchet: generates a fresh DH ratchet keypair immediately
     /// and derives a sending chain against the responder's already-known DH public key
     /// (their signed prekey, in the X3DH handshake).
+    ///
+    /// `max_skip` must fall within [`MIN_MAX_SKIP`, `MAX_MAX_SKIP`] — see
+    /// [`validate_max_skip`] for why both bounds exist.
     pub fn init_as_initiator(
         conversation_id: [u8; 16],
         root_key: [u8; 32],
         responder_dh_public: PublicKey,
         max_skip: u32,
-    ) -> Self {
+    ) -> Result<Self> {
+        validate_max_skip(max_skip)?;
+
         let dh_self_secret = StaticSecret::random_from_rng(OsRng);
         let dh_self_public = PublicKey::from(&dh_self_secret);
         let dh_output = dh_self_secret.diffie_hellman(&responder_dh_public);
         let (new_root, sending_chain_key) = kdf_rk(&root_key, dh_output.as_bytes());
 
-        RatchetState {
+        Ok(RatchetState {
             conversation_id,
             max_skip,
             root_key: Zeroizing::new(new_root),
@@ -88,20 +108,25 @@ impl RatchetState {
             recv_n: 0,
             prev_chain_len: 0,
             skipped: HashMap::new(),
-        }
+        })
     }
 
     /// The X3DH responder's ratchet: keeps using the DH keypair whose public half the
     /// initiator already X3DH'd against (typically the signed prekey), and doesn't
     /// derive a receiving chain until the initiator's first message actually arrives.
+    ///
+    /// `max_skip` must fall within [`MIN_MAX_SKIP`, `MAX_MAX_SKIP`] — see
+    /// [`validate_max_skip`] for why both bounds exist.
     pub fn init_as_responder(
         conversation_id: [u8; 16],
         root_key: [u8; 32],
         own_dh_secret: StaticSecret,
         max_skip: u32,
-    ) -> Self {
+    ) -> Result<Self> {
+        validate_max_skip(max_skip)?;
+
         let own_dh_public = PublicKey::from(&own_dh_secret);
-        RatchetState {
+        Ok(RatchetState {
             conversation_id,
             max_skip,
             root_key: Zeroizing::new(root_key),
@@ -113,7 +138,7 @@ impl RatchetState {
             recv_n: 0,
             prev_chain_len: 0,
             skipped: HashMap::new(),
-        }
+        })
     }
 
     /// Encrypt already-tagged-and-padded plaintext (see [`payload::tag_and_pad`]) into
@@ -323,6 +348,25 @@ fn copy_secret(z: &Zeroizing<[u8; 32]>) -> [u8; 32] {
     *borrowed
 }
 
+/// Reject a `max_skip` outside [`MIN_MAX_SKIP`, `MAX_MAX_SKIP`]. Both bounds are
+/// deliberate, not arbitrary: too low and an ordinary queued burst (the exact scenario
+/// `docs/ARCHITECTURE.md` §1 exists to handle) can trip `MaxSkipExceeded` in normal
+/// use; too high and a single hostile or corrupted envelope's `pn`/`n` field can force
+/// a correspondingly larger, wasted skipped-key derivation before the AEAD check
+/// ultimately rejects it (§11.8) — this is a memory/CPU bound on that, not just a
+/// queue-depth allowance.
+fn validate_max_skip(max_skip: u32) -> Result<()> {
+    if (MIN_MAX_SKIP..=MAX_MAX_SKIP).contains(&max_skip) {
+        Ok(())
+    } else {
+        Err(Error::InvalidMaxSkip {
+            got: max_skip,
+            min: MIN_MAX_SKIP,
+            max: MAX_MAX_SKIP,
+        })
+    }
+}
+
 /// Derive-and-return message keys for chain indices `[from, until)` — exclusive of
 /// `until` — advancing `chain_key` via `KDF_CK` at each step, without mutating any
 /// ratchet state. Returns the derived `(index, message_key)` pairs plus the chain key
@@ -439,13 +483,15 @@ mod tests {
             root_key,
             responder_public,
             DEFAULT_MAX_SKIP,
-        );
+        )
+        .unwrap();
         let responder = RatchetState::init_as_responder(
             conversation_id,
             root_key,
             responder_secret,
             DEFAULT_MAX_SKIP,
-        );
+        )
+        .unwrap();
         (initiator, responder)
     }
 
@@ -623,31 +669,73 @@ mod tests {
         let root_key = [7u8; 32];
         let responder_secret = StaticSecret::random_from_rng(OsRng);
         let responder_public = PublicKey::from(&responder_secret);
-        let small_max_skip = 5;
+        let small_max_skip = MIN_MAX_SKIP; // the smallest value the configurable range allows
 
         let mut alice = RatchetState::init_as_initiator(
             conversation_id,
             root_key,
             responder_public,
             small_max_skip,
-        );
+        )
+        .unwrap();
         let mut bob = RatchetState::init_as_responder(
             conversation_id,
             root_key,
             responder_secret,
             small_max_skip,
-        );
+        )
+        .unwrap();
 
+        let burst = small_max_skip + 10;
         let mut last = None;
-        for i in 0..10 {
+        for i in 0..burst {
             last = Some(alice.encrypt(&chat(&format!("msg {i}"))).unwrap());
         }
-        // Only the last of 10 messages arrives; the skipped-key cache would need to
-        // derive-and-cache the other 9, which exceeds max_skip=5.
+        // Only the last message of the burst arrives; the skipped-key cache would need
+        // to derive-and-cache the rest, which exceeds max_skip.
         assert!(matches!(
             bob.decrypt_raw(&last.unwrap()),
-            Err(Error::MaxSkipExceeded(5))
+            Err(Error::MaxSkipExceeded(skip)) if skip == small_max_skip
         ));
+    }
+
+    #[test]
+    fn max_skip_outside_the_configurable_range_is_rejected() {
+        let conversation_id = [1u8; 16];
+        let root_key = [7u8; 32];
+        let responder_secret = StaticSecret::random_from_rng(OsRng);
+        let responder_public = PublicKey::from(&responder_secret);
+
+        assert!(matches!(
+            RatchetState::init_as_initiator(conversation_id, root_key, responder_public, MIN_MAX_SKIP - 1),
+            Err(Error::InvalidMaxSkip { got, min, max }) if got == MIN_MAX_SKIP - 1 && min == MIN_MAX_SKIP && max == MAX_MAX_SKIP
+        ));
+        assert!(matches!(
+            RatchetState::init_as_initiator(conversation_id, root_key, responder_public, MAX_MAX_SKIP + 1),
+            Err(Error::InvalidMaxSkip { got, .. }) if got == MAX_MAX_SKIP + 1
+        ));
+        // The whole supported range must actually be accepted, not just its interior.
+        assert!(RatchetState::init_as_initiator(
+            conversation_id,
+            root_key,
+            responder_public,
+            MIN_MAX_SKIP
+        )
+        .is_ok());
+        assert!(RatchetState::init_as_initiator(
+            conversation_id,
+            root_key,
+            responder_public,
+            MAX_MAX_SKIP
+        )
+        .is_ok());
+        assert!(RatchetState::init_as_responder(
+            conversation_id,
+            root_key,
+            responder_secret,
+            MIN_MAX_SKIP - 1
+        )
+        .is_err());
     }
 
     /// Regression test for a real vulnerability found while reviewing this module: an

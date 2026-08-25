@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use dratchet_core::envelope::Envelope;
 use dratchet_core::payload::{untag_and_unpad, PAYLOAD_CHAT};
-use dratchet_core::ratchet::{RatchetState, DEFAULT_MAX_SKIP};
+use dratchet_core::ratchet::{RatchetState, DEFAULT_MAX_SKIP, MIN_MAX_SKIP};
 use proptest::prelude::*;
 use rand_core::OsRng;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -33,8 +33,10 @@ fn matched_pair(max_skip: u32) -> (RatchetState, RatchetState) {
     let responder_secret = StaticSecret::random_from_rng(OsRng);
     let responder_public = PublicKey::from(&responder_secret);
     (
-        RatchetState::init_as_initiator(conversation_id, root_key, responder_public, max_skip),
-        RatchetState::init_as_responder(conversation_id, root_key, responder_secret, max_skip),
+        RatchetState::init_as_initiator(conversation_id, root_key, responder_public, max_skip)
+            .unwrap(),
+        RatchetState::init_as_responder(conversation_id, root_key, responder_secret, max_skip)
+            .unwrap(),
     )
 }
 
@@ -108,7 +110,7 @@ fn late_arrival_across_several_ratchet_steps_still_decrypts() {
 /// ever-growing cache.
 #[test]
 fn queue_depth_beyond_max_skip_is_refused_deterministically() {
-    let max_skip = 20;
+    let max_skip = MIN_MAX_SKIP;
     let (mut alice, mut bob) = matched_pair(max_skip);
 
     let mut last = None;

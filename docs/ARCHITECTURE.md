@@ -118,11 +118,20 @@ Once the root key exists, per-message crypto is entirely symmetric:
   turn-taking, not by a literal count of messages. The old ratchet private
   key is discarded the moment the new one replaces it.
 - **Skipped-message key cache:** because the chain KDF is a one-way function,
-  keys can be derived ahead and cached (bounded, e.g. `MAX_SKIP = 1000`) for
-  messages that arrive out of order or after a backlog. **This is the direct
-  answer to the queue-depth question**: Double Ratchet was built to tolerate
+  keys can be derived ahead and cached (bounded by `max_skip`) for messages
+  that arrive out of order or after a backlog. **This is the direct answer
+  to the queue-depth question**: Double Ratchet was built to tolerate
   exactly the burst/offline/out-of-order conditions that break a strict
-  alternating-PGP-keypair scheme.
+  alternating-PGP-keypair scheme. `max_skip` is configurable per session
+  (v0, `core/src/ratchet.rs`), constrained to `[50, 150]`
+  (`MIN_MAX_SKIP`/`MAX_MAX_SKIP`) rather than left as an arbitrary integer:
+  the floor keeps an *ordinary* queued burst — the exact scenario this
+  design exists to handle — from tripping the bound in normal use; the
+  ceiling caps how much wasted skipped-key derivation a single hostile or
+  corrupted envelope's `pn`/`n` field (§11.8) can force before the AEAD
+  check ultimately rejects it. A value outside that range is rejected at
+  construction (`Error::InvalidMaxSkip`), not silently clamped. Default is
+  100.
 
 ### 3.4 Key lifecycle summary
 
