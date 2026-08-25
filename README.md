@@ -11,7 +11,8 @@ algorithm rather than a naive "new PGP keypair per message" scheme, so the
 protocol tolerates real-world conditions: offline recipients, bursts of
 queued messages, out-of-order delivery, and retries.
 
-Status: **design phase, no application code yet.**
+Status: **v0 crypto core implemented and tested** (`core/`) — X3DH handshake
++ Double Ratchet engine, OpenPGP identity. No transport, no UI yet.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full protocol and
 system design, [`docs/MESSAGE_SCHEMA.md`](docs/MESSAGE_SCHEMA.md) for the
@@ -42,6 +43,18 @@ storage). Highlights:
 - Security hardening pulled from prior art: Signal (sealed sender, message
   padding, PQXDH, Key Transparency), Apple iMessage's PQ3, Briar (Tor-based
   P2P, panic response), and OTR (message deniability).
+
+## Building
+
+```
+cargo test -p dratchet-core
+```
+
+Requires `libssl-dev`/`pkg-config` on Linux (`sequoia-openpgp`'s crypto
+backend); see [`.github/workflows/ci.yml`](.github/workflows/ci.yml) for
+the exact CI setup. `core/tests/queue_depth.rs` is the test that actually
+checks the queue-depth claim above against arbitrarily-ordered delivery,
+including a property test over random burst sizes and delivery orderings.
 
 ## License
 

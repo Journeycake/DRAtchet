@@ -85,9 +85,18 @@ up to a cap, beyond which it pads to the next larger bucket — so
 `ciphertext_len` doesn't directly reveal exact message length
 (distinguishing a one-word reply from a longer message by size alone, or
 fingerprinting content by its exact byte count — and, now, distinguishing a
-`DeliveryAck` from a short chat message by size). Padding is stripped after
-decryption and never transmitted as a separate field. Inspired by Signal's
+`DeliveryAck` from a short chat message by size). Inspired by Signal's
 message padding; see §11.3 of `ARCHITECTURE.md` for the full rationale.
+
+**Implementation note (v0, `core/src/payload.rs`):** padding turned out to
+need one more field than described above — a `content_len: u32 LE`
+immediately after `payload_type`, before the content itself. Zero-byte
+padding isn't self-delimiting: content that itself happens to end in `0x00`
+bytes (realistic for binary CBOR payloads like `RecoveryProfileAnnounce`)
+would otherwise be silently truncated on unpad, indistinguishable from
+padding. The explicit length prefix removes the ambiguity; it's still
+inside the padded, encrypted region, so it adds no observable-on-the-wire
+size signal beyond what padding already introduces.
 
 **Nonce:** not transmitted. The AEAD encryption key *and* the 12-byte nonce
 are both derived from the per-message key via HKDF (`HKDF(message_key) →

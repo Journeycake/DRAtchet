@@ -67,6 +67,21 @@ profile). This is the key a user backs up, the key behind their fingerprint,
 and the key used to sign everything below. It is **never** used to encrypt
 message content directly.
 
+**Implementation note (v0, `core/src/identity.rs`):** the certificate's own
+Cv25519 ECDH subkey and the X3DH identity DH key (`IK`, §3.2) turned out to
+be worth keeping as separate key material rather than one and the same key.
+OpenPGP's ECDH packet format wraps a *symmetric session key* directly (per
+RFC 9580's ECDH-KEM construction); it isn't built to hand out a raw X25519
+scalar for an arbitrary external Diffie-Hellman the way X3DH needs. Reaching
+into `sequoia-openpgp`'s internal MPI representation to extract one anyway
+was the kind of shortcut worth avoiding without interop test vectors to
+check it against — so v0 generates a dedicated X25519 keypair for `IK`,
+authenticated by a standalone OpenPGP signature from the certificate
+instead of being derived from the certificate's own subkey. The
+certificate's stated ECDH capability is still real; X3DH just doesn't
+consume it directly. Worth revisiting if a concrete reason to unify them
+shows up later.
+
 ### 3.2 Session establishment — X3DH over OpenPGP subkeys
 
 Modeled on Signal's X3DH, but the key material is carried as OpenPGP packets:
@@ -784,11 +799,16 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
 
 ## 9. Roadmap
 
-1. **v0 — crypto core**: identity keys, X3DH handshake, Double Ratchet
-   engine (using the fixed-layout envelope from `MESSAGE_SCHEMA.md` §2,
-   including the `payload_type` tag and `DeliveryAck` payload from §7),
-   unit + property tests (including out-of-order/skipped-key tests
-   simulating queue depth), no UI, no transport yet.
+1. **v0 — crypto core** (implemented — see `core/`): identity keys, X3DH
+   handshake, Double Ratchet engine (using the fixed-layout envelope from
+   `MESSAGE_SCHEMA.md` §2, including the `payload_type` tag and
+   `DeliveryAck` payload from §7), unit + property tests (including
+   out-of-order/skipped-key tests simulating queue depth), no UI, no
+   transport yet. Two implementation notes worth reading alongside the rest
+   of this roadmap: §3.1 (the X3DH identity DH key is generated separately
+   from, not extracted from, the OpenPGP certificate's own ECDH subkey) and
+   `MESSAGE_SCHEMA.md` §2 (padding needs an explicit length prefix to stay
+   unambiguous).
 2. **v1 — desktop MVP**: Tauri app, 1:1 chat only, Tier 1 delivery
    (ephemeral relay-assisted, §4.2, using ratchet-derived `mailbox_id`s per
    §11.1, the fallback state machine and timeout/retry parameters from
