@@ -588,6 +588,8 @@ more permissive than the conversation's effective policy, the client must
 say so plainly ("You've set Full Recovery, but this conversation is
 storing nothing because your contact has chosen not to recover messages")
 — otherwise a user could reasonably believe they have a backup they don't.
+This is the steady-state view; §7.5 covers the notice shown at the moment
+a counterpart's profile actually changes.
 
 ### 7.3 Mechanism
 
@@ -673,6 +675,44 @@ honor it. This is the same category of limit the original recoverable-mode
 threat-model note (§8) already flags; the three-profile system doesn't
 change the category, just gives honest clients a more precise agreement to
 honor.
+
+### 7.5 Notifying on profile changes
+
+A counterpart changing their recovery profile is worth surfacing as a
+visible event, not just a silent input to the effective-policy computation
+in §7.2 — the person on the other end should know when what's being kept
+about their conversation just changed, the same instinct behind Signal's
+safety-number-changed notice (§6.2).
+
+- Every `RecoveryProfileAnnounce` a client receives (§7.3) is compared
+  against the last profile on record for that peer, for that conversation.
+  If the two differ, the client surfaces a plain-language, user-visible
+  notice naming **both** the old and new profile — e.g. *"Bob changed his
+  recovery setting from B (Sent-only) to C (None)"* — covering every
+  transition (A→C, C→A, B→C, and so on), not just moves toward or away
+  from C specifically.
+- The very first announcement for a conversation (sent at session
+  establishment, §7.3) is establishing initial state, not changing it —
+  it does **not** produce a "changed" notice. Only a second, different
+  announcement for an already-known peer counts as a change.
+- This fires **regardless of whether the conversation's effective policy
+  actually moves as a result.** If your own side is already pinned to
+  Profile C, a counterpart moving between A and B doesn't change what's
+  stored anywhere — but it's still worth knowing, since it tells you what
+  would take effect if you ever loosened your own setting. When the
+  effective policy *does* change as a result, that's a related but
+  distinct fact and gets its own notice ("Recovery for this conversation is
+  now: None") rather than being folded into the peer-change notice — one
+  says what your counterpart did, the other says what that means for this
+  conversation right now.
+- One-way and passive — no acknowledgment or confirmation round-trip, same
+  pattern as an identity-key-changed warning (§6.2). Diffing happens
+  entirely against each client's own locally cached last-known-peer-profile
+  (per conversation); no new field is needed on `RecoveryProfileAnnounce`
+  (§8 of `MESSAGE_SCHEMA.md`) to carry an explicit "previous value" — the
+  receiving side already has one, and computing the transition locally
+  means the "old" side of the notice isn't something the sender gets to
+  assert.
 
 ## 8. Threat model
 

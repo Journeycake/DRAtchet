@@ -206,7 +206,7 @@ encryption of their own — the service has to be able to read routing
 metadata to do its job (§4.1/§4.2 of `ARCHITECTURE.md`), unlike message
 content.
 
-## 8. Recovery profile negotiation (CBOR) — §7.2/§7.3 of `ARCHITECTURE.md`
+## 8. Recovery profile negotiation (CBOR) — §7.2/§7.3/§7.5 of `ARCHITECTURE.md`
 
 | Field | Type | Notes |
 |---|---|---|
@@ -220,4 +220,11 @@ a given conversation treats the counterpart as Profile C (fail-closed,
 `ARCHITECTURE.md` §7.2) rather than assuming a default. The effective
 policy — `min(own profile, last-announced peer profile)` — is computed
 independently and identically by both clients; no response message is
-needed, and there's no proposal to accept or reject.
+needed, and there's no proposal to accept or reject. There's also no
+`previous_profile` field: a receiving client diffs an incoming `profile`
+against whatever it already has cached for that peer to decide whether to
+surface a change notice, so the "old" side of that notice is always the
+receiver's own last-known state, never something the sender asserts — see
+`ARCHITECTURE.md` §7.5 for the full notification behavior, including why
+the very first announcement for a conversation is establishing state
+rather than changing it.
