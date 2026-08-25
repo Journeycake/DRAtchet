@@ -14,7 +14,8 @@ queued messages, out-of-order delivery, and retries.
 Status: **design phase, no application code yet.**
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full protocol and
-system design, including:
+system design, and [`docs/MESSAGE_SCHEMA.md`](docs/MESSAGE_SCHEMA.md) for
+the concrete wire formats. Highlights:
 
 - Why a literal per-message PGP-keypair rotation isn't feasible under
   message queueing, and how Double Ratchet solves it.
@@ -23,8 +24,12 @@ system design, including:
   what's rotated, what's discarded, and when).
 - Peer identity verification via in-person QR exchange or a remote
   single-use pairing code (`username#NNNN` addressing).
+- A serverless-first, tiered delivery model: direct peer-to-peer by default,
+  an optional ephemeral (auto-expiring) relay to bridge offline recipients,
+  and no durable storage of any kind unless both participants opt in.
 - Per-conversation message recovery — off by default, opt-in only with
-  mutual consent from both participants.
+  mutual consent from both participants, and hostable on storage the
+  participants themselves control rather than a DRAtchet-run service.
 - Client architecture (Tauri + Rust, one codebase for Windows/macOS/Linux)
   and threat model.
 

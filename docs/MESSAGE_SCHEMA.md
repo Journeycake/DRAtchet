@@ -1,0 +1,127 @@
+# DRAtchet — Message Schemas
+
+Status: **design draft, no code yet**. Companion to [`ARCHITECTURE.md`](ARCHITECTURE.md)
+— read that first for the protocol rationale (Double Ratchet, X3DH-over-OpenPGP,
+§6 peer auth, §7 recovery). This document is the concrete wire format for
+each message type that protocol produces.
+
+## Encoding conventions
+
+Two different encodings, chosen per message type by how hot the path is:
+
+- **Ratchet message envelope** (§2 below) — the thing sent for *every* chat
+  message — uses a **fixed binary layout**, not a general serialization
+  format. It's on the hot path, sent at chat volume, and benefits from
+  minimum overhead and zero-copy parsing. This is also where §3.5 of
+  `ARCHITECTURE.md` (lightweight envelope vs. full OpenPGP framing) pays off
+  concretely — see the overhead comparison at the end of §2.
+- **Everything else** (prekey bundles, the X3DH init message, pairing
+  messages, recovery blobs) — sent rarely (session setup, verification,
+  backup) — uses **CBOR** (RFC 8949): compact, binary, schema-evolvable via
+  map keys (new optional fields don't break old parsers), good Rust support
+  (`ciborium`). JSON was considered and rejected for these too: CBOR is
+  smaller, has real binary support (no base64 tax for key material), and a
+  stricter type model.
+
+All multi-byte integers are big-endian (network byte order). All key
+material is raw fixed-size public-key bytes (X25519 = 32 bytes) unless
+explicitly noted as an OpenPGP packet.
+
+## 1. Prekey bundle (CBOR)
+
+Published by each client to wherever bundles are discoverable (see
+`ARCHITECTURE.md` §4 for the serverless/relay discussion of *where* —
+this schema is the same regardless of hosting model).
+
+| Field | Type | Notes |
+|---|---|---|
+| `username` | text string | self-chosen, §6.1 |
+| `discriminator` | uint16 | the `NNNN` in `username#NNNN` |
+| `identity_key` | bytes | OpenPGP public key packet (Ed25519 + Curve25519) |
+| `signed_prekey_id` | uint32 | monotonic per-account counter |
+| `signed_prekey` | bytes | OpenPGP ECDH subkey packet (Curve25519) |
+| `signed_prekey_sig` | bytes | OpenPGP signature packet, by `identity_key` |
+| `signed_prekey_expires_at` | uint64 | unix seconds; rotated on schedule (§3.2) |
+| `one_time_prekeys` | array of `{id: uint32, key: bytes}` | each consumed once, then removed from the published bundle (§3.4) |
+
+## 2. Ratchet message envelope (fixed binary layout)
+
+The payload for every ongoing chat message, once a session is established.
+
+| Offset | Size | Field | Notes |
+|---|---|---|---|
+| 0 | 1 | `version` | protocol version tag, allows future format changes |
+| 1 | 16 | `conversation_id` | `SHA-256(sorted(fingerprint_A, fingerprint_B))[:16]` — both sides compute this independently; no server needs to mint it (relevant for the serverless model in `ARCHITECTURE.md` §4) |
+| 17 | 32 | `dh_pub` | sender's current ratchet public key (X25519) — the "next message's public key" from the original brief |
+| 49 | 4 | `pn` | length of the sender's *previous* sending chain |
+| 53 | 4 | `n` | message number within the current sending chain |
+| 57 | 4 | `ciphertext_len` | only needed on transports without native message framing (see note below) |
+| 61 | `ciphertext_len` | `ciphertext` | AEAD ciphertext; the 16-byte AEAD tag is appended by the AEAD API and counted inside this length |
+
+**Header authentication:** bytes `0..61` (everything except the ciphertext)
+are passed as AEAD associated data — authenticated (tamper-evident) but
+sent in clear text. This is the standard Double Ratchet trade-off: `dh_pub`,
+`pn`, `n`, and `conversation_id` are visible to anything that can see the
+wire, including a relay if one is in the path. That's a metadata leak
+(reveals turn-taking and rough message volume, though not content), tracked
+as a known gap in `ARCHITECTURE.md` §8 and as an open decision (header
+encryption, §9 below) rather than solved here.
+
+**Nonce:** not transmitted. The AEAD encryption key *and* the 12-byte nonce
+are both derived from the per-message key via HKDF (`HKDF(message_key) →
+{enc_key(32B), nonce(12B)}`) — since each message key is single-use by
+construction (§3.3/§3.4 of `ARCHITECTURE.md`), a derived rather than
+transmitted nonce is safe and saves 12 bytes on every message.
+
+**Transport framing note:** on a message-oriented transport (WebRTC
+DataChannel, QUIC datagram) the surrounding transport already delimits each
+message, making `ciphertext_len` redundant — it's kept in the schema so the
+same envelope also works unmodified over a byte-stream transport (raw
+TCP, or a relay that concatenates queued envelopes in one fetch response).
+
+**Overhead:** 61-byte header + 16-byte AEAD tag = **77 bytes of fixed
+overhead per message**, regardless of payload size. That's the concrete
+number behind the §3.5 decision in `ARCHITECTURE.md` — a full-OpenPGP-framed
+equivalent (packet headers + MPI-encoded fields across a PKESK/SKESK +
+SEIPD packet pair) typically runs several times that for a short chat
+message.
+
+## 3. X3DH session-establishment message (CBOR)
+
+The *first* message of a new session — carries the extra fields the
+recipient needs to derive the shared root key, since they don't have
+ratchet state yet. After this, all further messages use the fixed
+ratchet envelope above.
+
+| Field | Type | Notes |
+|---|---|---|
+| `initiator_identity_fingerprint` | bytes (32) | SHA-256 of initiator's identity key |
+| `initiator_ephemeral_pub` | bytes (32) | `EK_A`, fresh per session |
+| `used_signed_prekey_id` | uint32 | which of the recipient's signed prekeys was used |
+| `used_one_time_prekey_id` | uint32, optional | omitted if the recipient had none available (X3DH degrades gracefully but loses one DH term — flagged in `ARCHITECTURE.md` open decisions if this needs hardening) |
+| `initial_envelope` | bytes | the first ratchet message envelope (§2), encrypted under the HKDF-derived root/chain key |
+
+## 4. Peer-pairing messages (CBOR) — §6.4 remote pairing
+
+| Message | Field | Type | Notes |
+|---|---|---|---|
+| `PairingChallenge` (recipient → initiator, out-of-band) | `pairing_id` | bytes (16) | correlates challenge/response if relayed through an untrusted channel |
+| | `expires_at` | uint64 | ~10 min TTL (§9 of `ARCHITECTURE.md`) |
+| `PairingResponse` (initiator → recipient) | `pairing_id` | bytes (16) | echoes the challenge |
+| | `code_proof` | bytes (32) | `HMAC(key = code, msg = session_transcript_hash)` — **not the raw code**, so a transport that isn't fully trusted (e.g. an ephemeral relay, §4 of `ARCHITECTURE.md`) never observes the code itself or gets a replayable value against a different session |
+
+## 5. Recovery backup entry (CBOR) — §7 opt-in recovery
+
+Written to whatever recovery store the two participants agreed on
+(self-hosted cloud storage or, later, a managed option — see
+`ARCHITECTURE.md` §4 Tier 2). One entry per message, independent of the
+ratchet's own `n`/`pn` counters so recovery ordering never depends on live
+ratchet internals.
+
+| Field | Type | Notes |
+|---|---|---|
+| `conversation_id` | bytes (16) | same derivation as §2 |
+| `seq` | uint64 | monotonic per-conversation sequence number, assigned locally |
+| `ciphertext` | bytes | `AEAD(plaintext)` under the conversation recovery key, independent key from any ratchet message key |
+| `created_at` | uint64 | unix seconds |
+| `written_by` | 1 byte | which participant uploaded this entry (sender uploads by default; either side may also upload as redundancy — dedup by `(conversation_id, seq)`) |

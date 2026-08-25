@@ -3,6 +3,10 @@
 Status: **design draft, no code yet**
 Target platforms: Windows, macOS, Linux (desktop)
 
+See [`MESSAGE_SCHEMA.md`](MESSAGE_SCHEMA.md) for the concrete wire formats
+referenced throughout (prekey bundle, ratchet message envelope, X3DH init,
+pairing messages, recovery backup entry).
+
 ## 1. Recap: why "a fresh PGP keypair every message" doesn't work
 
 The original idea was: encrypt every message with classic OpenPGP public-key
@@ -155,21 +159,113 @@ awkward header-metadata fit. Message bodies never leave the app anyway
 (they're deleted from the ratchet the instant they're used, per §3.4), so
 there's no real-world scenario where a generic PGP tool needs to read one.
 
-## 4. System architecture
+## 4. System architecture: a serverless-first, tiered model
 
-- **Relay server**: store-and-forward only — queues ciphertext per recipient
-  device, hosts prekey bundles, never sees plaintext or ratchet state
-  (untrusted by design, same trust model as Signal's server).
-- **Client**: owns all key material and ratchet state; server is dumb
-  transport + mailbox.
-- Large backlog handling: skipped-key cache is bounded; if a recipient is
-  offline long enough to exceed `MAX_SKIP`, client falls back to a fresh
-  session establishment (X3DH resync) rather than growing the cache
-  unbounded.
-- Multi-device and group chat are **out of scope for v1** (flagged in
-  Roadmap) — both are real extensions (Signal's "Sesame" for multi-device,
-  sender-keys for groups) but add significant complexity better tackled
-  after the 1:1 ratchet is solid.
+The earlier draft assumed a single always-present relay server doing three
+jobs at once: routing/discovery, offline store-and-forward, and (implicitly)
+being the thing a recovery backup would sit on. Splitting those three jobs
+apart is what makes "serverless" and "recoverable" both possible — they turn
+out to be independent decisions, not one all-or-nothing server. Message
+schemas referenced below are in
+[`MESSAGE_SCHEMA.md`](MESSAGE_SCHEMA.md).
+
+### 4.1 Tier 0 — pure peer-to-peer (strictest serverless)
+
+- Clients connect directly over a **WebRTC DataChannel** (available in all
+  three target webviews — WebView2, WKWebView, WebKitGTK — no native
+  networking code needed, consistent with the "one core, thin OS glue"
+  approach in §5).
+- WebRTC still needs a **rendezvous step** before a direct connection
+  exists: exchanging ICE candidates/SDP, and NAT traversal (STUN always,
+  TURN as a relay-of-last-resort behind symmetric NATs). None of this
+  carries message content — only connection-setup metadata and prekey
+  bundles (§1 of `MESSAGE_SCHEMA.md`), both already meant to be public.
+  A minimal, stateless signaling service can host this (or a DHT — see §4.4
+  open question); either way it holds no ciphertext, ever.
+- **Delivery requires both peers online at overlapping times.** If the
+  recipient isn't reachable, the message queues **locally on the sender's
+  device** and retries on the next connection attempt. This is the honest
+  cost of Tier 0, and it's the same queue-depth question from the very
+  first design pass, resurfacing at the transport layer instead of the
+  crypto layer: the Double Ratchet's skipped-message-key cache (§3.3) still
+  handles out-of-order/backlogged *decryption* just fine once messages
+  arrive — Tier 0's limitation is purely "when can delivery happen at all,"
+  not "can the crypto keep up."
+- **Zero recovery, by construction** — there is no third party anywhere in
+  this path holding ciphertext, so there's nothing to recover from if a
+  device is lost. This is the mode the task description means by "even if
+  that means foregoing the possibility of recovering messages."
+
+### 4.2 Tier 1 — ephemeral relay-assisted (pragmatic default)
+
+Same as Tier 0, plus one addition: an optional **ephemeral store-and-forward
+hop** to bridge the gap when both peers aren't online at the same time,
+without becoming a durable archive.
+
+- Implementable as genuinely serverless-hosted infrastructure (e.g.
+  Cloudflare Durable Objects/KV, or an equivalent self-hostable minimal
+  relay) — no long-running process to patch or operate, but it is still
+  third-party infrastructure in the delivery path, unlike Tier 0.
+- Holds ciphertext **transiently**: short TTL (days, not months) and/or
+  auto-wipe on delivery acknowledgment — a mailbox, not an archive. The
+  relay envelope wraps the opaque ratchet message envelope with only
+  routing metadata: an opaque `mailbox_id` (a rotating per-device id,
+  deliberately not the username, to limit long-term correlation), a TTL,
+  and a delivery token. This wrapper is a thin, tier-specific addition on
+  top of the ratchet message envelope defined in §2 of
+  `MESSAGE_SCHEMA.md`, which stays identical across all tiers — the relay
+  never needs to understand it, only pass it along.
+- This is the recommended **default** for v1: pure Tier 0 is more
+  privacy-strict but has a materially worse offline-delivery experience for
+  an MVP; Tier 1's relay never sees plaintext or ratchet state and holds
+  ciphertext only transiently, so it stays close to Tier 0's guarantees
+  while being usable when both people aren't online together.
+- Still **zero durable recovery by default** — a Tier 1 relay auto-wiping
+  ciphertext after delivery is not a backup, even though it technically
+  "stores" something briefly. That distinction should be explicit in any
+  user-facing description of Tier 1, so it doesn't get conflated with §4.3.
+
+### 4.3 Tier 2 — opt-in recovery layer (mutual consent, self-hostable)
+
+Layers on top of *either* Tier 0 or Tier 1 — orthogonal to which delivery
+tier is in use. This is exactly the §7 recovery design, restated with the
+hosting question now answered: the durable, decryptable-with-the-recovery-
+key backup store doesn't need to be a DRAtchet-operated service at all. It
+can be:
+
+- **Self-hosted cloud storage the users themselves point at** (an
+  S3-compatible bucket, a small self-run service, etc.) — keeps the project
+  itself serverless while still making recovery possible for whoever wants
+  it.
+- A future managed option, if there's demand (still gated by the same
+  mutual-consent flow — hosting model doesn't change the consent
+  requirement from §7).
+
+Either way, activating Tier 2 is a conversation-level, mutual, explicit
+decision (§7) — it never happens as a side effect of picking a delivery
+tier, and picking Tier 0 for delivery doesn't preclude Tier 2 for recovery
+or vice versa.
+
+### 4.4 Cross-cutting notes
+
+- Large backlog handling is unchanged from the original design regardless
+  of tier: the skipped-key cache is bounded (`MAX_SKIP`); if a recipient is
+  unreachable long enough to exceed it, the client falls back to a fresh
+  X3DH session establishment rather than growing the cache unbounded. Tier 0
+  additionally needs a local outbox retention/pruning policy on the
+  *sender* side, since undelivered messages accumulate there instead of on
+  a server.
+- Prekey bundle discovery (`username#NNNN` → bundle, §6.1) needs *some*
+  discoverable location even in Tier 0/1 — recommend the same minimal
+  signaling service also serves this (public-key material only, low
+  sensitivity, much simpler than a full DHT) rather than standing up a
+  second piece of infrastructure. Flagged as an open decision in §10 if a
+  fully decentralized (DHT-based) directory turns out to matter more than
+  the simplicity of a small serverless KV store.
+- Multi-device and group chat remain **out of scope for v1** (Roadmap, §9)
+  — both interact with the tiering question (a DHT or relay mailbox model
+  changes shape once "recipient" means multiple devices) and are better
+  tackled once the 1:1 ratchet and delivery tiers are solid.
 
 ## 5. Client / platform architecture
 
@@ -339,8 +435,13 @@ ratchet rather than changing it:
 
 In scope:
 - Passive network eavesdropping.
-- A compromised or malicious relay server (never sees plaintext or long-term
-  key material).
+- A compromised or malicious Tier 1 relay, or a compromised signaling/
+  directory service (§4) — neither ever sees plaintext, ratchet state, or
+  long-term key material; the relay's ciphertext access is also
+  time-bounded by its TTL (§4.2), not indefinite.
+- A TURN relay (Tier 0/1 NAT-traversal fallback) seeing encrypted traffic
+  metadata (packet timing/size) without seeing content — tracked as a
+  metadata concern, not a content-confidentiality one (see below).
 - Forward secrecy against a future endpoint compromise (old messages stay
   safe).
 - Post-compromise security: session self-heals after a transient key
@@ -348,8 +449,11 @@ In scope:
 
 Explicitly out of scope for v1 (call out, don't silently ignore):
 - Endpoint malware / device compromise while keys are live in memory.
-- Metadata protection (who talks to whom, timing) — would need sealed-sender
-  style techniques later.
+- Metadata protection (who talks to whom, timing, and — per §2 of
+  `MESSAGE_SCHEMA.md` — the ratchet header's `dh_pub`/`pn`/`n` are
+  authenticated but sent in clear text, visible to anything on the wire
+  including a Tier 1 relay) — would need sealed-sender-style techniques and/
+  or ratchet header encryption later; tracked in §10.
 - Multi-device and group messaging (see Roadmap).
 - Recoverable-mode conversations (§7) intentionally accept a narrower threat
   model by design and by mutual consent: a durable, decryptable-with-the-
@@ -365,14 +469,17 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
 ## 9. Roadmap
 
 1. **v0 — crypto core**: identity keys, X3DH handshake, Double Ratchet
-   engine, unit + property tests (including out-of-order/skipped-key tests
-   simulating queue depth), no UI.
-2. **v1 — desktop MVP**: Tauri app, 1:1 chat only, relay server, local
-   encrypted storage, QR and remote-pairing-code verification (§6),
-   per-conversation opt-in recovery with self-custodied recovery phrase (§7).
+   engine (using the fixed-layout envelope from `MESSAGE_SCHEMA.md` §2),
+   unit + property tests (including out-of-order/skipped-key tests
+   simulating queue depth), no UI, no transport yet.
+2. **v1 — desktop MVP**: Tauri app, 1:1 chat only, Tier 1 delivery
+   (ephemeral relay-assisted, §4.2) as the default with Tier 0 direct P2P
+   attempted first when reachable, local encrypted storage, QR and
+   remote-pairing-code verification (§6), per-conversation opt-in Tier 2
+   recovery with a self-custodied recovery phrase (§7).
 3. **v2**: multi-device support, group chat (sender-keys), prekey bundle
-   auto-replenishment, push notifications, optional server-escrowed
-   passphrase-protected recovery (§7 option b).
+   auto-replenishment, push notifications, optional managed/server-escrowed
+   passphrase-protected recovery option (§7 option b, §4.3).
 
 ## 10. Open decisions for confirmation
 
@@ -386,5 +493,20 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
 - Pairing-code parameters (§6.4): code length (6 digits assumed), TTL
   (~10 minutes assumed), and attempt rate limit — reasonable defaults
   chosen, tune once there's real usage data.
-- Relay server hosting model (self-hosted vs. managed) — not yet decided,
-  doesn't block crypto-core work.
+- P2P transport stack: WebRTC DataChannels (recommended — free NAT
+  traversal via STUN/TURN, no native networking code across the three
+  webviews) vs. a pure-Rust P2P stack (`libp2p`/QUIC) for tighter control
+  over the wire format and no browser-WebRTC dependency — WebRTC is the
+  faster path to v1; revisit if DataChannel overhead or webview quirks
+  become a real problem.
+- Signaling/directory hosting (§4.4): minimal serverless KV-backed service
+  (recommended — simple, cheap, low-sensitivity data) vs. a DHT-based fully
+  decentralized directory — the DHT removes even the "one small service"
+  dependency but adds real engineering cost (discovery latency, DHT
+  security) for what's currently just public-key material.
+- Ratchet header encryption (flagged in §8): encrypting `dh_pub`/`pn`/`n`
+  under a separate header key (a documented Double Ratchet extension) would
+  close the Tier-1-relay metadata gap; not in v1 scope, worth a v2 look once
+  the base protocol is solid.
+- Tier 1 relay hosting model (self-hosted vs. a managed option) — not yet
+  decided, doesn't block crypto-core (v0) work.
