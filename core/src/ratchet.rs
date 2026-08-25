@@ -6,7 +6,7 @@
 //! keypair) tolerates queue depth — bursts of messages sent before a reply,
 //! out-of-order delivery, and retries. See `tests/queue_depth.rs`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key as AeadKey, Nonce};
@@ -41,6 +41,19 @@ pub const MIN_MAX_SKIP: u32 = 50;
 /// single hostile or corrupted `pn`/`n` can force that derivation to grow.
 pub const MAX_MAX_SKIP: u32 = 150;
 
+/// Multiplier applied to `max_skip` to bound the *total* size of the skipped-message-key
+/// cache across the ratchet's entire lifetime (many DH ratchet steps) — distinct from
+/// the per-call bound `skip_and_derive` already enforces for a single chain. Without
+/// this, a correspondent who keeps triggering DH ratchet steps while leaving old
+/// messages permanently undelivered (a chronically flaky connection, or a malicious
+/// already-paired peer) can grow `RatchetState::skipped` without bound: only a cache
+/// *hit* in `decrypt_raw` ever removes an entry, and each new chain gets its own fresh
+/// `max_skip`-sized budget on top of whatever's already cached from earlier chains.
+/// Sized to comfortably hold a few legitimate full-width gaps at once (the
+/// out-of-order-across-a-ratchet-boundary scenarios `tests/queue_depth.rs` exercises)
+/// before the oldest, least-likely-to-still-arrive entries start getting evicted.
+const SKIPPED_CACHE_LIFETIME_MULTIPLIER: usize = 4;
+
 /// ChaCha20-Poly1305's authentication tag length; its ciphertext is always exactly
 /// `plaintext.len() + AEAD_TAG_LEN` bytes.
 const AEAD_TAG_LEN: usize = 16;
@@ -74,6 +87,12 @@ pub struct RatchetState {
     prev_chain_len: u32,
 
     skipped: HashMap<(DhPubBytes, u32), Zeroizing<[u8; 32]>>,
+    /// Insertion order of `skipped`'s keys, oldest first — used to evict the oldest
+    /// entries once the total cache exceeds its lifetime bound (see
+    /// [`SKIPPED_CACHE_LIFETIME_MULTIPLIER`]). May contain stale entries for keys
+    /// already removed from `skipped` via a cache hit; those are harmless no-ops when
+    /// popped, since eviction only ever removes-if-present.
+    skipped_order: VecDeque<(DhPubBytes, u32)>,
 }
 
 impl RatchetState {
@@ -108,6 +127,7 @@ impl RatchetState {
             recv_n: 0,
             prev_chain_len: 0,
             skipped: HashMap::new(),
+            skipped_order: VecDeque::new(),
         })
     }
 
@@ -138,6 +158,7 @@ impl RatchetState {
             recv_n: 0,
             prev_chain_len: 0,
             skipped: HashMap::new(),
+            skipped_order: VecDeque::new(),
         })
     }
 
@@ -289,9 +310,32 @@ impl RatchetState {
         }
         self.receiving_chain_key = Some(Zeroizing::new(final_receiving_chain_key));
         self.recv_n = envelope.n + 1;
-        self.skipped.extend(newly_skipped);
+        for (id, key) in newly_skipped {
+            self.skipped.insert(id, key);
+            self.skipped_order.push_back(id);
+        }
+        self.evict_oldest_skipped_beyond_lifetime_bound();
 
         Ok(plaintext)
+    }
+
+    /// Enforce [`SKIPPED_CACHE_LIFETIME_MULTIPLIER`] `* max_skip` as a hard cap on the
+    /// total skipped-key cache, evicting the oldest entries first. Called once per
+    /// successful `decrypt_raw`, after any new entries from this call have already
+    /// been inserted.
+    fn evict_oldest_skipped_beyond_lifetime_bound(&mut self) {
+        let cap = self.max_skip as usize * SKIPPED_CACHE_LIFETIME_MULTIPLIER;
+        while self.skipped.len() > cap {
+            match self.skipped_order.pop_front() {
+                Some(oldest) => {
+                    self.skipped.remove(&oldest);
+                }
+                // Every insertion into `skipped` is paired with a push onto
+                // `skipped_order`, so this can't happen while `skipped` still has
+                // more entries than the cap — but never spin if it somehow did.
+                None => break,
+            }
+        }
     }
 
     pub fn decrypt_payload(&mut self, envelope: &Envelope) -> Result<(u8, Vec<u8>)> {
@@ -820,5 +864,66 @@ mod tests {
 
         let e1 = alice.encrypt(&chat("still fine")).unwrap();
         assert_eq!(read_chat(&bob.decrypt_raw(&e1).unwrap()), "still fine");
+    }
+
+    /// Regression test for a real bug found while auditing this module: the
+    /// per-derivation `max_skip` bound only caps how many keys a *single*
+    /// `skip_and_derive` call may produce; nothing previously capped the *total*
+    /// `skipped` cache across many DH ratchet steps. A correspondent who keeps
+    /// ratcheting forward (replying) while leaving one message per round
+    /// permanently undelivered — plausible with a flaky connection, or a malicious
+    /// already-paired peer — grew the cache linearly forever, since only a cache
+    /// *hit* in `decrypt_raw` ever removes an entry. Confirmed empirically before
+    /// the fix: 30 such rounds left exactly 30 entries cached, ~30x the naive
+    /// expectation that `max_skip` alone bounds this. `evict_oldest_skipped_beyond_
+    /// lifetime_bound` now caps the total at `max_skip * SKIPPED_CACHE_LIFETIME_
+    /// MULTIPLIER`, evicting oldest-first.
+    #[test]
+    fn skipped_cache_is_bounded_across_many_dh_ratchet_steps() {
+        let (mut alice, mut bob) = matched_pair();
+        let cap = DEFAULT_MAX_SKIP as usize * SKIPPED_CACHE_LIFETIME_MULTIPLIER;
+
+        // Every round: Alice sends a message that's never delivered (a permanent gap),
+        // then one that is; Bob replies, forcing his own ratchet forward each time.
+        // None of the gap keys are ever consumed, so without a lifetime bound this
+        // cache would grow by one entry every round, forever.
+        for round in 0..(cap * 3) {
+            let _never_delivered = alice.encrypt(&chat(&format!("gap {round}"))).unwrap();
+            let delivered = alice.encrypt(&chat(&format!("delivered {round}"))).unwrap();
+            bob.decrypt_raw(&delivered).unwrap();
+            let reply = bob.encrypt(&chat(&format!("reply {round}"))).unwrap();
+            alice.decrypt_raw(&reply).unwrap();
+        }
+
+        assert!(
+            bob.skipped_key_count() <= cap,
+            "skipped-key cache grew to {} entries, past its {}-entry lifetime cap",
+            bob.skipped_key_count(),
+            cap
+        );
+    }
+
+    /// The eviction the previous test relies on must not throw away keys a *legitimate*
+    /// late arrival still needs, as long as the total in flight stays under the cap —
+    /// only genuinely never-consumed old entries should ever be at risk.
+    #[test]
+    fn eviction_does_not_break_a_legitimate_late_arrival_within_the_cap() {
+        let (mut alice, mut bob) = matched_pair();
+
+        let stray = alice.encrypt(&chat("delivered very late")).unwrap();
+        // A handful of further turns, well under the lifetime cap, none of which
+        // should evict `stray`'s still-pending skipped key.
+        for round in 0..5 {
+            let from_alice = alice.encrypt(&chat(&format!("a{round}"))).unwrap();
+            bob.decrypt_raw(&from_alice).unwrap();
+            let from_bob = bob.encrypt(&chat(&format!("b{round}"))).unwrap();
+            alice.decrypt_raw(&from_bob).unwrap();
+        }
+
+        assert_eq!(
+            read_chat(&bob.decrypt_raw(&stray).unwrap()),
+            "delivered very late",
+            "a late arrival well within the cache's lifetime cap must still decrypt"
+        );
     }
 }

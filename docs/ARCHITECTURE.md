@@ -779,6 +779,23 @@ In scope:
   key and potential ratchet step is computed into local variables first,
   and `self` is only mutated after the AEAD tag actually verifies —
   regression-tested in `ratchet::tests::garbage_envelope_does_not_desync_the_ratchet`.
+- **Unbounded growth of the skipped-message-key cache over a conversation's
+  lifetime.** Also found during implementation audit, not designed against
+  up front: `max_skip` (§3.3) only bounded how many keys a single
+  `skip_and_derive` call may produce for one DH chain — it never bounded
+  the *total* `RatchetState::skipped` cache across many DH ratchet steps.
+  Since only a cache hit in `decrypt_raw` ever removes an entry, a
+  correspondent who keeps ratcheting forward while leaving one message
+  permanently undelivered each round — a chronically flaky connection, or a
+  malicious already-paired peer deliberately doing this — grew the cache
+  linearly forever; confirmed empirically (30 such rounds left exactly 30
+  never-evictable entries) before fixing it. `RatchetState` now tracks
+  insertion order and evicts the oldest entries once the total exceeds
+  `max_skip * 4` (`SKIPPED_CACHE_LIFETIME_MULTIPLIER` in
+  `core/src/ratchet.rs`), leaving comfortable headroom for legitimate
+  concurrent gaps while still bounding memory over the conversation's full
+  lifetime — regression-tested in
+  `ratchet::tests::skipped_cache_is_bounded_across_many_dh_ratchet_steps`.
 - A TURN relay (Tier 0/1 NAT-traversal fallback) seeing encrypted traffic
   metadata (packet timing/size) without seeing content — tracked as a
   metadata concern, not a content-confidentiality one (see below).
