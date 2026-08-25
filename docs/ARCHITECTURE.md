@@ -206,6 +206,34 @@ schemas referenced below are in
   of removing the server from the path — see §11.2 for the mitigation
   (a user-facing toggle to force relaying even when direct is possible).
 
+**Concrete connection flow:**
+
+```mermaid
+sequenceDiagram
+    participant A as Alice's client
+    participant S as Signaling & Presence Service
+    participant B as Bob's client
+
+    Note over A,S: Alice already holds a WS connection (SERVERS.md §1.2)
+    S-->>A: PresenceUpdate(Bob, online) — pushed earlier, cached locally
+    A->>A: Recipient shows online → attempt Tier 0 first
+    A->>S: RendezvousOffer(to: Bob, sdp_offer, ice_candidates…)
+    S->>B: RendezvousOffer (forwarded)
+    B->>S: RendezvousAnswer(sdp_answer, ice_candidates…)
+    S->>A: RendezvousAnswer (forwarded)
+    A->>B: ICE connectivity checks (direct, or via TURN per §11.2)
+    Note over A,B: DataChannel opens — budget: 10s total (§4.5)
+    A->>B: Ratchet message envelope, directly over the DataChannel
+    B-->>A: DeliveryAck, directly over the DataChannel (§4.6)
+```
+
+Once the DataChannel is open, WebRTC's SCTP-based data channel already
+gives reliable, ordered delivery for as long as both sides stay connected —
+no relay, no TTL, no delivery token needed for this path. The signaling
+service's only role was the rendezvous handshake at the top; it's out of
+the loop for the rest of the conversation until the next rendezvous is
+needed (e.g. after a network change forces reconnection).
+
 ### 4.2 Tier 1 — ephemeral relay-assisted (pragmatic default)
 
 Same as Tier 0, plus one addition: an optional **ephemeral store-and-forward
@@ -238,6 +266,44 @@ without becoming a durable archive.
   ciphertext after delivery is not a backup, even though it technically
   "stores" something briefly. That distinction should be explicit in any
   user-facing description of Tier 1, so it doesn't get conflated with §4.3.
+
+**Concrete mailbox flow:**
+
+```mermaid
+sequenceDiagram
+    participant A as Alice's client
+    participant S as Signaling & Relay Service
+    participant B as Bob's client
+
+    Note over A: Presence cache says Bob offline,<br/>or the Tier 0 attempt (§4.1) timed out
+    A->>A: mailbox_id = HKDF(root_key, "mailbox" ‖ direction) (§11.1)
+    A->>S: MailboxWrite(mailbox_id, ratchet_envelope, ttl=14d)
+    Note over S: Ciphertext held transiently, TTL-bound (§4.5)
+    Note over B: … time passes, Bob's client comes online later …
+    B->>S: WS connect + auth (SERVERS.md §1.2)
+    B->>S: MailboxFetch(mailbox_id) — computed locally from Bob's own<br/>ratchet state per active conversation, never enumerated by asking the server
+    S-->>B: ratchet_envelope
+    B->>B: Ratchet-decrypt
+    B->>S: MailboxDelete(mailbox_id, entry_id)
+    Note over S: Entry wiped on confirmed decrypt, not merely on fetch —<br/>see the decrypt-failure note below
+    B->>S: DeliveryAck (§4.6), routed back the same way a normal message would be
+    S-->>A: DeliveryAck delivered (pushed if Alice's already connected, else queued the same as any message)
+```
+
+- **Delete-on-decrypt, not delete-on-fetch:** the recipient's client only
+  issues `MailboxDelete` after the fetched envelope decrypts successfully.
+  If decryption fails (corrupted transit, a bug, or an out-of-window replay)
+  the entry is left in place for one retry rather than being silently lost
+  on a fetch that didn't actually succeed end-to-end.
+- **Pull on reconnect, push if already connected:** a client always issues
+  `MailboxFetch` for its active conversations' current `mailbox_id`s right
+  after establishing its WebSocket connection (covers "was offline, came
+  back"). If the recipient is *already* connected when a write lands, the
+  service can additionally push it immediately over the open WebSocket —
+  push-if-connected is a latency optimization, not a substitute for the
+  pull-on-reconnect path, which is what actually guarantees delivery.
+- See §4.5 for the exact retry/backoff parameters and §4.6 for how
+  `DeliveryAck` prunes the sender's local outbox.
 
 ### 4.3 Tier 2 — opt-in recovery layer (mutual consent, self-hostable)
 
@@ -284,6 +350,65 @@ Tier 0 for delivery doesn't preclude Tier 2 for recovery or vice versa.
   — both interact with the tiering question (a DHT or relay mailbox model
   changes shape once "recipient" means multiple devices) and are better
   tackled once the 1:1 ratchet and delivery tiers are solid.
+
+### 4.5 Tier selection & fallback state machine
+
+Per outgoing message, not per conversation — presence can change between
+one message and the next, so the tier decision is re-made each time rather
+than pinned for the conversation's lifetime.
+
+```mermaid
+stateDiagram-v2
+    [*] --> CheckPresence: user sends a message
+    CheckPresence --> AttemptTier0: recipient shows online
+    CheckPresence --> Tier1Write: recipient shows offline/unknown
+    AttemptTier0 --> SentDirect: DataChannel opens within budget
+    AttemptTier0 --> Tier1Write: timeout, or ICE/TURN failure
+    Tier1Write --> QueuedRemote: relay accepts the write
+    Tier1Write --> LocalOutbox: relay unreachable, or Tier 0-only mode
+    QueuedRemote --> Delivered: recipient fetches + DeliveryAck received
+    SentDirect --> Delivered: DeliveryAck received
+    LocalOutbox --> AttemptTier0: presence flips to online, or periodic sweep
+    LocalOutbox --> Pruned: retention limit exceeded
+    Delivered --> [*]
+    Pruned --> [*]
+```
+
+Concrete parameters (v1 defaults — all client-side/tunable, nothing here
+requires relay-side coordination beyond the TTL):
+
+| Parameter | Default | Rationale |
+|---|---|---|
+| Tier 0 connection attempt budget | 10s total | STUN-only paths typically resolve in under 2s; TURN fallback adds a few more — 10s covers the realistic worst case without stalling the send indefinitely |
+| ICE gathering sub-budget | 5s | Within the 10s total |
+| Tier 1 mailbox TTL | 14 days | Long enough for a genuinely offline recipient (device off, vacation), short enough to keep "mailbox, not archive" true — see §12 for how a server-based deployment might reasonably extend this |
+| Tier 1 write retry backoff | 1s → 60s exponential, capped | For a transiently unreachable relay, not a permanently down one |
+| Local outbox retention | 500 messages/conversation **or** 30 days, whichever hits first | Oldest-pruned-first; pruning surfaces a visible "couldn't be delivered" notice rather than failing silently |
+| Retry trigger for a stalled outbox | Event-driven on a presence transition to online, plus a 5-minute periodic sweep while foregrounded | Avoids polling the relay/peer on a tight loop while still self-healing if a presence event was missed |
+
+### 4.6 Delivery acknowledgment
+
+A message being *sent* isn't the same as it being *delivered* — the sender
+needs to know when to stop retrying (§4.5's `LocalOutbox`/`QueuedRemote`
+states) and the UI needs something to base a delivery indicator on. A new
+schema message, `DeliveryAck` (§7 of `MESSAGE_SCHEMA.md`), closes this loop:
+
+- Sent by the recipient's client the moment a ratchet envelope **decrypts
+  successfully** — not on mere receipt, so a corrupted-in-transit message
+  never gets falsely acked.
+- Routed back exactly like a normal message would be: over an open Tier 0
+  DataChannel if one exists, otherwise written to a Tier 1 mailbox the same
+  way — `DeliveryAck` gets no special-cased transport.
+- On receipt, the sender prunes the corresponding entry from its local
+  outbox/retry queue (§4.5) and the UI can show a delivered indicator.
+- **This is deliberately *delivery*, not *read*.** Whether the human on the
+  other end has actually looked at the message is a separate, more
+  privacy-sensitive signal (Signal, WhatsApp, and iMessage all draw exactly
+  this line, and all let users turn read receipts off independently of
+  delivery confirmation). DRAtchet's v1 scope is delivery acknowledgment
+  only; a `ReadReceipt` message would follow the identical pattern but
+  should default to **off**, user-toggleable per conversation, tracked as
+  an open decision in §10 rather than shipped as an unconditional default.
 
 ## 5. Client / platform architecture
 
@@ -511,21 +636,25 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
 ## 9. Roadmap
 
 1. **v0 — crypto core**: identity keys, X3DH handshake, Double Ratchet
-   engine (using the fixed-layout envelope from `MESSAGE_SCHEMA.md` §2),
+   engine (using the fixed-layout envelope from `MESSAGE_SCHEMA.md` §2,
+   including the `payload_type` tag and `DeliveryAck` payload from §7),
    unit + property tests (including out-of-order/skipped-key tests
    simulating queue depth), no UI, no transport yet.
 2. **v1 — desktop MVP**: Tauri app, 1:1 chat only, Tier 1 delivery
    (ephemeral relay-assisted, §4.2, using ratchet-derived `mailbox_id`s per
-   §11.1) as the default with Tier 0 direct P2P attempted first when
-   reachable, the Signaling & Presence Service (`SERVERS.md` §1, combined
-   with the Tier 1 mailbox for v1 simplicity, prekey-fetch rate limiting
-   and registration proof-of-work per §11.8), local encrypted storage, QR
-   and remote-pairing-code verification (§6), message padding (§11.3),
-   an "always relay, never direct-connect" per-contact privacy toggle
-   (§11.2), per-conversation disappearing-message timers (§11.5),
-   per-conversation opt-in Tier 2 recovery with a self-custodied recovery
-   phrase, deployment profile A — the purpose-built server (§7,
-   `SERVERS.md` §2.1).
+   §11.1, the fallback state machine and timeout/retry parameters from
+   §4.5, and `DeliveryAck`-driven outbox pruning from §4.6) as the default
+   with Tier 0 direct P2P attempted first when reachable, the Signaling &
+   Presence Service (`SERVERS.md` §1, combined with the Tier 1 mailbox for
+   v1 simplicity, prekey-fetch rate limiting and registration proof-of-work
+   per §11.8), local encrypted storage, QR and remote-pairing-code
+   verification (§6), message padding (§11.3), an "always relay, never
+   direct-connect" per-contact privacy toggle (§11.2 — this is also what
+   turns a v1 install into the server-based deployment model from §12 when
+   paired with running the relay on durable infrastructure), per-
+   conversation disappearing-message timers (§11.5), per-conversation
+   opt-in Tier 2 recovery with a self-custodied recovery phrase, deployment
+   profile A — the purpose-built server (§7, `SERVERS.md` §2.1).
 3. **v2**: multi-device support, group chat (MLS/RFC 9420-style group key
    management — TreeKEM's tree-based scaling is the better-established
    approach today vs. naive pairwise sender-keys fan-out), prekey bundle
@@ -533,7 +662,8 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
    passphrase-protected recovery option (§7 option b, §4.3), post-quantum
    hybrid handshake (§11.4).
 4. **Research track, not scheduled**: Tor/onion-routed transport (§11.2),
-   key transparency for the directory (§11.7), duress response (§11.9).
+   key transparency for the directory (§11.7), duress response (§11.9),
+   federated (multi-operator) server-based deployments (§12.4).
 
 ## 10. Open decisions for confirmation
 
@@ -575,6 +705,20 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
   `SERVERS.md`, recommended for v1 — better delete/rate-limit control) vs.
   direct S3-compatible bucket writes (§2.2, zero custom server code) —
   worth offering both eventually; v1 ships profile A first.
+- `ReadReceipt` (§4.6): whether it ships at all in v1 alongside
+  `DeliveryAck`, and if so, defaulting off with a per-conversation toggle —
+  leaning toward shipping it, but off-by-default is the part that isn't
+  negotiable given the Signal/WhatsApp/iMessage precedent of treating it as
+  more sensitive than delivery confirmation.
+- Tier 0 connection budget and Tier 1 TTL (§4.5): 10s and 14 days are
+  reasonable starting defaults, not measured — tune once there's real
+  network/usage data, especially the TTL if a server-based deployment (§12)
+  wants to extend it well past 14 days for genuinely async use.
+- Server-based deployment (§12): whether v1 ships official guidance/tooling
+  for running the Signaling & Presence Service as durable always-on
+  infrastructure (vs. leaving that entirely to whoever self-hosts it) —
+  not required for the protocol to support it, but affects how usable that
+  deployment model is out of the box.
 
 ## 11. Security hardening: lessons from prior art
 
@@ -756,3 +900,84 @@ entry, the way Briar integrates with a separate panic-trigger app. Genuinely
 useful for some threat models, but a UX feature layered on top of the core
 protocol rather than something that changes it — flagged for v2
 consideration, not designed further here.
+
+## 12. Deployment models: pure peer-to-peer vs. server-based
+
+Everything above frames Tier 0/1/2 as layered, composable choices. This
+section names the two ends of that spectrum explicitly and compares them,
+because they represent genuinely different operating philosophies — the
+one Briar/Ricochet commit to (no server, ever) versus the one Signal/
+WhatsApp/Matrix commit to (always route through operator infrastructure) —
+and a deployment (or a user, via the §11.2 toggle) is choosing between real
+trade-offs, not a cosmetic preference.
+
+### 12.1 Two models, not two protocols
+
+- **Pure peer-to-peer** = Tier 0 only, permanently. No relay is ever
+  configured or attempted; if Tier 0 fails, the message stays in the local
+  outbox (§4.5) until it succeeds. This is the strict end of the spectrum
+  Briar and Ricochet occupy.
+- **Server-based** = the same Signaling & Presence Service from `SERVERS.md`
+  §1, but **promoted from optional fallback to the primary, always-used
+  path** — run on durable always-on infrastructure (a maintained VPS or
+  equivalent, not necessarily "serverless-hosted" in the ops sense §4.2
+  otherwise recommends), with Tier 0 either disabled entirely or attempted
+  only as a latency optimization when the server path is also live. This
+  is architecturally *the same protocol* as Tier 1 — same message schemas,
+  same "never sees plaintext" guarantee — just a different deployment
+  policy: always relay, provision for durability and load, and treat the
+  relay as a first-class piece of infrastructure rather than an optional
+  bridge. It's the deployment shape Signal and WhatsApp commit to.
+
+Framing it this way — a deployment policy on top of one protocol, not a
+protocol fork — is deliberate: DRAtchet doesn't have to pick a side. A
+given install, or even a given conversation via the existing always-relay
+toggle (§11.2), can sit anywhere on this spectrum without anyone having
+implemented a second system.
+
+### 12.2 Comparison
+
+| Dimension | Pure peer-to-peer (Tier 0 only) | Server-based (always-on relay, primary path) |
+|---|---|---|
+| IP privacy between contacts | Exposed — direct connection or TURN-masked (§11.2) | Fully hidden — neither peer ever learns the other's IP, matching Signal/WhatsApp |
+| Offline / asynchronous delivery | Not possible without both online at once; sender retries from a local outbox | Native — server holds ciphertext until the recipient reconnects (§4.2) |
+| Delivery reliability | Bounded by both users' uptime, NAT type, and network conditions | High — dominated by server uptime, which a maintained deployment can make much better than a home client's |
+| Operational cost/complexity | None to run; complexity instead lives in the client's NAT-traversal engineering | Real, ongoing: infrastructure to provision, monitor, and keep patched |
+| Multi-device fan-out (v2) | Hard — every device would need its own direct session with every peer device | Natural — one incoming message, fanned out server-side to N registered devices |
+| Rich features (read receipts, typing indicators) | Possible, but each needs its own P2P signaling | Straightforward to centralize once |
+| Censorship resistance | High — no fixed server to block; traffic resembles generic WebRTC | Lower — a known server address/domain is a blockable choke point (mitigable, not eliminated, by pluggable-transport-style techniques) |
+| Trust required | Only the other party, plus a largely-metadata-blind STUN/TURN operator | The server operator, specifically not to log/correlate metadata even though they can't read content |
+| Abuse/spam moderation | Effectively impossible to centrally moderate — no chokepoint | Server can rate-limit and detect abuse patterns (also the mechanism from §11.8) |
+| Bandwidth cost | Borne by the two users (or a TURN relay) | Borne by whoever operates the server — a real, usage-scaling cost |
+| Latency when both are online | Lowest — direct connection | One extra hop; typically negligible for text chat |
+| Resilience to a party's network change (e.g. switching Wi-Fi) | Connection drops, ICE must renegotiate | Absorbed by the server — reconnect to a stable endpoint, not to the peer directly |
+
+### 12.3 DRAtchet's position
+
+Ship the **hybrid** (Tier 0-opportunistic-first, Tier 1-fallback — already
+the v1 default from §4.2 and the Roadmap, §9) rather than force a choice
+between the two extremes. It captures most of pure-P2P's latency and
+no-third-party benefit when both people happen to be online together,
+and gets the server-based model's reliability as a safety net otherwise —
+at the cost of not fully committing to either column above. Users who want
+one extreme or the other aren't blocked: pure-P2P is Tier 0 with Tier 1
+disabled; a fully server-based experience is the always-relay toggle
+(§11.2) plus running the Signaling & Presence Service on durable,
+always-on infrastructure instead of ephemeral serverless functions — a
+deployment/operations choice, not a code change.
+
+### 12.4 A further axis: single operator vs. federation
+
+Everything in §12.2 implicitly assumes a server-based deployment means
+*one* operator's server. That's not the only shape a "server-based" model
+can take — Matrix and XMPP instead federate: many independent operators run
+interoperating servers, and a user picks a home server the way email works,
+rather than everyone depending on one operator. Federation would let
+DRAtchet's server-based model avoid the single-operator trust concentration
+in §12.2's "trust required" row, at real added cost: cross-server routing,
+federation-level abuse handling, and a `username#NNNN` directory (§6.1)
+that now has to resolve across operators rather than within one. Flagged
+as a **research track**, not scoped for v1 or v2 — worth a real look once
+a single-operator server-based deployment exists and there's a concrete
+reason (multiple communities wanting to run their own, interoperating
+infrastructure) to justify the added complexity.

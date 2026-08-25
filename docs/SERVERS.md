@@ -110,6 +110,32 @@ including account-registration abuse (username squatting).
   (e.g. the Cloudflare Durable Objects/KV option from `ARCHITECTURE.md`
   §4.2, or Redis with `EXPIRE`) covers it without a schema or migrations.
 
+### 1.5 Deployment posture: ephemeral-fallback vs. always-on primary
+
+Everything in §1.1–§1.4 describes the *protocol* this service speaks; how
+it's hosted is a separate, orthogonal choice — the same distinction
+`ARCHITECTURE.md` §12 draws between the tiered model's default and the
+server-based deployment model:
+
+- **Ephemeral-fallback posture (v1 default)**: hosted as short-lived
+  serverless functions (Cloudflare Durable Objects/KV or equivalent),
+  attempted only after Tier 0 fails or times out (`ARCHITECTURE.md` §4.5).
+  Uptime expectations are modest — a brief gap just means more messages sit
+  in the sender's local outbox a little longer.
+- **Always-on primary posture (the "server-based model," `ARCHITECTURE.md`
+  §12.1)**: the identical protocol, hosted on durable, monitored
+  infrastructure and treated as the primary path — Tier 0 attempted only as
+  a latency optimization, or not at all. This posture is what makes sense
+  to pair with the always-relay privacy toggle (`ARCHITECTURE.md` §11.2)
+  and with extending the Tier 1 TTL well past the 14-day ephemeral default,
+  since a properly operated server can responsibly hold ciphertext for
+  longer without it turning into an accidental durable archive.
+
+No protocol or schema difference between the two — same message formats
+(§3 below, and `MESSAGE_SCHEMA.md` §6–7), same "never sees plaintext"
+guarantee. The difference is entirely operational: uptime SLA, TTL policy,
+and whether Tier 0 is attempted at all.
+
 ## 2. Recovery Store (Tier 2)
 
 ### 2.1 Per-participant, not shared — and why
@@ -187,6 +213,9 @@ isolation §2.1 exists to provide.
 
 Presence protocol messages (`PresenceAnnounce`, `PresenceUpdate`) referenced
 in §1.3 above are specified in [`MESSAGE_SCHEMA.md`](MESSAGE_SCHEMA.md) §6.
+Rendezvous and mailbox control messages (`RendezvousOffer`/`Answer`,
+`MailboxWrite`/`Fetch`/`Delete`) referenced in §1.1's job list, and the
+`DeliveryAck` payload they eventually carry, are in `MESSAGE_SCHEMA.md` §7.
 Recovery Store request/response bodies reuse the `RecoveryBackupEntry`
 schema from `MESSAGE_SCHEMA.md` §5 directly — the HTTP layer in §2.2 above
 adds only routing (`conversation_id`/`seq` in the URL) and auth, no new

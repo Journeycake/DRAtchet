@@ -69,14 +69,24 @@ wire, including a relay if one is in the path. That's a metadata leak
 as a known gap in `ARCHITECTURE.md` §8 and as an open decision (header
 encryption) in `ARCHITECTURE.md` §10, rather than solved here.
 
-**Padding:** plaintext is padded to a fixed bucket size before encryption
-— e.g. the next multiple of 160 bytes, up to a cap, beyond which it pads to
-the next larger bucket — so `ciphertext_len` doesn't directly reveal exact
-message length (distinguishing a one-word reply from a longer message by
-size alone, or fingerprinting content by its exact byte count). Padding is
-stripped after decryption and never transmitted as a separate field — it's
-just part of what gets encrypted. Inspired by Signal's message padding;
-see §11.3 of `ARCHITECTURE.md` for the full rationale.
+**Payload type:** the plaintext (before padding, inside what becomes
+`ciphertext`) starts with a 1-byte `payload_type` tag: `0 = chat message`,
+`1 = DeliveryAck` (§7), reserved values for future control payloads
+(e.g. a `ReadReceipt`, `ARCHITECTURE.md` §4.6). This is what lets a
+recipient tell a chat message apart from a control message like
+`DeliveryAck` after decrypting — both travel inside the same ratchet
+envelope and get the same confidentiality/padding treatment; nothing about
+a control message is distinguishable on the wire before decryption.
+
+**Padding:** the tagged plaintext (`payload_type` + content) is padded to a
+fixed bucket size before encryption — e.g. the next multiple of 160 bytes,
+up to a cap, beyond which it pads to the next larger bucket — so
+`ciphertext_len` doesn't directly reveal exact message length
+(distinguishing a one-word reply from a longer message by size alone, or
+fingerprinting content by its exact byte count — and, now, distinguishing a
+`DeliveryAck` from a short chat message by size). Padding is stripped after
+decryption and never transmitted as a separate field. Inspired by Signal's
+message padding; see §11.3 of `ARCHITECTURE.md` for the full rationale.
 
 **Nonce:** not transmitted. The AEAD encryption key *and* the 12-byte nonce
 are both derived from the per-message key via HKDF (`HKDF(message_key) →
@@ -159,3 +169,39 @@ changes happen — there is no `PresenceQuery` message, by design: presence
 can't be polled for an arbitrary account, only received for existing
 contacts, which is what keeps it from being an enumeration oracle
 (`SERVERS.md` §1.3).
+
+## 7. Rendezvous, mailbox, and delivery-acknowledgment messages (CBOR)
+
+The control messages behind the sequence diagrams in `ARCHITECTURE.md` §4.1
+(Tier 0 rendezvous), §4.2 (Tier 1 mailbox), and §4.6 (delivery
+acknowledgment) — all over the same Signaling & Presence Service WebSocket
+as §6.
+
+| Message | Field | Type | Notes |
+|---|---|---|---|
+| `RendezvousOffer` (initiator → service → recipient) | `to_fingerprint` | bytes (32) | recipient's identity fingerprint |
+| | `sdp_offer` | text | WebRTC SDP offer |
+| | `ice_candidates` | array of text | trickled incrementally in practice; shown as one field here for brevity |
+| `RendezvousAnswer` (recipient → service → initiator) | `sdp_answer` | text | WebRTC SDP answer |
+| | `ice_candidates` | array of text | |
+| `MailboxWrite` (sender → service) | `mailbox_id` | bytes (16) | derived per `ARCHITECTURE.md` §11.1, not a static device id |
+| | `envelope` | bytes | the ratchet message envelope (§2), opaque to the service |
+| | `ttl` | uint32 | seconds; 14 days default (`ARCHITECTURE.md` §4.5) |
+| `MailboxFetch` (recipient → service, on reconnect) | `mailbox_id` | bytes (16) | computed locally from the recipient's own ratchet state, never enumerated via the service |
+| `MailboxDelete` (recipient → service, after successful decrypt) | `mailbox_id` | bytes (16) | |
+| | `entry_id` | bytes (16) | service-assigned on write, echoed back on fetch |
+| `DeliveryAck` (recipient → sender, routed like any other message) | `conversation_id` | bytes (16) | same derivation as §2 |
+| | `acked_n` | uint32 | the ratchet header's `n` (§2) being acknowledged |
+
+`DeliveryAck`'s two fields (`conversation_id`, `acked_n`) are CBOR-encoded
+and become the *content* of a ratchet envelope's plaintext, tagged with
+`payload_type = 1` (§2) — it's carried as an ordinary ratchet message, not
+a separate wire format, and gets the same encryption, padding, and (for
+Tier 1) mailbox routing as a chat message. The rendezvous and mailbox
+control messages above it in this table (`RendezvousOffer` through
+`MailboxDelete`) are different in kind: they're exchanged with the
+Signaling & Presence Service itself, before or outside any given ratchet
+session, so they're plain CBOR over the WebSocket with no ratchet
+encryption of their own — the service has to be able to read routing
+metadata to do its job (§4.1/§4.2 of `ARCHITECTURE.md`), unlike message
+content.
