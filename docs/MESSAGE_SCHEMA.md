@@ -2,8 +2,10 @@
 
 Status: **design draft, no code yet**. Companion to [`ARCHITECTURE.md`](ARCHITECTURE.md)
 — read that first for the protocol rationale (Double Ratchet, X3DH-over-OpenPGP,
-§6 peer auth, §7 recovery). This document is the concrete wire format for
-each message type that protocol produces.
+§6 peer auth, §7 recovery) — and to [`SERVERS.md`](SERVERS.md) for the two
+server components (Signaling & Presence Service, Recovery Store) that some
+of the schemas below (§5, §6) are exchanged with. This document is the
+concrete wire format for each message type the protocol produces.
 
 ## Encoding conventions
 
@@ -125,3 +127,26 @@ ratchet internals.
 | `ciphertext` | bytes | `AEAD(plaintext)` under the conversation recovery key, independent key from any ratchet message key |
 | `created_at` | uint64 | unix seconds |
 | `written_by` | 1 byte | which participant uploaded this entry (sender uploads by default; either side may also upload as redundancy — dedup by `(conversation_id, seq)`) |
+
+## 6. Presence protocol (CBOR, over the Signaling & Presence Service's WebSocket)
+
+See [`SERVERS.md`](SERVERS.md) §1 for the service design these messages
+belong to — auth handshake, visibility rules, and why presence state is
+held in-memory only, never logged.
+
+| Message | Field | Type | Notes |
+|---|---|---|---|
+| `AuthChallenge` (service → client, on connect) | `nonce` | bytes (32) | fresh per connection |
+| `AuthResponse` (client → service) | `identity_fingerprint` | bytes (32) | identifies the connecting account |
+| | `signature` | bytes | signature over `nonce` using the identity key (or per-device subkey — `SERVERS.md` §4) |
+| `PresenceAnnounce` (client → service) | `state` | 1 byte enum | `0 = online`, `1 = away` |
+| `PresenceUpdate` (service → subscribed contacts' clients) | `identity_fingerprint` | bytes (32) | whose presence changed |
+| | `state` | 1 byte enum | `0 = online`, `1 = away`, `2 = offline` |
+| | `last_seen` | uint64, present only when `state = offline` | unix seconds |
+| `PresenceSubscribe` (client → service, implicit on session establishment) | `identity_fingerprint` | bytes (32) | a client only receives updates for accounts it has an established or attempted session with — the service enforces this, not the client (`SERVERS.md` §1.3) |
+
+`PresenceUpdate` is push-only, sent to already-subscribed clients as state
+changes happen — there is no `PresenceQuery` message, by design: presence
+can't be polled for an arbitrary account, only received for existing
+contacts, which is what keeps it from being an enumeration oracle
+(`SERVERS.md` §1.3).

@@ -5,7 +5,9 @@ Target platforms: Windows, macOS, Linux (desktop)
 
 See [`MESSAGE_SCHEMA.md`](MESSAGE_SCHEMA.md) for the concrete wire formats
 referenced throughout (prekey bundle, ratchet message envelope, X3DH init,
-pairing messages, recovery backup entry).
+pairing messages, presence protocol, recovery backup entry), and
+[`SERVERS.md`](SERVERS.md) for the two optional server components (the
+Signaling & Presence Service, and the Tier 2 Recovery Store) in full detail.
 
 ## 1. Recap: why "a fresh PGP keypair every message" doesn't work
 
@@ -230,21 +232,18 @@ without becoming a durable archive.
 Layers on top of *either* Tier 0 or Tier 1 — orthogonal to which delivery
 tier is in use. This is exactly the §7 recovery design, restated with the
 hosting question now answered: the durable, decryptable-with-the-recovery-
-key backup store doesn't need to be a DRAtchet-operated service at all. It
-can be:
+key backup store doesn't need to be a DRAtchet-operated service at all, and
+— now specified in full in [`SERVERS.md`](SERVERS.md) §2 — it doesn't need
+to be *shared* between the two participants either. Each side who opts in
+configures their **own** recovery destination (their own self-hosted server
+or cloud bucket); mutual consent still gates whether backup happens at all
+for that conversation, but the storage itself is single-owner, which keeps
+blast radius, deletion semantics, and auth all simpler than a shared store
+would — see `SERVERS.md` §2 for the full reasoning and API.
 
-- **Self-hosted cloud storage the users themselves point at** (an
-  S3-compatible bucket, a small self-run service, etc.) — keeps the project
-  itself serverless while still making recovery possible for whoever wants
-  it.
-- A future managed option, if there's demand (still gated by the same
-  mutual-consent flow — hosting model doesn't change the consent
-  requirement from §7).
-
-Either way, activating Tier 2 is a conversation-level, mutual, explicit
-decision (§7) — it never happens as a side effect of picking a delivery
-tier, and picking Tier 0 for delivery doesn't preclude Tier 2 for recovery
-or vice versa.
+Activating Tier 2 is a conversation-level, mutual, explicit decision (§7) —
+it never happens as a side effect of picking a delivery tier, and picking
+Tier 0 for delivery doesn't preclude Tier 2 for recovery or vice versa.
 
 ### 4.4 Cross-cutting notes
 
@@ -262,6 +261,13 @@ or vice versa.
   second piece of infrastructure. Flagged as an open decision in §10 if a
   fully decentralized (DHT-based) directory turns out to matter more than
   the simplicity of a small serverless KV store.
+- **Online-status/presence** is a fourth job that same signaling service
+  can hold: whether a contact is currently reachable, used both for UX (a
+  presence indicator) and to decide whether to attempt Tier 0 direct
+  delivery or go straight to a Tier 1 mailbox/local outbox. Full design —
+  connection/auth model, presence visibility rules, and why it stays
+  ephemeral (in-memory, not logged) rather than becoming another durable
+  store — is in [`SERVERS.md`](SERVERS.md) §1.
 - Multi-device and group chat remain **out of scope for v1** (Roadmap, §9)
   — both interact with the tiering question (a DHT or relay mailbox model
   changes shape once "recipient" means multiple devices) and are better
@@ -454,6 +460,19 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
   authenticated but sent in clear text, visible to anything on the wire
   including a Tier 1 relay) — would need sealed-sender-style techniques and/
   or ratchet header encryption later; tracked in §10.
+- The Signaling & Presence Service (`SERVERS.md` §1) is, by design, a
+  single point that can observe *global* online/offline transitions across
+  its whole user base — not per-relationship metadata like the rest of this
+  model, but service-wide. Presence visibility to other *users* is scoped
+  to verified contacts (`SERVERS.md` §1.2); visibility to the service
+  *operator* is not scoped at all — this is a real trust concession to
+  running any presence feature and is worth stating plainly rather than
+  implying presence is as contained as the rest of the design.
+- A Recovery Store operator (`SERVERS.md` §2) sees that user's own backup
+  metadata (conversation cadence, sizes, timing) even though it never sees
+  plaintext — contained to whichever user's store it is under the
+  recommended per-participant model, but see `SERVERS.md` §2.3 for the
+  cross-party hosting case where that containment breaks down.
 - Multi-device and group messaging (see Roadmap).
 - Recoverable-mode conversations (§7) intentionally accept a narrower threat
   model by design and by mutual consent: a durable, decryptable-with-the-
@@ -474,9 +493,12 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
    simulating queue depth), no UI, no transport yet.
 2. **v1 — desktop MVP**: Tauri app, 1:1 chat only, Tier 1 delivery
    (ephemeral relay-assisted, §4.2) as the default with Tier 0 direct P2P
-   attempted first when reachable, local encrypted storage, QR and
-   remote-pairing-code verification (§6), per-conversation opt-in Tier 2
-   recovery with a self-custodied recovery phrase (§7).
+   attempted first when reachable, the Signaling & Presence Service
+   (`SERVERS.md` §1, combined with the Tier 1 mailbox for v1 simplicity),
+   local encrypted storage, QR and remote-pairing-code verification (§6),
+   per-conversation opt-in Tier 2 recovery with a self-custodied recovery
+   phrase, deployment profile A — the purpose-built server (§7,
+   `SERVERS.md` §2.1).
 3. **v2**: multi-device support, group chat (sender-keys), prekey bundle
    auto-replenishment, push notifications, optional managed/server-escrowed
    passphrase-protected recovery option (§7 option b, §4.3).
@@ -510,3 +532,14 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
   the base protocol is solid.
 - Tier 1 relay hosting model (self-hosted vs. a managed option) — not yet
   decided, doesn't block crypto-core (v0) work.
+- Signaling/Presence Service vs. Tier 1 mailbox as one combined service or
+  two separate ones (`SERVERS.md` §1) — recommend combined for v1 (one
+  piece of infra to run instead of two), split later only if their scaling
+  or hosting needs actually diverge.
+- Presence "away" heuristic (idle timeout before online → away) and whether
+  it ships at all in v1 vs. a simpler online/offline-only signal —
+  unresolved, low-stakes, doesn't block other work.
+- Recovery Store deployment profile: purpose-built minimal server (§2.1 of
+  `SERVERS.md`, recommended for v1 — better delete/rate-limit control) vs.
+  direct S3-compatible bucket writes (§2.2, zero custom server code) —
+  worth offering both eventually; v1 ships profile A first.

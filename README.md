@@ -14,8 +14,10 @@ queued messages, out-of-order delivery, and retries.
 Status: **design phase, no application code yet.**
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full protocol and
-system design, and [`docs/MESSAGE_SCHEMA.md`](docs/MESSAGE_SCHEMA.md) for
-the concrete wire formats. Highlights:
+system design, [`docs/MESSAGE_SCHEMA.md`](docs/MESSAGE_SCHEMA.md) for the
+concrete wire formats, and [`docs/SERVERS.md`](docs/SERVERS.md) for the two
+optional server components (signaling/presence, and per-user recovery
+storage). Highlights:
 
 - Why a literal per-message PGP-keypair rotation isn't feasible under
   message queueing, and how Double Ratchet solves it.
@@ -27,6 +29,9 @@ the concrete wire formats. Highlights:
 - A serverless-first, tiered delivery model: direct peer-to-peer by default,
   an optional ephemeral (auto-expiring) relay to bridge offline recipients,
   and no durable storage of any kind unless both participants opt in.
+- Presence: contacts-only online-status, held in memory only by the same
+  minimal signaling service used for peer-to-peer rendezvous — never
+  logged, never queryable for arbitrary accounts.
 - Per-conversation message recovery — off by default, opt-in only with
   mutual consent from both participants, and hostable on storage the
   participants themselves control rather than a DRAtchet-run service.
