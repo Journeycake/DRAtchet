@@ -43,11 +43,17 @@ chat (v2) adds. Highlights:
   ratchet, why a Group Coordination Service becomes mandatory once
   membership changes need one agreed-upon ordering, and how the same
   most-restrictive-wins recovery policy extends from two participants to N.
+- Multi-device roadmap (v2): per-device identity keys (Signal's Sesame
+  model) rather than a synced shared key, one ratchet session per
+  device pair, and how recovery profiles stay consistent across a user's
+  own devices.
 - Client architecture (Tauri + Rust, one codebase for Windows/macOS/Linux)
   and threat model.
 - Security hardening pulled from prior art: Signal (sealed sender, message
-  padding, PQXDH, Key Transparency), Apple iMessage's PQ3, Briar (Tor-based
-  P2P, panic response), and OTR (message deniability).
+  padding, PQXDH, Triple Ratchet/SPQR post-quantum hardening, Key
+  Transparency), Apple iMessage's PQ3, SimpleX (two-hop private message
+  routing), Briar (Tor-based P2P, panic response), and OTR (message
+  deniability).
 
 ## Building
 

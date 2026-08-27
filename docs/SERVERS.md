@@ -30,14 +30,17 @@ One small service, four related jobs — kept as one piece of infrastructure
 for v1 rather than four, per the open decision in `ARCHITECTURE.md` §10:
 
 1. Prekey bundle directory: publish/fetch by `username#NNNN` (§1 of
-   `MESSAGE_SCHEMA.md`).
+   `MESSAGE_SCHEMA.md`) — extended in v2 to a per-account **device list**
+   rather than one bundle per account (`ARCHITECTURE.md` §14.2).
 2. WebRTC rendezvous: relay SDP offer/answer and ICE candidates so two
    clients can establish a direct Tier 0 connection.
 3. Tier 1 mailbox: hold ratchet message envelopes transiently (TTL'd) when
    the recipient isn't reachable for direct delivery (`ARCHITECTURE.md`
    §4.2), addressed by the per-conversation-direction `mailbox_id`
    described there — not a per-device inbox (see `ARCHITECTURE.md` §11.1
-   for why).
+   for why) — extended in v2 to an optional two-hop private-routing mode
+   so no single relay operator sees both ends of a conversation
+   (`ARCHITECTURE.md` §11.2).
 4. **Presence**: track and broadcast online/offline status to verified
    contacts — the new piece this section specifies.
 
@@ -345,13 +348,14 @@ These are also tracked in `ARCHITECTURE.md` §10 alongside the rest of the
 project's open decisions; kept here too since they're specific to these
 services.
 
-- **Signing key for the presence handshake (§1.2):** reuse the long-term
-  identity key directly, or mint a dedicated per-device signing subkey for
-  it? A per-device subkey would let a lost/revoked device be cut off from
-  presence and signaling independently of the identity key it was derived
-  from, without a full identity rotation — worth doing once multi-device
-  (`ARCHITECTURE.md` §9 v2) is in scope, probably unnecessary complexity
-  before then.
+- ~~**Signing key for the presence handshake (§1.2)**~~ — **resolved** by
+  the multi-device roadmap (`ARCHITECTURE.md` §14.3): each device already
+  gets its own identity DH key and signed prekey under the per-device
+  model (§14.1), so reusing that same per-device key for the presence
+  handshake is the natural answer rather than a separate mechanism — a
+  revoked device loses signaling access the same way it loses
+  message-session access, in one step. No longer open; kept here as a
+  record of the question, not a decision still pending.
 - **Presence "away" state:** ship the idle-timeout `away` state in v1, or
   keep it to a simpler online/offline-only signal until there's a concrete
   UX reason for the extra state? Low-stakes, doesn't block other work.

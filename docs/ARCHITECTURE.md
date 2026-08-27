@@ -829,7 +829,9 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
   the v1 always-relay toggle — a user who hasn't enabled it is knowingly (if
   the UI states it clearly) trading IP privacy for the latency/no-third-party
   benefits of direct P2P.
-- Multi-device and group messaging (see Roadmap).
+- Multi-device (§14) and group messaging (§13) each push their own new
+  threat-model items onto the base model above rather than inheriting it
+  silently — see their own sections, not this one, for what those are.
 - Recoverable-mode conversations (§7) intentionally accept a narrower threat
   model by design, scoped to whatever the conversation's *effective*
   profile actually permits (§7.2): under effective Profile A, a durable,
@@ -878,15 +880,19 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
    recovery profile system (§7) with a self-custodied recovery phrase,
    hosted via storage option 1, the purpose-built server (`SERVERS.md`
    §3.2).
-3. **v2**: multi-device support, group chat (MLS/RFC 9420 — full roadmap,
+3. **v2**: multi-device support (full roadmap, including the per-device
+   identity model and how recovery profiles stay consistent across a
+   user's own devices, in §14), group chat (MLS/RFC 9420 — full roadmap,
    including why a coordinating server becomes mandatory and how recovery
-   extends to N members, in §13), prekey bundle auto-replenishment, push
-   notifications, optional managed/server-escrowed passphrase-protected
-   recovery option (§7 option b, §4.3), post-quantum hybrid handshake
-   (§11.4).
+   extends to N members, in §13), SimpleX-style two-hop private message
+   routing (§11.2), prekey bundle auto-replenishment, push notifications,
+   optional managed/server-escrowed passphrase-protected recovery option
+   (§7 option b, §4.3), post-quantum hardening — hybrid handshake now,
+   extended to the ratchet itself once that ships (§11.4).
 4. **Research track, not scheduled**: Tor/onion-routed transport (§11.2),
    key transparency for the directory (§11.7), duress response (§11.9),
-   federated (multi-operator) server-based deployments (§12.4).
+   federated (multi-operator) server-based deployments (§12.4), reducing
+   multi-device fan-out amplification (§14.4/§14.5).
 
 ## 10. Open decisions for confirmation
 
@@ -980,7 +986,7 @@ writes even without a stable id — this is a partial mitigation, not
 sealed-sender's full guarantee, and doesn't need Signal's server-issued
 certificate infrastructure to deliver most of the benefit.
 
-### 11.2 Direct-P2P IP exposure between contacts — inspired by Briar (Tor-based P2P) vs. Signal/WhatsApp's always-relayed model — **v1 (toggle), research (Tor transport)**
+### 11.2 Direct-P2P IP exposure between contacts — inspired by Briar (Tor-based P2P), SimpleX's private message routing, and Signal/WhatsApp's always-relayed model — **v1 (toggle), v2 (private routing), research (Tor transport)**
 
 Gap, stated plainly in §4.1: Tier 0 WebRTC gives each side the other's IP
 (or the TURN relay's, if NAT traversal falls back to relaying). Centrally
@@ -994,12 +1000,38 @@ inherently can, unless every connection is forced through a relay.
   exactly this as a calls-privacy setting ("Always Relay Calls"), for
   exactly this reason. Default **off** (best latency, matches the
   serverless-P2P default elsewhere), opt-in per contact.
+- **v2, closes the gap further than the v1 toggle alone**: adopt a
+  SimpleX-style **two-hop private message routing** scheme for Tier 1 —
+  instead of one relay hop that still lets a single operator observe both
+  a sender's and a recipient's connection at once, the sender's own chosen
+  relay forwards to the recipient's *own* chosen relay, so no single relay
+  operator sees both ends of a conversation. Paired with disposable,
+  unidirectional per-direction message queues (distinct from the
+  bidirectional per-conversation `mailbox_id` in §11.1) so a relay can't
+  correlate a device's inbound and outbound traffic as the same
+  conversation either. This extends the existing Tier 1 relay design
+  (§4.2) and the Signaling & Presence Service (`SERVERS.md` §1) rather than
+  requiring a new transport or a global anonymity network the way Tor
+  does, below.
+  - Concretely: each side's prekey bundle names not just its own identity
+    but a small set of relay addresses it trusts for receiving, discovered
+    the same way a signed prekey is today (§3.2). Sending a message means
+    the sender's client hands the ciphertext to the recipient's declared
+    relay directly if reachable, or via the sender's own relay as a
+    forwarding hop if not — the forwarding relay never has to be the same
+    operator as the receiving one.
+  - Weaker than the research-track Tor option below (an operator who runs
+    or colludes with both the forwarding *and* the receiving relay still
+    sees both ends), but a real improvement over the v1 toggle alone, and
+    shippable without the latency and engineering cost of an onion-routed
+    transport.
 - **Research, not v1**: Tor/onion-routed transport (Briar's approach — no
   central server at all, direct connections over Tor hidden services) would
-  close the gap without needing to trust a TURN operator either. Realistic
-  in Rust via `arti` (the native Rust Tor implementation), but real latency
-  and engineering cost — worth a dedicated spike once the base protocol and
-  Tier 0/1 delivery are solid, not before.
+  close the gap completely, without needing to trust *any* relay operator,
+  colluding pair or not. Realistic in Rust via `arti` (the native Rust Tor
+  implementation), but real latency and engineering cost — worth a
+  dedicated spike once the base protocol and Tier 0/1 delivery (and the v2
+  private-routing option above) are solid, not before.
 
 ### 11.3 Message padding — inspired by Signal's padding scheme — **v1**
 
@@ -1012,7 +1044,7 @@ Adopted fix (folded into `MESSAGE_SCHEMA.md` §2): pad plaintext to a fixed
 bucket size before encryption, same approach Signal uses. Cheap, mechanical,
 no protocol-version implications — there's no reason this waits for v2.
 
-### 11.4 Post-quantum hybrid handshake — inspired by Signal's PQXDH and Apple iMessage's PQ3 — **v2, design-now**
+### 11.4 Post-quantum hardening — handshake and ratchet — inspired by Signal's PQXDH/Triple Ratchet (SPQR) and Apple iMessage's PQ3 — **v2**
 
 Gap: X3DH's session establishment (§3.2) is pure classical ECDH
 (Curve25519). A passive adversary recording today's handshake traffic could
@@ -1033,10 +1065,29 @@ with periodic post-quantum rekeying through the session, not just at setup.
   root-key HKDF to accept an additional input cleanly, so adding the PQ term
   later doesn't force a second protocol-version fork on top of the one v2
   will already need for multi-device/groups.
-- **Further out, not currently scoped**: PQ3's periodic-rekeying-through-
-  the-session idea (vs. PQ only at handshake time) is a real hardening step
-  beyond PQXDH parity — worth revisiting once the v2 hybrid handshake has
-  shipped and proven out.
+- **Sequenced after the handshake work above ships and proves out**: extend
+  PQ protection from the handshake to the *ratchet itself*, following
+  Signal's **Triple Ratchet** design (shipped October 2025) — a sparse
+  post-quantum ratchet (**SPQR**) layered alongside the classical Double
+  Ratchet, periodically exchanging chunked ML-KEM material across several
+  messages rather than requiring a full KEM exchange on every single
+  message (which would blow past the padding budget in §11.3), and mixing
+  its output into the same root-key HKDF the PQXDH-style handshake term
+  above already uses. This is what actually closes the gap PQ3's
+  periodic-rekeying idea pointed at — an earlier draft of this section
+  flagged it as "further out, not currently scoped"; Signal's shipped
+  implementation is now real, citable prior art rather than a hypothetical,
+  so it's promoted here to a properly scoped v2 follow-on instead of an
+  open-ended aspiration.
+- **Engineering cost, stated plainly**: chunking a KEM exchange across
+  message-sized pieces without leaking how many chunks remain outstanding
+  (a new timing/size side-channel candidate, the same family of concern as
+  §11.3's padding work) and extending the fixed-layout envelope (§2 of
+  `MESSAGE_SCHEMA.md`) to carry the extra key material both need real
+  design work, not just "turn it on" — this is why the ratchet extension is
+  sequenced *after* the handshake work ships and the version-byte/HKDF
+  extensibility point (above) actually proves out under real use, rather
+  than shipping alongside it.
 
 ### 11.5 On-device message retention — inspired by Signal/WhatsApp/Telegram disappearing messages — **v1**
 
@@ -1172,7 +1223,7 @@ implemented a second system.
 | Offline / asynchronous delivery | Not possible without both online at once; sender retries from a local outbox | Native — server holds ciphertext until the recipient reconnects (§4.2) |
 | Delivery reliability | Bounded by both users' uptime, NAT type, and network conditions | High — dominated by server uptime, which a maintained deployment can make much better than a home client's |
 | Operational cost/complexity | None to run; complexity instead lives in the client's NAT-traversal engineering | Real, ongoing: infrastructure to provision, monitor, and keep patched |
-| Multi-device fan-out (v2) | Hard — every device would need its own direct session with every peer device | Natural — one incoming message, fanned out server-side to N registered devices |
+| Multi-device fan-out (v2, §14) | Hard — every device would need its own direct session with every peer device | Natural — one incoming message, fanned out server-side to N registered devices |
 | Rich features (read receipts, typing indicators) | Possible, but each needs its own P2P signaling | Straightforward to centralize once |
 | Censorship resistance | High — no fixed server to block; traffic resembles generic WebRTC | Lower — a known server address/domain is a blockable choke point (mitigable, not eliminated, by pluggable-transport-style techniques) |
 | Trust required | Only the other party, plus a largely-metadata-blind STUN/TURN operator | The server operator, specifically not to log/correlate metadata even though they can't read content |
@@ -1391,3 +1442,140 @@ still holds. New, group-specific items:
    Services — the group-chat analog of §12.4's single-operator-vs-
    federation axis, deferred for the identical reason (real added
    complexity, no concrete need yet).
+
+## 14. Multi-device roadmap (v2)
+
+Everything above this section assumes one identity key means one device.
+That's true for v0/v1 — a lost phone means generating a fresh identity and
+re-verifying with every contact from scratch, which is the accepted trade
+of a serverless-first v1. This section is how a single account runs on
+more than one device at once without weakening anything the rest of this
+document establishes: no shared long-term private key ever crosses a
+network, and a lost or stolen device becomes a **revocation** problem, not
+an "the whole account is compromised" problem.
+
+### 14.1 Mechanism: per-device identity keys, Signal's Sesame model
+
+Two ways to give one account multiple devices: **per-user identity keys**
+(every device shares one private key, synced somehow) or **per-device
+identity keys** (every device generates and holds its own, independent of
+the others). Signal's **Sesame algorithm** — the reference design for
+exactly this problem — supports either model, but DRAtchet adopts
+per-device only: syncing a private signing/DH key across devices means it
+exists outside of any single device at some point, transiently in transit
+or persistently in a sync service — precisely the kind of long-term-key
+exposure §3.1's identity-key-separation decision already declined to
+accept for a different key. Per-device keys keep that same discipline:
+**each device generates its own X3DH identity DH key and its own
+OpenPGP-signed prekey**, all cross-signed under the account's one OpenPGP
+identity certificate (§3.1) so a contact can verify "this device really
+belongs to alice#4821" without any private key ever leaving the device it
+was generated on.
+
+A contact's "conversation" with an account is, under the hood, one Double
+Ratchet session **per (sending device, receiving device) pair** — the same
+mechanism §3.2/§3.3 already describe, just multiplied. Sending a message
+means encrypting it once per recipient device the sender currently knows
+about and fanning the ciphertexts out together; this is exactly what
+§12's deployment-model comparison table already flags as "hard" for pure
+P2P and "natural" for a server-based model with device fan-out —
+multi-device is where that trade-off actually bites, not a theoretical
+concern.
+
+### 14.2 What changes in the existing design
+
+- **Addressing (§6.1):** `username#NNNN` still resolves to one *account*,
+  but the directory now holds a **device list** — one prekey bundle per
+  active device, each carrying a `device_id`. `MESSAGE_SCHEMA.md` §1's
+  prekey bundle schema needs a `device_id` field added before this ships —
+  flagged here as a schema evolution, not solved in this pass, the same
+  treatment §13.3 gave the `written_by` field for groups.
+- **Session establishment (§3.2):** X3DH runs once per new device pair
+  discovered, not once per account pair. A device learns about a new
+  device on the other side of a conversation the same way it learns about
+  the first one — via the directory's device list — and simply adds a new
+  ratchet session for it.
+- **The "stash" (Sesame's term):** each device keeps a small cache of
+  not-yet-consumed one-time prekeys and in-flight session state per peer
+  device, so a message queued for a device that goes briefly offline
+  mid-handshake doesn't get lost — conceptually the same discipline as the
+  skipped-message-key cache in §3.3, one layer up.
+- **A user's own other devices are just another recipient:** when Alice
+  sends from her phone, her own laptop needs a copy too, encrypted to the
+  laptop's device key the same way a message to Bob is encrypted to Bob's
+  device key — not a special case. This is what makes "read on one device,
+  see it on all your devices" work without a server ever holding a
+  decryptable copy.
+
+### 14.3 Recovery Profiles, extended to per-device
+
+§7's profile system (Full / Sent-only / None) is currently a per-*account*
+setting. Multi-device forces it to stay per-account in principle while
+being *enforced* consistently across every device that account owns — a
+phone and a laptop disagreeing about whether to back up the same
+conversation is a bug, not a feature:
+
+- The recovery profile itself stays a single account-level setting (not
+  one per device); what changes is that **every device belonging to that
+  account enforces the same effective profile**, requiring the setting to
+  sync across a user's own devices the same way session state does
+  (§14.2's device-list mechanism carries this too, not a separate channel).
+- The `min()` composition across conversation *participants* (§7.2) is
+  unaffected — it still operates on one effective profile per account,
+  same as today. Multi-device is orthogonal to that lattice, not an
+  extension of it the way group chat's N-member `min()` (§13.3) is.
+- This is also where `SERVERS.md` §5's open question about a per-device
+  presence-handshake signing key resolves: once every device already has
+  its own identity DH key and signed prekey (§14.1), reusing that same
+  per-device key for the presence/signaling handshake (`SERVERS.md` §1.2)
+  is the natural answer, not a separate mechanism — a revoked device loses
+  signaling access the same way it loses message-session access, in one
+  step.
+
+### 14.4 Threat model additions for multi-device
+
+Extends §8, same posture as §13.4 — new items named plainly rather than
+assumed away:
+
+- **Device-list metadata exposure to the directory** — the Signaling &
+  Presence Service (`SERVERS.md` §1) now knows how many devices an account
+  has and, via connection patterns, roughly how active each one is.
+  Analogous to §13.4's group-roster trade for the Group Coordination
+  Service: a real, accepted increase in what the directory can observe,
+  not something multi-device can avoid while a new device still needs to
+  be discoverable at all.
+- **Lost/stolen device revocation** — a device is removed from the
+  account's device list via a self-signed revocation, using the same
+  OpenPGP identity key that cross-signed the device in the first place
+  (§14.1), and every peer that learns of the revocation stops encrypting
+  to it. The gap: a peer who hasn't yet fetched the updated device list
+  keeps addressing the revoked device until they do — a bounded, not
+  instant, window, the same kind of eventual-consistency gap the prekey
+  directory already has for any bundle update.
+- **Fan-out amplification** — sending to an account with more devices
+  means more ciphertext copies in flight, which is more opportunity for a
+  relay (Tier 1) to observe traffic volume correlated to one account, even
+  though it still can't read any of it. A quantitative, not qualitative,
+  increase in the metadata surface §11.1's sealed-sender-style mailbox-id
+  work already accepted.
+- **Compromise blast radius, deliberately scoped down, not up** — this is
+  the one place multi-device is *better* than the v0/v1 single-device
+  model: a compromised or lost device can be individually revoked without
+  regenerating the account's OpenPGP identity or re-verifying with every
+  contact, unlike v1's current story of "lost device means starting over."
+
+### 14.5 Phasing
+
+1. **v2.0 — multi-device MVP**: per-device identity keys and prekey
+   bundles (`device_id` added to `MESSAGE_SCHEMA.md` §1), device-list
+   directory lookup, one ratchet session per device pair with fan-out
+   send, recovery profile sync across a user's own devices (§14.3).
+2. **v2.1 — multi-device hardening**: device revocation propagation with a
+   bounded staleness window (§14.4), a device-linking UX (QR-scan a new
+   device against an already-verified one, reusing §6.3's in-person path
+   rather than inventing a new one), per-device presence signing key
+   (resolves `SERVERS.md` §5's open question, §14.3).
+3. **Research track**: reducing fan-out amplification (§14.4) — e.g.
+   sender-side batching, or a group-chat-style tree structure (§13.1's
+   TreeKEM) applied to one account's own devices instead of a full MLS
+   group, if the ciphertext-copy overhead turns out to matter in practice.
