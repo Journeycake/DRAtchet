@@ -888,11 +888,13 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
    routing (§11.2), prekey bundle auto-replenishment, push notifications,
    optional managed/server-escrowed passphrase-protected recovery option
    (§7 option b, §4.3), post-quantum hardening — hybrid handshake now,
-   extended to the ratchet itself once that ships (§11.4).
+   extended to the ratchet itself once that ships (§11.4), duress
+   response — quick wipe and a separately-gated full identity wipe,
+   client-only, no protocol change (§11.9).
 4. **Research track, not scheduled**: Tor/onion-routed transport (§11.2),
-   key transparency for the directory (§11.7), duress response (§11.9),
-   federated (multi-operator) server-based deployments (§12.4), reducing
-   multi-device fan-out amplification (§14.4/§14.5).
+   key transparency for the directory (§11.7), federated (multi-operator)
+   server-based deployments (§12.4), reducing multi-device fan-out
+   amplification (§14.4/§14.5).
 
 ## 10. Open decisions for confirmation
 
@@ -1104,7 +1106,9 @@ third party's.
 - **v1**: per-conversation disappearing-message timer, user-configurable,
   default "keep until manually deleted" but easy to set short (an hour, a
   day, a week — standard presets). On expiry, the client deletes the local
-  plaintext row.
+  plaintext row. §11.9's duress-response wipe is the immediate,
+  user-triggered version of this same on-device-retention concern, rather
+  than a time-based one.
 - **Explicit interaction to surface in the UI, not just this document**: a
   disappearing-message timer and Tier 2 recovery (§7) can be in tension — a
   short local timer does not retroactively purge an already-agreed,
@@ -1129,7 +1133,11 @@ since they hold the same key material and could in principle have produced
 it themselves. This deniability property is a direct inheritance from OTR
 (the protocol that first made it a design goal, well before Signal), and is
 worth naming as an intentional property of DRAtchet's message layer, not
-just a byproduct of the §3.5 wire-format decision.
+just a byproduct of the §3.5 wire-format decision. It protects against
+being *proven* to have said something after the fact; it says nothing
+about a device seized or coerced-unlocked while history is still readable
+on it — §11.9's duress response is the companion feature for that
+different half of the same threat category.
 
 ### 11.7 Key transparency for the directory — inspired by Signal's Key Transparency / CONIKS — **research**
 
@@ -1174,12 +1182,64 @@ Two related gaps beyond the prekey-exhaustion point already folded into
 
 ### 11.9 Duress response — inspired by Briar's panic-button integration — **v2, optional**
 
-Lighter-weight than the rest of this section: a configurable duress
-PIN/trigger that wipes local key material or shows a decoy empty state on
-entry, the way Briar integrates with a separate panic-trigger app. Genuinely
-useful for some threat models, but a UX feature layered on top of the core
-protocol rather than something that changes it — flagged for v2
-consideration, not designed further here.
+Lighter-weight than the rest of this section, and deliberately so: a
+client-only feature layered on top of the protocol, not a change to the
+protocol itself — no wire format, no server component, no interoperability
+concern. It's the companion §11.6's deniability doesn't cover: deniability
+protects against being *proven* to have said something after the fact;
+this protects against a device being physically seized, or its unlock
+coerced, while a conversation's history is still readable on it. Same
+threat category (device seizure/coercion) as §11.6, different mechanism.
+
+- **Trigger**: a configurable duress action — a distinct PIN/passphrase
+  entered at the normal unlock prompt (Briar's model: a second passphrase
+  unlocks a decoy empty state instead of the real data, so the act of
+  wiping isn't itself visible to whoever is coercing the unlock), a
+  gesture, or an app-switcher shortcut. The decoy-passphrase form is
+  preferable to a visible "panic button" where the threat model includes
+  someone coercing the unlock in person — an obviously wiped, empty app is
+  itself evidence something was hidden; a decoy state that looks like a
+  normal, unremarkable account is not.
+- **Scope — the central design decision, explicitly two-tiered rather than
+  one wipe that does everything**:
+  - **Quick wipe (default)**: deletes locally decrypted message history
+    and cached session/ratchet state from the on-device store (§5), but
+    keeps the account's OpenPGP identity intact. The account still
+    functions afterward — no forced identity regeneration, no
+    re-verification with every contact (§6). This is the fast, low-cost,
+    frequently-rehearsable action.
+  - **Full wipe (explicit, separate confirmation)**: additionally destroys
+    the local OpenPGP identity private key material, forcing every future
+    session to start from a fresh identity. Irreversible and disruptive by
+    design — every existing contact will see "identity changed" (§6.2) the
+    next time they try to reach the account — so it's gated behind its own
+    confirmation, not the default outcome of the same trigger that does a
+    quick wipe. Reserved for a threat model where continued use of the
+    compromised identity itself is the risk, not just the history sitting
+    on the device.
+- **What "wipe" has to mean technically, stated plainly rather than
+  assumed**: a mechanism that only issues a database `DELETE` and relies on
+  the filesystem to eventually overwrite the blocks is not a wipe against a
+  forensic adversary — it has to be genuine cryptographic erasure, i.e.
+  destroying the local encryption key protecting the on-device store (§5)
+  so the ciphertext already on disk becomes permanently unreadable even if
+  the raw bytes are later recovered. Both tiers above rely on this; the
+  full wipe additionally crypto-shreds the identity key material the same
+  way.
+- **Recovery Store interaction, named as a gap rather than solved here**: a
+  local wipe does not reach anything already durably written to a Tier 2
+  Recovery Store (§7) under an effective Profile A/B setting — that copy
+  lives on storage the user configured separately and isn't touched by a
+  purely local, potentially offline panic action. Extending the panic
+  trigger to also request a remote purge (reusing the same purge mechanism
+  §7.3 already defines for a profile-tightening event) is a real option,
+  but needs live connectivity to the Recovery Store at the exact moment a
+  duress trigger fires — not guaranteed, and worth flagging as a follow-on
+  rather than assuming the v2 feature covers it by default.
+- **Not designed further here**: exact trigger UX (gesture vs. decoy
+  passphrase vs. both), and whether the full-wipe tier ships in the same
+  v2 pass as the quick wipe or later — left open, consistent with this
+  being a v2-optional feature rather than a v1 blocker.
 
 ## 12. Deployment models: pure peer-to-peer vs. server-based
 
