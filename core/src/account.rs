@@ -27,8 +27,8 @@ pub struct Account {
 }
 
 impl Account {
-    pub fn generate(userid: &str) -> Result<Self> {
-        let identity = Identity::generate(userid)?;
+    pub fn generate() -> Result<Self> {
+        let identity = Identity::generate()?;
         let identity_dh_secret = StaticSecret::random_from_rng(OsRng);
         let identity_dh_public = PublicKey::from(&identity_dh_secret);
         let identity_dh_signature =
@@ -72,7 +72,7 @@ impl Account {
             None
         };
         Ok(PrekeyBundle {
-            identity_cert_bytes: self.identity.export_public_cert()?,
+            identity_public_key: self.identity.export_public_key()?,
             identity_dh_public: self.identity_dh_public,
             identity_dh_signature: self.identity_dh_signature.clone(),
             signed_prekey: self.signed_prekey.public_bundle_entry(),

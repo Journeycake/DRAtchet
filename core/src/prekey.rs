@@ -12,7 +12,7 @@ pub struct SignedPrekey {
     pub id: u32,
     pub secret: StaticSecret,
     pub public: PublicKey,
-    /// Detached OpenPGP signature over `(id, public)`, by the owning identity.
+    /// Raw Ed25519 signature over `(id, public)`, by the owning identity.
     pub signature: Vec<u8>,
 }
 
@@ -77,9 +77,9 @@ pub struct OneTimePrekeyPublic {
 
 /// What a client fetches from the directory to start a new session with someone,
 /// per `docs/MESSAGE_SCHEMA.md` §1. `identity_dh_public` is the long-term X3DH
-/// identity DH key (separate from the OpenPGP signing identity — see `identity.rs`).
+/// identity DH key (separate from the Ed25519 signing identity — see `identity.rs`).
 pub struct PrekeyBundle {
-    pub identity_cert_bytes: Vec<u8>,
+    pub identity_public_key: Vec<u8>,
     pub identity_dh_public: PublicKey,
     pub identity_dh_signature: Vec<u8>,
     pub signed_prekey: SignedPrekeyPublic,
@@ -88,16 +88,16 @@ pub struct PrekeyBundle {
 
 impl PrekeyBundle {
     /// Verify the signed prekey's signature (and, if present, the identity DH key's own
-    /// signature) against the bundled certificate before trusting anything in it.
+    /// signature) against the bundled identity public key before trusting anything in it.
     pub fn verify(&self) -> crate::error::Result<()> {
         Identity::verify_prekey_signature(
-            &self.identity_cert_bytes,
+            &self.identity_public_key,
             crate::account::IDENTITY_DH_SIGNATURE_ID,
             self.identity_dh_public.as_bytes(),
             &self.identity_dh_signature,
         )?;
         Identity::verify_prekey_signature(
-            &self.identity_cert_bytes,
+            &self.identity_public_key,
             self.signed_prekey.id,
             self.signed_prekey.public.as_bytes(),
             &self.signed_prekey.signature,

@@ -2,11 +2,11 @@
 name = "dratchet-core"
 version = "0.1.0"
 edition = "2021"
-description = "DRAtchet v0 crypto core: X3DH handshake + Double Ratchet message layer, OpenPGP identity"
+description = "DRAtchet v0 crypto core: X3DH handshake + Double Ratchet message layer, Ed25519/X25519 identity"
 license = "GPL-3.0-only"
 
 [dependencies]
-sequoia-openpgp = { version = "1", default-features = false, features = ["crypto-openssl"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 # "zeroize": StaticSecret and its Diffie-Hellman output zeroize their bytes on drop
 # instead of leaving key material sitting in freed memory.
 x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
@@ -17,7 +17,6 @@ chacha20poly1305 = "0.10"
 rand_core = { version = "0.6", features = ["getrandom"] }
 thiserror = "1"
 zeroize = "1"
-anyhow = "1"
 
 [dev-dependencies]
 proptest = "1"

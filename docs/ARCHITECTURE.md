@@ -36,9 +36,10 @@ That breaks under real messaging conditions:
 
 **This is a solved problem** — it's what the Signal Protocol's **Double
 Ratchet** algorithm exists for. DRAtchet adopts Double Ratchet as the
-key-rotation model, and uses OpenPGP where it actually earns its cost:
-long-term identity, key discovery/verification, and signing — not as a
-per-message asymmetric operation.
+key-rotation model: long-term identity, key discovery/verification, and
+signing are handled by a raw signing keypair (§3.1) used only where that
+cost is actually worth paying — never as a per-message asymmetric
+operation.
 
 ## 2. Design goals
 
@@ -50,9 +51,9 @@ per-message asymmetric operation.
    replies.
 4. Every symmetric message key is single-use and is deleted immediately after
    one encrypt/decrypt.
-5. OpenPGP is used for identity and key-agreement material (so keys are
-   auditable, exportable, and interoperable with existing OpenPGP tooling),
-   but never as a per-message bottleneck.
+5. Identity and key-agreement material is raw, auditable, exportable key
+   material (Ed25519 signing + X25519 Diffie-Hellman) — not wrapped in a
+   heavier certificate format — but never as a per-message bottleneck.
 6. Native desktop app on Windows, macOS, Linux from one codebase.
 7. Peer identity is authenticated out-of-band (in-person QR, or a remote
    single-use pairing code) rather than trusted on lookup alone.
@@ -61,38 +62,50 @@ per-message asymmetric operation.
 
 ## 3. Cryptographic protocol
 
-### 3.1 Identity keys (OpenPGP)
+### 3.1 Identity keys
 
-Each user has one long-term OpenPGP identity keypair (Ed25519 signing +
-Curve25519 ECDH, OpenPGP v6 per RFC 9580, following the modern GnuPG default
-profile). This is the key a user backs up, the key behind their fingerprint,
-and the key used to sign everything below. It is **never** used to encrypt
-message content directly.
+Each user has one long-term Ed25519 signing keypair. This is the key a
+user backs up, the key behind their fingerprint, and the key used to sign
+everything below. It is **never** used to encrypt message content
+directly, and it is raw key material — not wrapped in an OpenPGP or X.509
+certificate.
 
-**Implementation note (v0, `core/src/identity.rs`):** the certificate's own
-Cv25519 ECDH subkey and the X3DH identity DH key (`IK`, §3.2) turned out to
-be worth keeping as separate key material rather than one and the same key.
-OpenPGP's ECDH packet format wraps a *symmetric session key* directly (per
-RFC 9580's ECDH-KEM construction); it isn't built to hand out a raw X25519
-scalar for an arbitrary external Diffie-Hellman the way X3DH needs. Reaching
-into `sequoia-openpgp`'s internal MPI representation to extract one anyway
-was the kind of shortcut worth avoiding without interop test vectors to
-check it against — so v0 generates a dedicated X25519 keypair for `IK`,
-authenticated by a standalone OpenPGP signature from the certificate
-instead of being derived from the certificate's own subkey. The
-certificate's stated ECDH capability is still real; X3DH just doesn't
-consume it directly. Worth revisiting if a concrete reason to unify them
-shows up later.
+**Why not OpenPGP (v0 tried it, then dropped it, `core/src/identity.rs`):**
+an earlier v0 iteration carried this as a full OpenPGP (RFC 9580)
+certificate via `sequoia-openpgp`. Two frictions led to dropping it rather
+than working around them. First, OpenPGP's ECDH packet format wraps a
+*symmetric session key* directly (per RFC 9580's ECDH-KEM construction);
+it isn't built to hand out a raw X25519 scalar for an arbitrary external
+Diffie-Hellman the way X3DH needs (§3.2) — reaching into `sequoia-openpgp`'s
+internal MPI representation to extract one anyway would have been exactly
+the kind of shortcut worth avoiding without interop test vectors to check
+it against. A future post-quantum (ML-KEM) key would hit the same
+packet-shaped-hole problem. Second, the certificate/policy/subkey-search
+machinery was real ongoing complexity for a property (OpenPGP-tool
+interoperability) nothing in this design actually uses — no stock OpenPGP
+client can decrypt a ratchet-derived session anyway (§3.5 already made
+this same call for message bodies). Raw key material sidesteps both: it's
+just bytes in this project's own extensible CBOR schema (`MESSAGE_SCHEMA.md`
+§1), so a new key type — including a future ML-KEM term — is a new
+optional field, not a packet-format workaround, and `identity.rs` shrank
+substantially once the certificate machinery was gone.
 
-### 3.2 Session establishment — X3DH over OpenPGP subkeys
+The X3DH identity DH key (`IK`, §3.2) is a **separate** X25519 keypair,
+not derived from the Ed25519 signing key — Ed25519 and X25519 are
+different key types for different purposes (signing vs. Diffie-Hellman),
+so keeping them apart is the right call independent of whichever
+certificate format (or lack of one) wraps them.
 
-Modeled on Signal's X3DH, but the key material is carried as OpenPGP packets:
+### 3.2 Session establishment — X3DH
+
+Modeled on Signal's X3DH, with key material carried as raw, fixed-size
+key bytes rather than any packet format:
 
 - Each user publishes a **prekey bundle** to the relay server:
   - Identity key (long-term).
-  - One **signed prekey** (ECDH Curve25519 subkey), signed by the identity
-    key, rotated periodically (e.g. weekly).
-  - A batch of **one-time prekeys** (ECDH Curve25519 subkeys), uploaded in
+  - One **signed prekey** (X25519 keypair), signed by the identity key,
+    rotated periodically (e.g. weekly).
+  - A batch of **one-time prekeys** (X25519 keypairs), uploaded in
     bulk; the server hands out one per new session and then deletes it.
 - To start a session, the initiator fetches the recipient's bundle, verifies
   the signed prekey's signature, and performs the X3DH DH computations
@@ -112,7 +125,7 @@ Once the root key exists, per-message crypto is entirely symmetric:
   after use — this is where "single-use key, discarded after one message" is
   fully and cheaply true.
 - **DH ratchet:** each message header carries the sender's *current* ratchet
-  public key (an OpenPGP-compatible Curve25519 ECDH key) — this is the
+  public key (a raw X25519 key) — this is the
   "follow-on message includes the latest public key for the next
   transmission" behavior from the original brief. A *new* DH keypair is
   generated, and the ratchet steps forward (new root + chain keys), the first
@@ -154,48 +167,48 @@ keys are wrapped in `zeroize::Zeroizing`, and DH secrets (`StaticSecret`,
 both overwrite their storage on drop rather than leaving key material
 sitting in freed memory for a debugger or core dump to find.
 
-### 3.5 Message wire format: full OpenPGP vs. lightweight custom envelope
+### 3.5 Message wire format: why a minimal custom format, not a general-purpose one
 
-Two different things can be "OpenPGP" here, and it's worth separating them:
-**key material** (identity keys, prekeys — already specified as OpenPGP
-packets in §3.1/3.2) vs. **message bodies** (the ciphertext for an individual
-chat message). This section is only about the latter.
+Both **key material** (identity keys, prekeys, §3.1/3.2) and **message
+bodies** (the ciphertext for an individual chat message) end up as raw,
+fixed-size fields in this project's own minimal schemas — CBOR for
+key/handshake material (`MESSAGE_SCHEMA.md` §1/§3), a fixed binary layout
+for the hot-path ratchet envelope (`MESSAGE_SCHEMA.md` §2). Neither is
+wrapped in a general-purpose packet format like OpenPGP's. This was a real
+decision, not a default — an early v0 iteration *did* carry identity keys
+and prekeys as OpenPGP (RFC 9580) packets (§3.1 explains why that was
+dropped) and considered going further to make message bodies themselves
+valid OpenPGP messages too (a Public-Key or Symmetric-Key Encrypted
+Session Key packet followed by a Symmetrically Encrypted Integrity
+Protected Data packet — the same structure a `.pgp` file GnuPG produces).
+The comparison below is why that path was rejected for message bodies,
+and — with hindsight — why the same reasoning ended up applying to keys
+too:
 
-**Full OpenPGP wire format** means every message is itself a valid OpenPGP
-message: a Public-Key Encrypted Session Key (PKESK) packet (or, to actually
-carry a ratchet-derived key, a repurposed Symmetric-Key Encrypted Session Key
-/ SKESK packet) followed by a Symmetrically Encrypted Integrity Protected
-Data (SEIPD) packet per RFC 9580 — the same packet structure as a `.pgp`
-file GnuPG produces.
-
-**Lightweight custom envelope** means a minimal, application-defined
-structure: a fixed ratchet header (sender's current DH public key, message
-number `N`, previous chain length `PN`) followed by an AEAD ciphertext +
-tag. Nothing about it is OpenPGP-packet-shaped; only the *keys* (§3.1/3.2)
-are OpenPGP objects.
-
-| | Full OpenPGP wire format | Lightweight custom envelope |
+| | Full OpenPGP-style packet format | Minimal custom format (adopted) |
 |---|---|---|
 | **Per-message overhead** | Multiple packet headers + MPI-encoded fields — noticeably larger than the payload for short chat messages | Fixed ~40–50 byte header (32-byte pubkey + two counters) + ciphertext + 16-byte tag — minimal |
 | **Where ratchet metadata lives** | No natural home — the DH pubkey/counters would have to be smuggled into Notation Data subpackets or a custom packet type, which itself breaks strict standard-compliance | First-class fields in a header designed exactly for what Double Ratchet needs |
 | **Real interoperability** | Looks standard, but a generic OpenPGP/GnuPG client still can't decrypt it — the "session key" is ratchet-derived, not produced by a normal public-key encryption step, so the compatibility is mostly cosmetic | None claimed — doesn't pretend to be readable by outside tools |
-| **Parsing surface / attack surface** | Larger — full packet parser, MPI decoding, subpacket handling per message | Small, fully controlled, easy to fuzz/test exhaustively |
+| **Parsing surface / attack surface** | Larger — full packet parser, MPI decoding, subpacket handling per message | Small, fully controlled, easy to fuzz/test exhaustively — see `core/fuzz/` |
 | **Engineering cost** | Reuses a standardized format for *framing*, but key derivation is custom either way — you inherit format complexity without shedding protocol-design responsibility | Faster to implement correctly; entire format fits in a page |
-| **Future flexibility** | If a hard requirement later appears to bridge to PGP/MIME email or produce gpg-decryptable archives, this gets partway there | Would need a translation layer built later if that requirement ever appears |
+| **Future flexibility** | If a hard requirement later appears to bridge to PGP/MIME email or produce gpg-decryptable archives, this gets partway there | A new field (e.g. a future ML-KEM key/ciphertext, §11.4) is additive — no packet-format workaround needed |
 | **Tooling** | Can reuse existing OpenPGP packet inspectors for debugging | Debug/inspection tooling must be custom-built (small effort given the format's size) |
 
-**Recommendation (decided, revisit only if a concrete interop requirement
-appears):** OpenPGP packet format for identity keys and prekey bundles
-(§3.1/3.2), lightweight custom envelope for message bodies. The claimed
-interoperability benefit of full OpenPGP message framing is largely
-illusory — a stock OpenPGP client still can't decrypt a ratchet-derived
-session key — so it doesn't justify the extra size, parsing surface, and
-awkward header-metadata fit. Message bodies never leave the app anyway
-(they're deleted from the ratchet the instant they're used, per §3.4), so
-there's no real-world scenario where a generic PGP tool needs to read one.
+**Decision (settled for both keys and messages; revisit only if a concrete
+interop requirement appears):** a minimal custom format throughout. The
+claimed interoperability benefit of OpenPGP-shaped message framing is
+largely illusory — a stock OpenPGP client still can't decrypt a
+ratchet-derived session key — so it doesn't justify the extra size,
+parsing surface, and awkward header-metadata fit. Message bodies never
+leave the app anyway (they're deleted from the ratchet the instant they're
+used, per §3.4), so there's no real-world scenario where a generic PGP
+tool needs to read one — and, per §3.1, the same "no real interoperability
+benefit, real engineering and future-extensibility cost" calculus turned
+out to apply just as much to key material once it was examined directly.
 
-There's a second reason to prefer AEAD over an OpenPGP-signed message that
-has nothing to do with size: **deniability**. See §11.6.
+There's a second reason to prefer AEAD over a signed message that has
+nothing to do with size: **deniability**. See §11.6.
 
 ## 4. System architecture: a serverless-first, tiered model
 
@@ -454,14 +467,15 @@ differences are handled as integration details within the single core, not
 as different stacks.
 
 - Rust core handles all cryptography and ratchet state — no crypto in the UI
-  layer. Candidate crates: `sequoia-openpgp` (OpenPGP identity/prekeys),
-  `x25519-dalek` (ECDH), `hkdf` + `hmac` + `sha2` (ratchet KDFs),
-  `chacha20poly1305` (AEAD). All are audited, widely used RustCrypto/Sequoia
-  ecosystem crates rather than hand-rolled primitives.
+  layer. Candidate crates: `ed25519-dalek` (identity signing), `x25519-dalek`
+  (ECDH), `hkdf` + `hmac` + `sha2` (ratchet KDFs), `chacha20poly1305` (AEAD).
+  All are audited, widely used RustCrypto ecosystem crates rather than
+  hand-rolled primitives — and all pure Rust, so the crypto core has no
+  native system dependency to build or ship.
   - Rust over Electron/Node for this project specifically because the crypto
-    core benefits from memory safety and a mature native OpenPGP
-    implementation (Sequoia); Tauri's footprint and update size are also
-    substantially smaller than Electron's.
+    core benefits from memory safety and this mature, audited crate
+    ecosystem; Tauri's footprint and update size are also substantially
+    smaller than Electron's.
 - Local storage: SQLite (SQLCipher-encrypted) for session/ratchet state, with
   the local database encryption key sealed via the OS credential store —
   Windows DPAPI, macOS Keychain, Linux Secret Service (libsecret) — not a
@@ -860,8 +874,9 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
    `DeliveryAck` payload from §7), unit + property tests (including
    out-of-order/skipped-key tests simulating queue depth), no UI, no
    transport yet. Two implementation notes worth reading alongside the rest
-   of this roadmap: §3.1 (the X3DH identity DH key is generated separately
-   from, not extracted from, the OpenPGP certificate's own ECDH subkey) and
+   of this roadmap: §3.1 (identity is a raw Ed25519 signing keypair, not an
+   OpenPGP certificate — dropped after an earlier v0 iteration tried it;
+   the X3DH identity DH key is a separate X25519 keypair) and
    `MESSAGE_SCHEMA.md` §2 (padding needs an explicit length prefix to stay
    unambiguous).
 2. **v1 — desktop MVP**: Tauri app, 1:1 chat only, Tier 1 delivery
@@ -1122,8 +1137,9 @@ third party's.
 ### 11.6 Deniability — the OTR (Off-the-Record Messaging) lineage — **documentation-only**
 
 No protocol change here — this restates something already true given the
-§3.5 decision, worth saying explicitly given the project's OpenPGP
-heritage. Classic OpenPGP messages are typically **signed**: verifiable
+§3.5 decision, worth saying explicitly given the project's conceptual
+origin in PGP-style key rotation (§1) — a lineage worth being precise
+about, since classic OpenPGP messages are typically **signed**: verifiable
 proof of authorship a recipient can show a third party. That's the opposite
 of what a private messenger usually wants. DRAtchet, like Signal and OTR
 before it, authenticates message content with a **symmetric** MAC/AEAD tag
@@ -1204,12 +1220,12 @@ threat category (device seizure/coercion) as §11.6, different mechanism.
   one wipe that does everything**:
   - **Quick wipe (default)**: deletes locally decrypted message history
     and cached session/ratchet state from the on-device store (§5), but
-    keeps the account's OpenPGP identity intact. The account still
+    keeps the account's identity signing key intact. The account still
     functions afterward — no forced identity regeneration, no
     re-verification with every contact (§6). This is the fast, low-cost,
     frequently-rehearsable action.
   - **Full wipe (explicit, separate confirmation)**: additionally destroys
-    the local OpenPGP identity private key material, forcing every future
+    the local identity signing key material, forcing every future
     session to start from a fresh identity. Irreversible and disruptive by
     design — every existing contact will see "identity changed" (§6.2) the
     next time they try to reach the account — so it's gated behind its own
@@ -1353,19 +1369,23 @@ Adopting MLS rather than designing a custom group ratchet is itself the
 decision worth stating plainly: unlike the pairwise Double Ratchet — where
 the published spec is closer to reference pseudocode and DRAtchet already
 made real, custom framing decisions on top of it (§3.5) — MLS is a
-complete, standardized wire protocol with its own TLS-style encoding.
-There's no "wrapping tax" to avoid the way there was with OpenPGP framing
-for 1:1 messages (§3.5): **group wire messages should adopt RFC 9420's own
-encoding directly**, not get a DRAtchet-specific envelope. Reinventing
-group cryptography from scratch, for a property this security-critical, is
+complete, standardized wire protocol with its own TLS-style encoding, so
+**group wire messages should adopt RFC 9420's own encoding directly**, not
+get a DRAtchet-specific envelope — consistent with §3.5's broader "don't
+reinvent a packet format" conclusion for the 1:1 case. Reinventing group
+cryptography from scratch, for a property this security-critical, is
 exactly the kind of shortcut the rest of this project has deliberately
 avoided (§3.1's identity-key-separation note is the same instinct at
 smaller scale).
 
-MLS credentials reuse the existing OpenPGP identity key's signing
-capability (§3.1) rather than introducing a second identity system — a
-member's MLS `Credential` is backed by the same identity certificate
-everything else in this document already trusts.
+MLS credentials reuse the existing Ed25519 identity signing key
+(§3.1) rather than introducing a second identity system — a member's MLS
+`Credential` is backed by the same raw signing key everything else in this
+document already trusts. This is a *better* fit than it would have been
+under the earlier OpenPGP-based design, not just a renamed one: RFC 9420's
+own `BasicCredential` type is exactly a raw public key plus a signature
+scheme, so a raw Ed25519 key maps onto it directly — an OpenPGP certificate
+would have needed an adapter layer MLS has no native concept of.
 
 ### 13.2 Why a server becomes mandatory
 
@@ -1527,8 +1547,8 @@ or persistently in a sync service — precisely the kind of long-term-key
 exposure §3.1's identity-key-separation decision already declined to
 accept for a different key. Per-device keys keep that same discipline:
 **each device generates its own X3DH identity DH key and its own
-OpenPGP-signed prekey**, all cross-signed under the account's one OpenPGP
-identity certificate (§3.1) so a contact can verify "this device really
+Ed25519-signed prekey**, all cross-signed under the account's one Ed25519
+identity signing key (§3.1) so a contact can verify "this device really
 belongs to alice#4821" without any private key ever leaving the device it
 was generated on.
 
@@ -1606,8 +1626,8 @@ assumed away:
   be discoverable at all.
 - **Lost/stolen device revocation** — a device is removed from the
   account's device list via a self-signed revocation, using the same
-  OpenPGP identity key that cross-signed the device in the first place
-  (§14.1), and every peer that learns of the revocation stops encrypting
+  Ed25519 identity signing key that cross-signed the device in the first
+  place (§14.1), and every peer that learns of the revocation stops encrypting
   to it. The gap: a peer who hasn't yet fetched the updated device list
   keeps addressing the revoked device until they do — a bounded, not
   instant, window, the same kind of eventual-consistency gap the prekey
@@ -1621,8 +1641,9 @@ assumed away:
 - **Compromise blast radius, deliberately scoped down, not up** — this is
   the one place multi-device is *better* than the v0/v1 single-device
   model: a compromised or lost device can be individually revoked without
-  regenerating the account's OpenPGP identity or re-verifying with every
-  contact, unlike v1's current story of "lost device means starting over."
+  regenerating the account's identity signing key or re-verifying with
+  every contact, unlike v1's current story of "lost device means starting
+  over."
 
 ### 14.5 Phasing
 

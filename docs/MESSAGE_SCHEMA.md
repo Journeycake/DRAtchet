@@ -1,7 +1,7 @@
 # DRAtchet — Message Schemas
 
 Status: **design draft, no code yet**. Companion to [`ARCHITECTURE.md`](ARCHITECTURE.md)
-— read that first for the protocol rationale (Double Ratchet, X3DH-over-OpenPGP,
+— read that first for the protocol rationale (Double Ratchet, X3DH,
 §6 peer auth, §7 recovery) — and to [`SERVERS.md`](SERVERS.md) for the two
 server components (Signaling & Presence Service, Recovery Store) that some
 of the schemas below (§5, §6) are exchanged with. This document is the
@@ -15,8 +15,9 @@ Two different encodings, chosen per message type by how hot the path is:
   message — uses a **fixed binary layout**, not a general serialization
   format. It's on the hot path, sent at chat volume, and benefits from
   minimum overhead and zero-copy parsing. This is also where §3.5 of
-  `ARCHITECTURE.md` (lightweight envelope vs. full OpenPGP framing) pays off
-  concretely — see the overhead comparison at the end of §2.
+  `ARCHITECTURE.md` (why a minimal custom format was chosen over a
+  general-purpose one) pays off concretely — see the overhead comparison
+  at the end of §2.
 - **Everything else** (prekey bundles, the X3DH init message, pairing
   messages, recovery blobs) — sent rarely (session setup, verification,
   backup) — uses **CBOR** (RFC 8949): compact, binary, schema-evolvable via
@@ -26,8 +27,9 @@ Two different encodings, chosen per message type by how hot the path is:
   stricter type model.
 
 All multi-byte integers are big-endian (network byte order). All key
-material is raw fixed-size public-key bytes (X25519 = 32 bytes) unless
-explicitly noted as an OpenPGP packet.
+material is raw fixed-size bytes: Ed25519 public keys and X25519 public
+keys are both 32 bytes, Ed25519 signatures are 64 bytes — nothing is an
+OpenPGP or other certificate/packet object (`ARCHITECTURE.md` §3.1/§3.5).
 
 ## 1. Prekey bundle (CBOR)
 
@@ -39,12 +41,14 @@ this schema is the same regardless of hosting model).
 |---|---|---|
 | `username` | text string | self-chosen, §6.1 |
 | `discriminator` | uint16 | the `NNNN` in `username#NNNN` |
-| `identity_key` | bytes | OpenPGP public key packet (Ed25519 + Curve25519) |
+| `identity_key` | bytes (32) | raw Ed25519 public key, the account's long-term signing identity (`ARCHITECTURE.md` §3.1) |
+| `identity_dh_public` | bytes (32) | raw X25519 public key, the long-term X3DH identity DH key `IK` — a separate keypair from `identity_key`, not derived from it (`ARCHITECTURE.md` §3.1) |
+| `identity_dh_signature` | bytes (64) | raw Ed25519 signature over `identity_dh_public`, by `identity_key` — binds the DH key to this identity the same way a signed prekey is bound (§3.2) |
 | `signed_prekey_id` | uint32 | monotonic per-account counter |
-| `signed_prekey` | bytes | OpenPGP ECDH subkey packet (Curve25519) |
-| `signed_prekey_sig` | bytes | OpenPGP signature packet, by `identity_key` |
+| `signed_prekey` | bytes (32) | raw X25519 public key |
+| `signed_prekey_sig` | bytes (64) | raw Ed25519 signature, by `identity_key` |
 | `signed_prekey_expires_at` | uint64 | unix seconds; rotated on schedule (§3.2) |
-| `one_time_prekeys` | array of `{id: uint32, key: bytes}` | each consumed once, then removed from the published bundle (§3.4) |
+| `one_time_prekeys` | array of `{id: uint32, key: bytes (32)}` | each consumed once, then removed from the published bundle (§3.4) |
 
 ## 2. Ratchet message envelope (fixed binary layout)
 

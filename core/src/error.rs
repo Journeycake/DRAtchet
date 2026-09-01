@@ -20,9 +20,6 @@ pub enum Error {
     #[error("ratchet has not been initialized for {0}")]
     RatchetNotInitialized(&'static str),
 
-    #[error("OpenPGP identity operation failed: {0}")]
-    OpenPgp(#[from] anyhow::Error),
-
     #[error("prekey signature verification failed")]
     InvalidPrekeySignature,
 

@@ -1,6 +1,6 @@
-//! End-to-end: two real `Account`s (OpenPGP identity + prekeys), a real X3DH
-//! handshake, then the Double Ratchet taking over — per `docs/ARCHITECTURE.md`
-//! §3.2/§3.3.
+//! End-to-end: two real `Account`s (Ed25519/X25519 identity + prekeys), a real
+//! X3DH handshake, then the Double Ratchet taking over — per
+//! `docs/ARCHITECTURE.md` §3.2/§3.3.
 
 use dratchet_core::account::Account;
 use dratchet_core::payload::{untag_and_unpad, PAYLOAD_CHAT};
@@ -19,8 +19,8 @@ fn read_chat(bytes: &[u8]) -> String {
 
 #[test]
 fn full_handshake_with_one_time_prekey_then_ratchet_conversation() {
-    let alice_account = Account::generate("alice@example.test").unwrap();
-    let mut bob_account = Account::generate("bob@example.test").unwrap();
+    let alice_account = Account::generate().unwrap();
+    let mut bob_account = Account::generate().unwrap();
     bob_account.generate_one_time_prekeys(1);
 
     let conv_id = conversation_id(
@@ -99,8 +99,8 @@ fn full_handshake_with_one_time_prekey_then_ratchet_conversation() {
 
 #[test]
 fn handshake_degrades_gracefully_without_a_one_time_prekey() {
-    let alice_account = Account::generate("alice@example.test").unwrap();
-    let bob_account = Account::generate("bob@example.test").unwrap();
+    let alice_account = Account::generate().unwrap();
+    let bob_account = Account::generate().unwrap();
     // No one_time_prekeys generated — the bundle will have none available.
 
     let bob_bundle = bob_account.publish_bundle(true).unwrap();
@@ -125,8 +125,8 @@ fn handshake_degrades_gracefully_without_a_one_time_prekey() {
 
 #[test]
 fn tampered_bundle_signature_is_rejected_before_any_key_agreement() {
-    let alice_account = Account::generate("alice@example.test").unwrap();
-    let bob_account = Account::generate("bob@example.test").unwrap();
+    let alice_account = Account::generate().unwrap();
+    let bob_account = Account::generate().unwrap();
     let mut bob_bundle = bob_account.publish_bundle(false).unwrap();
 
     // Flip a byte of the signed prekey's public value without updating its signature —
