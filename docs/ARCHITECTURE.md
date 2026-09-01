@@ -55,8 +55,10 @@ operation.
    material (Ed25519 signing + X25519 Diffie-Hellman) — not wrapped in a
    heavier certificate format — but never as a per-message bottleneck.
 6. Native desktop app on Windows, macOS, Linux from one codebase.
-7. Peer identity is authenticated out-of-band (in-person QR, or a remote
-   single-use pairing code) rather than trusted on lookup alone.
+7. Peer identity must be authenticated out-of-band (in-person QR, or a
+   remote single-use pairing code) before any conversation — 1:1 or group —
+   can exchange application messages; trust-on-first-use is never a usable
+   state, not just a discouraged one (§6.2).
 8. Message history is unrecoverable by default; recovery is only ever an
    explicit, mutual, per-conversation opt-in.
 
@@ -516,18 +518,33 @@ flagged in §9 as revisitable if that ever becomes a real constraint.)
 
 ### 6.2 Trust levels
 
+**Verification is mandatory, not opt-in.** DRAtchet does not use
+trust-on-first-use: a conversation — 1:1 or group — cannot exchange any
+application messages (chat content) until the parties involved have
+completed verified key exchange. This is a deliberate reversal of most
+consumer messengers' default ("chat immediately, flag risk later") in
+favor of the opposite trade — no unverified messaging exists as a usable
+state at all. See §6.5 for exactly what this blocks and what it doesn't.
+
 Every contact is either:
 
-- **Unverified** (default, TOFU — trust-on-first-use): the client has a
-  prekey bundle for `username#NNNN` fetched from the directory server, but
-  its fingerprint hasn't been independently confirmed. The UI should flag
-  this clearly (a persistent banner in the conversation, similar to Signal's
-  unverified-safety-number indicator) without blocking sending — flagging
-  risk beats blocking usability.
+- **Pending** (transient, not usable for messaging): the client has a
+  prekey bundle for `username#NNNN` fetched from the directory server, and
+  may have an X3DH/ratchet session already established against it, but its
+  fingerprint hasn't been confirmed through either path below yet. A
+  conversation sits here — visible in the UI as "verification required,"
+  never as an active chat thread — until it resolves to Verified. There is
+  no timeout that silently promotes a Pending contact to usable; the only
+  way out is completing Path 1 or Path 2, or the user abandoning the
+  attempt.
 - **Verified**: the identity key's fingerprint has been confirmed through
-  one of the two paths below, and is pinned locally. If the peer's identity
-  key later changes, the contact reverts to "unverified — identity changed"
-  and must be re-verified, the same way Signal treats a safety-number change.
+  one of the two paths below, and is pinned locally. Only a Verified
+  contact's conversation can send/receive application messages. If the
+  peer's identity key later changes, the contact reverts to "unverified —
+  identity changed" — back to a non-usable state, not a soft warning banner
+  — and must be re-verified before messaging resumes, the same event
+  Signal flags as a safety-number change, just with a harder consequence
+  here.
 
 ### 6.3 Path 1 — in-person QR exchange (strongest)
 
@@ -572,6 +589,48 @@ security rests entirely on the secrecy/integrity of whatever side channel
 carried the code — the same property Signal's "compare safety number over a
 phone call" verification has. It is not stronger than the channel used to
 convey the code.
+
+### 6.5 What the mandatory gate blocks, and what it doesn't
+
+Making verification mandatory (§6.2) changes when a conversation can send
+or receive **application messages** — it doesn't change the cryptographic
+handshake that has to happen first in order for there to be anything to
+verify:
+
+- **Still allowed pre-verification**: fetching a `username#NNNN` prekey
+  bundle, running X3DH against it (§3.2), and establishing the resulting
+  Double Ratchet session (§3.3). A Pending contact needs a real session —
+  and the fingerprint that session's identity key produces — before there's
+  anything to scan a QR code against or confirm with a pairing code. None
+  of this exposes anything sensitive to a not-yet-verified peer: prekey
+  bundles are already meant to be public (§4.1).
+- **Blocked pre-verification**: the client refuses to hand any decrypted
+  `payload_type = 0` (chat) content to the user, and refuses to encrypt and
+  send one, while the contact is Pending. The ratchet session itself keeps
+  running underneath — skipped-key derivation, DH ratchet steps — since
+  refusing to *process* incoming envelopes at all would make verification
+  itself impossible to complete over path 2 (§6.4), which is bound to "the
+  current handshake's key material." What's gated is *release* of
+  application content to and from the user, not the protocol machinery
+  underneath it.
+- **A mismatch is a hard stop, not a retry prompt**: exactly as §6.3
+  already states for Path 1 — if the scanned or confirmed fingerprint
+  doesn't match the session's actual identity key, the contact is never
+  silently marked Verified. The user sees a clear failure and has to
+  investigate (wrong code, compromised directory, active attack) before
+  trying again, the same posture §6.2's "identity changed" case takes.
+- **Both paths (§6.3, §6.4) satisfy the gate** — the mandatory requirement
+  is "verified," not "verified specifically in person." Requiring
+  literal physical presence for every conversation would strand anyone who
+  can't meet the other party face to face; Path 2's remote pairing code
+  already has its own honestly-stated limits (it's only as strong as the
+  side channel carrying the code) and remains an acceptable way to satisfy
+  the gate. This is a stated design decision, not an oversight — worth
+  revisiting only if a stricter posture (in-person only, no remote path) is
+  ever specifically wanted.
+- **Group admission uses the same underlying mechanism, generalized**: see
+  §13.6 for how a group extends this pairwise gate to more than two people
+  without requiring everyone to meet everyone.
 
 ## 7. Per-conversation message recovery
 
@@ -1522,6 +1581,74 @@ still holds. New, group-specific items:
    Services — the group-chat analog of §12.4's single-operator-vs-
    federation axis, deferred for the identical reason (real added
    complexity, no concrete need yet).
+
+### 13.6 Group admission: web-of-trust vouching + configurable weighted voting
+
+§6.2's mandatory-verification rule applies to groups too, but "every
+prospective member in-person-verifies with every current member" doesn't
+scale past a handful of people. This generalizes the same underlying
+mechanism — §6.3/§6.4's verified key exchange — into something that works
+at group size, rather than requiring it pairwise against the whole
+membership.
+
+**Vouching.** A prospective member completes an in-person QR exchange
+(§6.3) or a remote pairing-code exchange (§6.4) with **one** current
+member, exactly as they would for a 1:1 conversation. That member then
+issues a signed **vouch attestation** — the prospect's fingerprint, the
+voucher's own signature over it, and a timestamp — as an MLS Application
+message visible to the whole group, auditable the same way `Commit`/
+`Proposal` traffic already is (§13.2). A prospective member isn't limited
+to one voucher: they may gather attestations from several current members
+by repeating the same exchange with each.
+
+**Configurable weighted voting.** Each current member carries a **vouch
+weight** (default: 1 for every member). A prospective member accumulates
+vouches from one or more current members; once the summed weight of their
+vouches meets or exceeds the group's configured **admission threshold**,
+any current member may propose the `Commit` that actually admits them —
+the vouch attestations are the evidence that Commit is justified, checked
+independently by every member's own client before they apply it.
+
+- **Weight assignment**: creator/admin-assigned only, not self-service. A
+  member setting their own vouch weight would let anyone inflate their own
+  vouching power and defeat the point of requiring verification at all —
+  the same Sybil-resistance instinct behind §11.8's registration
+  proof-of-work, applied to group admission instead of account creation.
+- **Default admission threshold**: majority of the group's total assigned
+  weight, configurable per group by whoever can set weights. A group that
+  wants single-vouch-sufficient admission (pure web-of-trust, no
+  weighting) sets every member's weight equal and the threshold to one
+  member's worth; a group that wants stricter admission raises the
+  threshold or concentrates weight in fewer, more-trusted members.
+- **Consistent with §13.2's "coordination service never decides
+  membership" principle**: the weight tally is computed independently by
+  each current member's own client from the vouch attestations they've
+  observed in the group's Application message history — never trusted to
+  the Group Coordination Service, which continues to only order and relay,
+  exactly as it does for every other kind of group traffic.
+- **Vouch revocation — a named gap, not a solved one**: if a voucher is
+  later found to be compromised, or leaves the group, their past vouches
+  aren't automatically invalidated by this mechanism as described. A
+  member admitted on the strength of a since-compromised voucher's
+  attestation stays admitted. Flagged here rather than assumed away,
+  matching how §13.4 and §14.4 each named their own new gaps; a fuller
+  answer (e.g. re-tallying admission thresholds when a voucher is later
+  removed) is future hardening, not required for an initial version.
+- **New metadata surface**: the vouch attestation itself — who vouched for
+  whom, and when — is visible to anyone who can observe the group's
+  Application message traffic, which under §13.2 includes the Group
+  Coordination Service. This is additional to, not the same as, the
+  roster visibility §13.4 already accepts; it reveals *relationships*
+  (who vouched for whom) on top of *membership* (who's in the group).
+
+**Rollout**: lands alongside the v2.0 groups MVP (§13.5) — admission
+without *some* gate would leave groups without the mandatory verification
+§6.2 requires everywhere else, so this isn't deferrable hardening the way
+the epoch authenticator or Delivery Service abuse resistance are. Weight
+management UI (who can set/change weights, how a threshold is displayed)
+can start minimal — equal weights, majority threshold, no admin UI beyond
+the creator's own client — and grow richer in v2.1 without changing the
+underlying vouch/tally mechanism.
 
 ## 14. Multi-device roadmap (v2)
 

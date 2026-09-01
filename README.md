@@ -29,7 +29,11 @@ chat (v2) adds. Highlights:
 - The Double Ratchet message layer and key lifecycle (what's single-use,
   what's rotated, what's discarded, and when).
 - Peer identity verification via in-person QR exchange or a remote
-  single-use pairing code (`username#NNNN` addressing).
+  single-use pairing code (`username#NNNN` addressing) — **mandatory**,
+  not opt-in: no conversation, 1:1 or group, exchanges application
+  messages until it's done. Groups generalize this via web-of-trust
+  vouching with configurable weighted voting, instead of requiring every
+  member to verify with every other member.
 - A serverless-first, tiered delivery model: direct peer-to-peer by default,
   an optional ephemeral (auto-expiring) relay to bridge offline recipients,
   and no durable storage of any kind unless both participants opt in.

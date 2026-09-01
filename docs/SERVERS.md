@@ -92,9 +92,10 @@ including account-registration abuse (username squatting).
     there is no arbitrary "look up this username's presence" query. This
     prevents presence from becoming a contact-enumeration or stalking
     oracle.
-  - User-configurable: extend visibility to Unverified contacts too, or
-    disable presence broadcasting entirely (an "appear offline" toggle).
-    Default stays the more private option.
+  - User-configurable: extend visibility to Pending contacts too (useful
+    while a verification exchange, `ARCHITECTURE.md` §6.3/§6.4, is still in
+    progress), or disable presence broadcasting entirely (an "appear
+    offline" toggle). Default stays the more private option.
 - **Delivery-tier integration**: before sending, the client checks its
   locally cached presence for the recipient. Online → attempt Tier 0
   rendezvous first. Offline, unreachable, or the Tier 0 attempt times out →

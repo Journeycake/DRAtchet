@@ -241,3 +241,22 @@ receiver's own last-known state, never something the sender asserts — see
 `ARCHITECTURE.md` §7.5 for the full notification behavior, including why
 the very first announcement for a conversation is establishing state
 rather than changing it.
+
+## 9. Group vouch attestation (CBOR) — `ARCHITECTURE.md` §13.6
+
+| Field | Type | Notes |
+|---|---|---|
+| `prospect_fingerprint` | bytes (32) | the prospective member's identity fingerprint (`ARCHITECTURE.md` §3.1), confirmed by the voucher via §6.3 or §6.4 |
+| `voucher_fingerprint` | bytes (32) | the current member issuing this attestation — redundant with the MLS sender identity, included so the attestation is independently verifiable outside the transport that carried it |
+| `vouched_at` | uint64 | unix seconds |
+| `signature` | bytes (64) | raw Ed25519 signature by the voucher's identity key, over `(prospect_fingerprint, voucher_fingerprint, vouched_at)` |
+
+Carried as an MLS Application message (`ARCHITECTURE.md` §13.1) to the
+group, not a DRAtchet-specific ratchet envelope — consistent with §13.1's
+decision to adopt RFC 9420's own encoding for all group traffic. Every
+current member's client independently collects vouch attestations for a
+given `prospect_fingerprint`, sums the issuing members' configured vouch
+weights, and only then does a member propose the `Commit` that actually
+adds the prospect — the attestations are the auditable evidence for that
+Commit, not a request routed through the Group Coordination Service for
+it to act on.
