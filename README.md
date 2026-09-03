@@ -11,8 +11,12 @@ algorithm rather than a naive "new PGP keypair per message" scheme, so the
 protocol tolerates real-world conditions: offline recipients, bursts of
 queued messages, out-of-order delivery, and retries.
 
-Status: **v0 crypto core implemented and tested** (`core/`) — X3DH handshake
-+ Double Ratchet engine, Ed25519/X25519 identity. No transport, no UI yet.
+Status: **v0 crypto core** (`core/`) — X3DH handshake + Double Ratchet
+engine, Ed25519/X25519 identity — **plus Phase 1.1 of the v1 build plan**,
+the **Signaling & Presence Service** (`server/`): prekey directory, WebRTC
+rendezvous, Tier 1 mailbox, and presence, all over one WebSocket endpoint.
+See [`server/README.md`](server/README.md) for installing and running it.
+No UI yet.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full protocol and
 system design, [`docs/MESSAGE_SCHEMA.md`](docs/MESSAGE_SCHEMA.md) for the
@@ -64,7 +68,7 @@ chat (v2) adds. Highlights:
 ## Building
 
 ```
-cargo test -p dratchet-core
+cargo test --workspace
 ```
 
 No system dependencies — every crypto primitive is pure Rust
@@ -74,6 +78,11 @@ stable Rust toolchain is required on any platform; see
 setup. `core/tests/queue_depth.rs` is the test that actually checks the
 queue-depth claim above against arbitrarily-ordered delivery, including a
 property test over random burst sizes and delivery orderings.
+
+For the Signaling & Presence Service specifically — installing it,
+running it, its configuration and endpoints, and what each of its four
+test suites (including a concurrent-client stress test) covers — see
+[`server/README.md`](server/README.md).
 
 Fuzz targets for the two parsers that handle untrusted bytes off the wire
 (`Envelope::decode`, `payload::untag_and_unpad`) live in `core/fuzz/` — see

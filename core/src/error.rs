@@ -20,8 +20,8 @@ pub enum Error {
     #[error("ratchet has not been initialized for {0}")]
     RatchetNotInitialized(&'static str),
 
-    #[error("prekey signature verification failed")]
-    InvalidPrekeySignature,
+    #[error("signature verification failed")]
+    InvalidSignature,
 
     #[error("payload is malformed: {0}")]
     MalformedPayload(&'static str),

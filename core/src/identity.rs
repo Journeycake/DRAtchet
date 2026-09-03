@@ -42,6 +42,17 @@ impl Fingerprint {
     }
 }
 
+/// Compute the fingerprint of a raw Ed25519 public key, given only the
+/// public bytes — no private key required. A directory holding published
+/// bundles (only ever public key material) needs this to index and look up
+/// identities by fingerprint the same way an `Identity` computes its own.
+pub fn fingerprint_of_public_key(public_key_bytes: &[u8]) -> Fingerprint {
+    let digest = Sha256::digest(public_key_bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    Fingerprint(out)
+}
+
 pub struct Identity {
     signing_key: SigningKey,
 }
@@ -54,10 +65,7 @@ impl Identity {
     }
 
     pub fn fingerprint(&self) -> Fingerprint {
-        let digest = Sha256::digest(self.signing_key.verifying_key().as_bytes());
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&digest);
-        Fingerprint(out)
+        fingerprint_of_public_key(self.signing_key.verifying_key().as_bytes())
     }
 
     /// Export the raw 32-byte Ed25519 public key.
@@ -70,8 +78,7 @@ impl Identity {
     /// prekey id. Returns a raw 64-byte Ed25519 signature.
     pub fn sign_prekey(&self, prekey_id: u32, prekey_public: &[u8; 32]) -> Result<Vec<u8>> {
         let message = prekey_signing_payload(prekey_id, prekey_public);
-        let sig = self.signing_key.sign(&message);
-        Ok(sig.to_bytes().to_vec())
+        self.sign(&message)
     }
 
     /// Verify a prekey signature produced by [`Identity::sign_prekey`], given the
@@ -82,19 +89,39 @@ impl Identity {
         prekey_public: &[u8; 32],
         signature_bytes: &[u8],
     ) -> Result<()> {
-        let public_key_array: [u8; 32] = signer_public_key_bytes
-            .try_into()
-            .map_err(|_| Error::InvalidPrekeySignature)?;
-        let verifying_key = VerifyingKey::from_bytes(&public_key_array)
-            .map_err(|_| Error::InvalidPrekeySignature)?;
-        let signature =
-            Signature::from_slice(signature_bytes).map_err(|_| Error::InvalidPrekeySignature)?;
-
         let message = prekey_signing_payload(prekey_id, prekey_public);
-        verifying_key
-            .verify(&message, &signature)
-            .map_err(|_| Error::InvalidPrekeySignature)
+        verify_signature(signer_public_key_bytes, &message, signature_bytes)
     }
+
+    /// Sign an arbitrary message with this identity's key — the general-purpose
+    /// primitive `sign_prekey` is built on top of. Used directly wherever
+    /// something other than a prekey binding needs an identity signature (e.g.
+    /// the Signaling & Presence Service's connection auth handshake,
+    /// `SERVERS.md` §1.2, which signs a server-issued nonce).
+    pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>> {
+        let sig = self.signing_key.sign(message);
+        Ok(sig.to_bytes().to_vec())
+    }
+}
+
+/// Verify an arbitrary Ed25519 signature against a raw 32-byte public key —
+/// the general-purpose primitive [`Identity::verify_prekey_signature`] is
+/// built on top of. Free function, not tied to an `Identity` instance, since
+/// verifying doesn't require holding any key material of one's own.
+pub fn verify_signature(
+    public_key_bytes: &[u8],
+    message: &[u8],
+    signature_bytes: &[u8],
+) -> Result<()> {
+    let public_key_array: [u8; 32] = public_key_bytes
+        .try_into()
+        .map_err(|_| Error::InvalidSignature)?;
+    let verifying_key =
+        VerifyingKey::from_bytes(&public_key_array).map_err(|_| Error::InvalidSignature)?;
+    let signature = Signature::from_slice(signature_bytes).map_err(|_| Error::InvalidSignature)?;
+    verifying_key
+        .verify(message, &signature)
+        .map_err(|_| Error::InvalidSignature)
 }
 
 fn prekey_signing_payload(prekey_id: u32, prekey_public: &[u8; 32]) -> Vec<u8> {

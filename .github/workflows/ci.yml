@@ -33,13 +33,13 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy (deny warnings)
-        run: cargo clippy -p dratchet-core --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Build
-        run: cargo build -p dratchet-core --all-targets
+        run: cargo build --workspace --all-targets
 
       - name: Test
-        run: cargo test -p dratchet-core
+        run: cargo test --workspace
 
   fuzz-smoke:
     name: fuzz smoke test (decode_envelope, unpad_payload)
