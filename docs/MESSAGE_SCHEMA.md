@@ -49,6 +49,7 @@ this schema is the same regardless of hosting model).
 | `signed_prekey_sig` | bytes (64) | raw Ed25519 signature, by `identity_key` |
 | `signed_prekey_expires_at` | uint64 | unix seconds; rotated on schedule (§3.2) |
 | `one_time_prekeys` | array of `{id: uint32, key: bytes (32)}` | each consumed once, then removed from the published bundle (§3.4) |
+| `registration_pow` | optional uint64 | proof-of-work solution, required only when publishing a `username`/`discriminator` not already owned by this bundle's own identity — directory abuse resistance (§11.8), added in Phase 1.2 after the fields above; a rotation/republish of an already-owned username omits it |
 
 ## 2. Ratchet message envelope (fixed binary layout)
 

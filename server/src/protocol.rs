@@ -107,7 +107,9 @@ pub struct OneTimePrekeyWire {
     pub key: Vec<u8>,
 }
 
-/// Mirrors `MESSAGE_SCHEMA.md` §1 exactly.
+/// Mirrors `MESSAGE_SCHEMA.md` §1, plus `registration_pow` (Phase 1.2
+/// directory abuse resistance, `ARCHITECTURE.md` §11.8 — documented there
+/// as an additive field, not part of the original table).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrekeyBundleWire {
     pub username: String,
@@ -125,6 +127,15 @@ pub struct PrekeyBundleWire {
     pub signed_prekey_sig: Vec<u8>,
     pub signed_prekey_expires_at: u64,
     pub one_time_prekeys: Vec<OneTimePrekeyWire>,
+    /// Proof-of-work solution gating *new* username registration
+    /// (`crate::abuse`) — required only when this `username`/
+    /// `discriminator` isn't already owned by this bundle's own identity;
+    /// ignored on a rotation/republish of an already-owned username.
+    /// `#[serde(default)]` so a publisher omitting the field entirely still
+    /// decodes (as `None`), per this schema's additive-field-evolution
+    /// convention (`MESSAGE_SCHEMA.md`'s encoding conventions).
+    #[serde(default)]
+    pub registration_pow: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -36,12 +36,20 @@ use dratchet_core::prekey::{
     OneTimePrekeyPublic, PrekeyBundle as CorePrekeyBundle, SignedPrekeyPublic,
 };
 
+use crate::abuse::{self, ConnectionId};
 use crate::error::{Error, Result};
 use crate::protocol::*;
 use crate::state::{
     now_unix, prune_expired, random_16, random_32, AppState, Fingerprint, MailboxEntry,
     PresenceState, StoredBundle, UsernameKey,
 };
+
+/// Log a warning every `N`th `FetchBundle` that lands on an empty one-time-
+/// prekey pool for the same target — a coarse, best-effort signal, not a
+/// precise attack detector (see `state.rs`'s doc on `otp_exhaustion_attempts`
+/// for the caveat that a never-published pool looks the same as an
+/// exhausted one here).
+const OTP_EXHAUSTION_ALERT_THRESHOLD: u32 = 10;
 
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
@@ -69,6 +77,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             nonce: nonce.to_vec(),
         },
     ));
+
+    // Identifies this connection for the rate limiter (`crate::abuse`) only
+    // — unrelated to the auth nonce above, and never sent to the client.
+    let connection_id: ConnectionId = random_16();
 
     let mut authenticated: Option<Fingerprint> = None;
 
@@ -100,7 +112,17 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             }
         };
 
-        if let Err(e) = dispatch(tag, body, &state, &tx, &nonce, &mut authenticated).await {
+        if let Err(e) = dispatch(
+            tag,
+            body,
+            &state,
+            &tx,
+            &nonce,
+            connection_id,
+            &mut authenticated,
+        )
+        .await
+        {
             let _ = tx.send(encode(
                 FrameTag::Error,
                 &ErrorFrame {
@@ -137,6 +159,7 @@ async fn dispatch(
     state: &Arc<AppState>,
     tx: &mpsc::UnboundedSender<Vec<u8>>,
     nonce: &[u8; 32],
+    connection_id: ConnectionId,
     authenticated: &mut Option<Fingerprint>,
 ) -> Result<()> {
     match tag {
@@ -181,7 +204,7 @@ async fn dispatch(
 
         FrameTag::FetchBundle => {
             let req: FetchBundle = decode_body(body)?;
-            let result = fetch_bundle(state, &req, *authenticated).await;
+            let result = fetch_bundle(state, &req, *authenticated, connection_id).await?;
             let _ = tx.send(encode(FrameTag::BundleResult, &result));
             Ok(())
         }
@@ -364,12 +387,41 @@ async fn publish_bundle(state: &Arc<AppState>, wire: PrekeyBundleWire) -> Result
         discriminator: wire.discriminator,
     };
 
+    let mut inner = state.inner.write().await;
+    match inner.username_index.get(&username_key) {
+        // Already owned by this exact identity — a rotation/republish
+        // (signed-prekey renewal, topping up one-time prekeys). No
+        // proof-of-work required again; this is the common case.
+        Some(&existing_fp) if existing_fp == fp => {}
+        // Owned by a *different* identity — reject outright, regardless of
+        // proof-of-work. `username#NNNN` is first-come-first-served
+        // (`ARCHITECTURE.md` §11.8); without this check any later publish
+        // for a taken username would silently reassign it, which is worse
+        // than the squatting problem §11.8 actually names.
+        Some(_) => return Err(Error::UsernameTaken),
+        // Brand-new registration — require the registration proof-of-work
+        // (`crate::abuse`), a PII-free floor against mass-registering
+        // usernames to squat them.
+        None => {
+            let solved = wire.registration_pow.is_some_and(|solution| {
+                abuse::verify_registration_pow(
+                    &wire.username,
+                    wire.discriminator,
+                    &wire.identity_key,
+                    solution,
+                )
+            });
+            if !solved {
+                return Err(Error::ProofOfWorkRequired);
+            }
+        }
+    }
+
     let mut one_time_prekeys = std::collections::HashMap::new();
     for otp in &wire.one_time_prekeys {
         one_time_prekeys.insert(otp.id, otp.key.clone());
     }
 
-    let mut inner = state.inner.write().await;
     inner.username_index.insert(username_key, fp);
     inner.directory.insert(
         fp,
@@ -385,17 +437,25 @@ async fn fetch_bundle(
     state: &Arc<AppState>,
     req: &FetchBundle,
     fetcher: Option<Fingerprint>,
-) -> BundleResult {
+    connection_id: ConnectionId,
+) -> Result<BundleResult> {
     let username_key = UsernameKey {
         username: req.username.clone(),
         discriminator: req.discriminator,
     };
     let mut inner = state.inner.write().await;
     let Some(&target_fp) = inner.username_index.get(&username_key) else {
-        return BundleResult { bundle: None };
+        return Ok(BundleResult { bundle: None });
     };
+
+    // Rate-limit *before* touching the one-time-prekey pool — a rejected
+    // fetch must not itself consume anything (`crate::abuse`).
+    if !inner.fetch_rate_limiter.allow(connection_id, target_fp) {
+        return Err(Error::RateLimited);
+    }
+
     let Some(stored) = inner.directory.get_mut(&target_fp) else {
-        return BundleResult { bundle: None };
+        return Ok(BundleResult { bundle: None });
     };
 
     // Consume one one-time prekey if any remain — single-use, discard-after-use
@@ -434,9 +494,27 @@ async fn fetch_bundle(
             .insert(target_fp);
     }
 
-    BundleResult {
-        bundle: Some(fetched),
+    if fetched.one_time_prekey.is_none() {
+        let count = inner.otp_exhaustion_attempts.entry(target_fp).or_insert(0);
+        *count += 1;
+        if *count % OTP_EXHAUSTION_ALERT_THRESHOLD == 0 {
+            tracing::warn!(
+                target_fingerprint = %hex_encode(&target_fp),
+                attempts = *count,
+                "repeated fetches against an empty one-time-prekey pool for this account \
+                 (ARCHITECTURE.md §11.8) — possible enumeration/exhaustion attempt; surfacing \
+                 this to the affected account is future client work",
+            );
+        }
     }
+
+    Ok(BundleResult {
+        bundle: Some(fetched),
+    })
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Deliver an already-built frame to `to`'s live connection, if it has one —

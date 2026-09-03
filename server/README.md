@@ -1,7 +1,7 @@
 # dratchet-server — Signaling & Presence Service
 
-Phase 1.1 of the v1 build plan. This is the first of DRAtchet's two
-*optional* 1:1-model server components described in
+Phases 1.1 and 1.2 of the v1 build plan. This is the first of DRAtchet's
+two *optional* 1:1-model server components described in
 [`docs/SERVERS.md`](../docs/SERVERS.md) §1 — a single small service that
 does four related jobs over one WebSocket endpoint:
 
@@ -16,6 +16,22 @@ does four related jobs over one WebSocket endpoint:
 It never sees plaintext, ratchet state, or long-term private key material,
 and it holds **no durable state**: everything lives in memory and is lost
 (harmlessly, by design) on restart — see §1.4 of `docs/SERVERS.md`.
+
+Phase 1.2 adds directory abuse resistance on top of that (`ARCHITECTURE.md`
+§11.8, [`src/abuse.rs`](src/abuse.rs)):
+
+- **Prekey-fetch rate limiting** — a per-(connection, target) token bucket
+  on `FetchBundle`, so repeatedly fetching one account's bundle to exhaust
+  its one-time-prekey pool costs increasingly more wall-clock time instead
+  of being free.
+- **Registration proof-of-work** — claiming a brand-new `username#NNNN`
+  requires solving a small SHA-256 grinding puzzle first, a PII-free,
+  cost-based floor against mass-registering usernames to squat them.
+  Rotating a username your own identity already owns never needs this.
+- **Username ownership enforcement** — a `PublishBundle` for a
+  `username#NNNN` already owned by a *different* identity is rejected
+  outright, regardless of proof-of-work; first-come-first-served, not
+  first-*claims*-wins.
 
 This document covers installing and running the service itself
 (`dratchetd`). For the wire protocol it speaks, see
@@ -149,14 +165,16 @@ design — see `docs/SERVERS.md` §1.4.
 cargo test -p dratchet-server
 ```
 
-runs four suites, all against a real service bound to an OS-assigned
+runs five suites, all against a real service bound to an OS-assigned
 ephemeral port (`tests/common/mod.rs::spawn_server`) — no mocked
 networking, WebSocket transport, or cryptography anywhere in the suite,
 matching the project's testing philosophy established in `core/`:
 
-- **Unit tests** (`src/protocol.rs`) — frame encode/decode round-trips,
-  and that malformed/truncated/adversarial byte input is always rejected
-  as a plain `Err`, never a panic.
+- **Unit tests** (`src/protocol.rs`, `src/abuse.rs`) — frame encode/decode
+  round-trips and malformed/truncated/adversarial byte input always
+  rejected as a plain `Err`, never a panic (`protocol.rs`); the
+  proof-of-work solve/verify primitives and the fetch rate limiter's
+  token-bucket behavior in isolation (`abuse.rs`).
 - **`tests/integration.rs`** — the golden paths: publish → fetch a bundle,
   one-time prekeys consumed exactly once, the full auth handshake,
   presence subscribe → update delivery, rendezvous relay to an online
@@ -174,18 +192,32 @@ matching the project's testing philosophy established in `core/`:
   (and not silently overwriting a previously-good bundle); and a
   `proptest`-driven fuzz of the frame parser against arbitrary byte
   sequences (256 cases) to confirm it never panics.
+- **`tests/abuse.rs`** — Phase 1.2's directory-abuse-resistance defenses
+  wired into the real `PublishBundle`/`FetchBundle` dispatch path (not just
+  the `abuse.rs` unit tests' isolated primitives): a brand-new username
+  registered with no proof-of-work, or with a solution solved for a
+  different username, is rejected and never stored; a valid solution
+  succeeds; rotating a bundle's own already-owned username never requires
+  solving it again; a second identity cannot steal an already-registered
+  username even with its own valid proof-of-work; and bursting
+  `FetchBundle` calls against one target from one connection eventually
+  gets rate-limited, without affecting a different, never-fetched target's
+  own budget.
 - **`tests/stress.rs`** — a concurrency/load smoke test: 40 simulated
   clients, each held behind a start barrier until every one of them has
-  published a bundle and authenticated, then all 40 run 15 iterations
-  concurrently of fetch-bundle → mailbox write/fetch → presence announce →
-  rendezvous offer to a ring-neighbor peer, every response validated as
-  strictly as the sequential integration tests. On the development
-  hardware used to write this service it completes 3,000 request/response
-  round trips in roughly a second (~2,500 ops/sec); the test itself only
-  asserts a generous 30-second ceiling rather than a specific number, since
-  the point is to catch a pathological regression (e.g. an accidental lock
-  that serializes every connection), not to make a benchmark claim. Run it
-  on its own, with output, to see the actual numbers for your machine:
+  published a bundle and authenticated, then all 40 fetch their ring
+  neighbor's bundle once (like a real client establishing one X3DH
+  session — repeating it every iteration would just exercise the Phase 1.2
+  fetch rate limiter above, not load-test the service) and run 15
+  iterations concurrently of mailbox write/fetch → presence announce →
+  rendezvous offer to that peer, every response validated as strictly as
+  the sequential integration tests. On the development hardware used to
+  write this service it completes a couple thousand request/response round
+  trips in about a second (~2,000+ ops/sec); the test itself only asserts a
+  generous 30-second ceiling rather than a specific number, since the point
+  is to catch a pathological regression (e.g. an accidental lock that
+  serializes every connection), not to make a benchmark claim. Run it on
+  its own, with output, to see the actual numbers for your machine:
 
   ```sh
   cargo test -p dratchet-server --test stress -- --nocapture
@@ -204,10 +236,12 @@ server/
 │   ├── protocol.rs   — wire frame format: [tag: u8][CBOR body], all message types
 │   ├── state.rs      — in-memory server state (directory, presence, mailboxes, connections)
 │   ├── ws.rs          — the connection handler: auth, dispatch, all four jobs
+│   ├── abuse.rs        — Phase 1.2: fetch rate limiter, registration proof-of-work
 │   └── error.rs       — the service's error type
 └── tests/
     ├── common/mod.rs  — shared real-WebSocket test client
     ├── integration.rs — golden-path end-to-end tests
     ├── adversarial.rs — auth-bypass, replay, tamper, and fuzz tests
+    ├── abuse.rs        — directory-abuse-resistance tests (Phase 1.2)
     └── stress.rs       — concurrent-client load test
 ```

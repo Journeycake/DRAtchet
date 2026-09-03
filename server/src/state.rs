@@ -62,6 +62,15 @@ pub struct Inner {
     pub fetch_evidence: HashMap<Fingerprint, std::collections::HashSet<Fingerprint>>,
     pub mailboxes: HashMap<MailboxId, Vec<MailboxEntry>>,
     pub connections: HashMap<Fingerprint, OutboundSender>,
+    /// Directory abuse resistance (Phase 1.2, `ARCHITECTURE.md` §11.8) —
+    /// see `crate::abuse` for what each of these gates.
+    pub fetch_rate_limiter: crate::abuse::FetchRateLimiter,
+    /// target fingerprint -> count of `FetchBundle` calls that found its
+    /// one-time-prekey pool already empty — logged past a threshold as a
+    /// "someone keeps hitting this account's exhausted pool" signal
+    /// (`ARCHITECTURE.md` §11.8); surfacing it to the affected user is
+    /// future client work, not something this server-only phase can do.
+    pub otp_exhaustion_attempts: HashMap<Fingerprint, u32>,
 }
 
 pub struct AppState {

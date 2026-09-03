@@ -80,7 +80,11 @@ impl TestClient {
 
     /// Full auth handshake: receive the challenge, sign the nonce with
     /// `account`'s identity key, send it back. Panics (test failure) if the
-    /// server doesn't Ack.
+    /// server doesn't Ack. Unused by `abuse.rs`, which never needs an
+    /// authenticated connection — each test binary compiles this module
+    /// separately, so it shows as unused dead code from that binary's point
+    /// of view (see `send_raw`'s doc above for the same situation).
+    #[allow(dead_code)]
     pub async fn authenticate(&mut self, account: &Account) {
         let (tag, challenge): (_, AuthChallenge) = self.recv().await;
         assert_eq!(tag, FrameTag::AuthChallenge);
@@ -156,6 +160,18 @@ pub fn fresh_account_and_bundle(
         })
         .collect();
 
+    // Every fixture here registers a brand-new username, so it always needs
+    // a valid registration proof-of-work solution (Phase 1.2,
+    // `dratchet_server::abuse`) — solved up front so every existing test
+    // built on this fixture keeps working unchanged. Tests that
+    // specifically probe the proof-of-work gate itself build a
+    // `PrekeyBundleWire` by hand instead (see `abuse.rs`).
+    let registration_pow = Some(dratchet_server::abuse::solve_registration_pow(
+        username,
+        discriminator,
+        &core_bundle.identity_public_key,
+    ));
+
     let wire = PrekeyBundleWire {
         username: username.to_string(),
         discriminator,
@@ -167,10 +183,13 @@ pub fn fresh_account_and_bundle(
         signed_prekey_sig: core_bundle.signed_prekey.signature.clone(),
         signed_prekey_expires_at: 0,
         one_time_prekeys,
+        registration_pow,
     };
     (account, wire)
 }
 
+/// Unused by `abuse.rs` — see `send_raw`'s doc above for why that's expected.
+#[allow(dead_code)]
 pub fn fingerprint_of(account: &Account) -> Vec<u8> {
     account.identity.fingerprint().as_bytes().to_vec()
 }

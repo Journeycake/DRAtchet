@@ -17,6 +17,15 @@ pub enum Error {
     #[error("bundle is not internally consistent: {0}")]
     InvalidBundle(&'static str),
 
+    #[error("username is already registered to a different identity")]
+    UsernameTaken,
+
+    #[error("registering a new username requires a valid proof-of-work solution")]
+    ProofOfWorkRequired,
+
+    #[error("rate limit exceeded for this target, try again shortly")]
+    RateLimited,
+
     #[error("not found")]
     NotFound,
 }

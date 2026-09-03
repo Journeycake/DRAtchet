@@ -73,26 +73,33 @@ async fn many_concurrent_clients_publish_fetch_mailbox_presence_rendezvous_witho
 
             let mut ops = 0u32;
 
-            for iter in 0..ITERATIONS_PER_CLIENT {
-                // 1. Fetch the ring neighbor's bundle — always succeeds,
-                //    every account published before the barrier released.
-                client
-                    .send(
-                        FrameTag::FetchBundle,
-                        &FetchBundle {
-                            username: peer_username.clone(),
-                            discriminator: peer_index as u16,
-                        },
-                    )
-                    .await;
-                let result: BundleResult = client.recv_skip_pushes(FrameTag::BundleResult).await;
-                assert!(
-                    result.bundle.is_some(),
-                    "client {i} iter {iter}: peer bundle must be found"
-                );
-                ops += 1;
+            // Fetch the ring neighbor's bundle exactly once, like a real
+            // client establishing one X3DH session — not once per
+            // iteration. Phase 1.2's per-(connection, target) fetch rate
+            // limiter (`dratchet_server::abuse::FetchRateLimiter`)
+            // deliberately rejects the same connection repeatedly
+            // re-fetching the same target's bundle past a small burst
+            // budget, which a real client never needs to do; re-fetching
+            // it `ITERATIONS_PER_CLIENT` times here would just be testing
+            // that defense, not load-testing the service.
+            client
+                .send(
+                    FrameTag::FetchBundle,
+                    &FetchBundle {
+                        username: peer_username.clone(),
+                        discriminator: peer_index as u16,
+                    },
+                )
+                .await;
+            let result: BundleResult = client.recv_skip_pushes(FrameTag::BundleResult).await;
+            assert!(
+                result.bundle.is_some(),
+                "client {i}: peer bundle must be found"
+            );
+            ops += 1;
 
-                // 2. Mailbox round trip against a private, per-(client,
+            for iter in 0..ITERATIONS_PER_CLIENT {
+                // 1. Mailbox round trip against a private, per-(client,
                 //    iteration) mailbox id — no cross-client collisions.
                 let mailbox_id = {
                     let mut id = vec![0u8; 16];
@@ -134,14 +141,14 @@ async fn many_concurrent_clients_publish_fetch_mailbox_presence_rendezvous_witho
                 );
                 ops += 1;
 
-                // 3. Presence announce — fire-and-forget, no response frame.
+                // 2. Presence announce — fire-and-forget, no response frame.
                 let state = if iter % 2 == 0 { 1 } else { 0 };
                 client
                     .send(FrameTag::PresenceAnnounce, &PresenceAnnounce { state })
                     .await;
                 ops += 1;
 
-                // 4. Rendezvous offer to the (already-authenticated,
+                // 3. Rendezvous offer to the (already-authenticated,
                 //    still-connected) ring neighbor — must always relay.
                 client
                     .send(

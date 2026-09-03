@@ -4,6 +4,7 @@
 //! (`src/main.rs`) and integration tests can mount the same service, either
 //! bound to a real port or driven in-process.
 
+pub mod abuse;
 pub mod error;
 pub mod protocol;
 pub mod state;

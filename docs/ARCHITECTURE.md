@@ -1232,16 +1232,30 @@ before the base protocol and both peer-verification paths (§6.3/6.4) have
 shipped and been used. Worth revisiting once there's a real directory
 service in production and evidence of the TOFU gap mattering in practice.
 
-### 11.8 Directory abuse resistance — **v1**
+### 11.8 Directory abuse resistance — **v1 — implemented, Phase 1.2**
 
 Two related gaps beyond the prekey-exhaustion point already folded into
-`SERVERS.md` §1.1:
+`SERVERS.md` §1.1. Both are implemented in `server/src/abuse.rs` and wired
+into `PublishBundle`/`FetchBundle` in `server/src/ws.rs`; see
+`server/README.md` for the operational summary and `server/tests/abuse.rs`
+for the end-to-end tests.
 
 - **One-time-prekey exhaustion** (cross-referenced from `SERVERS.md` §1.1):
   rate-limit prekey fetches per requesting identity; treat repeated
   exhaustion attempts against one account as a signal worth surfacing to
   that user ("someone is repeatedly trying to start sessions with you"),
-  not just a resource-management concern.
+  not just a resource-management concern. Implemented as a per-
+  (connection, target) token bucket (`FetchRateLimiter`) gating
+  `FetchBundle`, plus a per-target counter of fetches that landed on an
+  already-empty prekey pool, logged past a threshold. Two caveats named
+  plainly rather than glossed over: rate limiting is keyed by *connection*,
+  not verified identity, since `FetchBundle` deliberately doesn't require
+  authentication first (§1.2 of `SERVERS.md`) — an unauthenticated
+  connection has no stable identity to key against, only a stable
+  connection for its own lifetime — so reconnecting resets the budget; and
+  "surfacing this to the affected user" is not yet possible at all (no
+  client exists yet), so today this is server-side logging only, ready for
+  a future client to actually notify the user.
 - **Username squatting/impersonation**: `username#NNNN` (§6.1) has no
   Sybil resistance beyond first-come-first-served registration — a
   deliberate trade against Signal/WhatsApp's phone-number-based identity,
@@ -1253,7 +1267,17 @@ Two related gaps beyond the prekey-exhaustion point already folded into
   PII-free, cost-based Sybil resistance in decentralized messaging systems
   goes back to Bitmessage's proof-of-work-gated message sends; applying the
   same idea at registration time (rather than per-message) keeps it a
-  one-time cost for a legitimate user instead of an ongoing tax.
+  one-time cost for a legitimate user instead of an ongoing tax. Implemented
+  as a SHA-256 grinding puzzle (`registration_pow`, `MESSAGE_SCHEMA.md`
+  §1) required only when a `PublishBundle` claims a `username#NNNN` the
+  publishing identity doesn't already own — a rotation/republish of an
+  already-owned username never needs to solve it again. A closely related
+  gap the original design note didn't call out explicitly: proof-of-work
+  alone doesn't stop one identity from *overwriting* an already-registered
+  username with a different identity's bundle (a hijack, strictly worse
+  than squatting) — the directory now also enforces that a `username#NNNN`
+  already owned by a different identity is rejected outright, regardless of
+  proof-of-work.
 
 ### 11.9 Duress response — inspired by Briar's panic-button integration — **v2, optional**
 
