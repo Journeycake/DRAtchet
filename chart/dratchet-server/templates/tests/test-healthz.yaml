@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "dratchet-server.fullname" . }}-test-healthz
+  labels:
+    {{- include "dratchet-server.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  containers:
+    - name: healthz
+      image: alpine:3.20
+      command:
+        - sh
+        - -c
+        - |
+          apk add --no-cache curl >/dev/null
+          curl -sf "http://{{ include "dratchet-server.fullname" . }}:{{ .Values.service.port }}/healthz"

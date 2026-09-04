@@ -1,0 +1,112 @@
+# Default values for dratchet-server.
+
+image:
+  repository: dratchet-server
+  tag: ""  # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# IMPORTANT — read before changing this: dratchetd holds all state (prekey
+# directory, presence, mailboxes, live connections) in-memory only, per pod
+# (docs/SERVERS.md §1.4 — there is no database, and no state is shared
+# between replicas). A WebSocket client's whole session lives on whatever
+# one pod it happened to connect to. Setting replicaCount > 1 does NOT give
+# you a horizontally-scaled view of the same directory/presence/mailbox
+# data — it gives you N independent, inconsistent copies, and a client
+# load-balanced to a different pod than the one it published its bundle to
+# will simply not find it. Scale replicas only if you have also solved that
+# (e.g. consistent-hashing/sticky routing per identity fingerprint at the
+# ingress/LB layer, which this chart does not set up for you), or if you
+# accept running exactly one pod as the default, safe posture.
+replicaCount: 1
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podAnnotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  port: 8787
+
+# Config surfaced as environment variables via a ConfigMap
+# (templates/configmap.yaml) — see server/README.md's Configuration table
+# for what dratchetd itself understands.
+config:
+  # RUST_LOG-style filter for the tracing subscriber, e.g. "info" or
+  # "dratchet_server=debug,info".
+  logLevel: "info"
+
+resources:
+  # A single WebSocket connection handler + a small in-memory HashMap-based
+  # store is lightweight; these are conservative starting points, not a
+  # measured production ceiling — the fitting Phase 1.1/1.2 stress test
+  # (server/tests/stress.rs) is a reasonable starting point for load
+  # testing your own limits before tuning these.
+  requests:
+    cpu: 50m
+    memory: 32Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+# Liveness/readiness both point at the same /healthz endpoint
+# (dratchet_server::app()'s healthz route) — it's a plain 200 OK with no
+# dependency checks (there's nothing to check: no database, no external
+# calls), so liveness and readiness are equivalent for this service.
+probes:
+  liveness:
+    initialDelaySeconds: 2
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  readiness:
+    initialDelaySeconds: 2
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+# A WebSocket connection is long-lived by design (server/README.md's
+# "Deployment posture" section) — give in-flight connections real time to
+# finish (or be told to reconnect elsewhere) instead of being cut off
+# mid-frame when a pod is terminated. Must be >= the pod's own graceful
+# shutdown budget; dratchetd handles SIGTERM via axum's graceful shutdown
+# (server/src/main.rs).
+terminationGracePeriodSeconds: 30
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: dratchet.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1

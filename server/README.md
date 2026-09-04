@@ -159,6 +159,153 @@ connections.
 No database, migration, or backup story is needed for this service by
 design — see `docs/SERVERS.md` §1.4.
 
+### Shutdown signals
+
+`dratchetd` shuts down gracefully (finishing in-flight requests rather than
+dropping connections mid-frame) on either `SIGINT` (Ctrl-C, interactive use)
+or `SIGTERM` (what `docker stop` and a Kubernetes pod termination/rolling
+update send) — see `shutdown_signal()` in `src/main.rs`.
+
+## Container image
+
+A [`Dockerfile`](../Dockerfile) at the repository root builds `dratchetd` as
+a statically-linked musl binary (`rust:1-alpine` builder stage) and ships it
+in a minimal `alpine:3.20` runtime image, running as a non-root user
+(uid `10001`). The whole workspace is pure Rust with no native/C
+dependencies, so nothing beyond the Rust toolchain itself is needed to build
+it — no extra `apt`/`apk` packages in the runtime image, no OpenSSL.
+
+```sh
+docker build -t dratchet-server:local .
+docker run --rm -p 8787:8787 dratchet-server:local
+curl http://127.0.0.1:8787/healthz
+```
+
+Configuration is via environment variables, same as running the binary
+directly (see [Configuration](#configuration) above) — `DRATCHETD_BIND` is
+set to `0.0.0.0:8787` in the image by default so it's reachable from outside
+the container without extra flags.
+
+## Kubernetes / Helm deployment
+
+A Helm chart at [`chart/dratchet-server`](../chart/dratchet-server) deploys
+the container image above: a `Deployment`, a `ClusterIP` `Service`, a
+dedicated `ServiceAccount`, a `ConfigMap` for the environment variables
+above, an optional `Ingress` (disabled by default), an optional
+`PodDisruptionBudget` (disabled by default), and a `helm test` hook that
+curls `/healthz` from inside the cluster.
+
+### Before you deploy: this service does not horizontally scale by default
+
+**Read `values.yaml`'s `replicaCount` comment before setting it above `1`.**
+`dratchetd` holds its entire state — prekey directory, presence, mailboxes,
+live connections — in memory, per pod (`docs/SERVERS.md` §1.4: there is no
+database, and nothing is shared between replicas). A client's WebSocket
+connection lives on whichever one pod it happened to land on. Running
+multiple replicas behind the chart's single `Service` gives you *N*
+independent, inconsistent copies of that state, not a scaled-out view of
+one — a client load-balanced to a different pod than the one it published
+its bundle to simply won't find it there. The chart defaults to
+`replicaCount: 1` for exactly this reason; only raise it if you've solved
+routing consistency yourself (e.g. consistent-hashing per identity
+fingerprint at the ingress/load-balancer layer), which this chart does not
+set up for you. The rendered `NOTES.txt` repeats this warning if
+`replicaCount` is set above `1`.
+
+### Install
+
+```sh
+# Build and make the image available to your cluster first (push it to a
+# registry your cluster can pull from, or import it directly if your
+# runtime supports that — see the RKE2/containerd note below).
+docker build -t <your-registry>/dratchet-server:0.1.0 .
+docker push <your-registry>/dratchet-server:0.1.0
+
+helm install dratchet chart/dratchet-server \
+  --set image.repository=<your-registry>/dratchet-server \
+  --set image.tag=0.1.0
+
+kubectl get pods -l app.kubernetes.io/name=dratchet-server
+helm test dratchet
+```
+
+### Configuration (`values.yaml`)
+
+| Key | Default | Purpose |
+|---|---|---|
+| `image.repository` / `image.tag` | `dratchet-server` / chart's `appVersion` | Where to pull the image built above from. |
+| `replicaCount` | `1` | See the scaling warning above — change with care. |
+| `service.port` | `8787` | Also becomes `DRATCHETD_BIND`'s port via the chart's `ConfigMap`. |
+| `config.logLevel` | `"info"` | `RUST_LOG` value passed to the container. |
+| `resources` | `50m`/`32Mi` requests, `500m`/`256Mi` limits | Conservative starting points — use `tests/stress.rs`'s load pattern as a starting point for load-testing your own limits before tuning these. |
+| `probes.liveness` / `probes.readiness` | both hit `/healthz` | Identical by design — there's no dependency (database, external call) for readiness to check that liveness doesn't already cover. |
+| `terminationGracePeriodSeconds` | `30` | Time given to `SIGTERM`-triggered graceful shutdown (see above) to let in-flight WebSocket connections wind down before a forced kill. |
+| `ingress.enabled` | `false` | See the WebSocket-upgrade note in `templates/ingress.yaml` if you enable it — your ingress controller needs WebSocket support and long-enough proxy timeouts for a persistent connection. |
+| `podDisruptionBudget.enabled` | `false` | Off by default since it's only meaningful once you've deliberately decided to run more than one replica. |
+
+Full reference: [`chart/dratchet-server/values.yaml`](../chart/dratchet-server/values.yaml).
+
+### Validating the chart
+
+```sh
+helm lint chart/dratchet-server
+helm template dratchet chart/dratchet-server | kubeconform -summary -strict -
+```
+
+[`kubeconform`](https://github.com/yannh/kubeconform) validates rendered
+manifests against the upstream Kubernetes OpenAPI schemas without needing a
+live cluster. CI (`.github/workflows/ci.yml`'s `helm` job) runs both of the
+above, plus a second render with `ingress`, `podDisruptionBudget`, multiple
+replicas, and `imagePullSecrets` all enabled, so the less-common code paths
+through the templates are exercised too — not just the defaults.
+
+### RKE2 (containerd) specifics
+
+Nothing RKE2-specific is required — RKE2 uses `containerd` as a standard,
+CRI-compliant container runtime, the same interface any other modern
+Kubernetes distribution (k3s, EKS, GKE, kubeadm) presents. This is a
+stateless-per-pod (see above), volume-free service with no host-level
+requirements (no privileged containers, no hostPath mounts, no special
+node capabilities), so it needs nothing beyond what any workload needs to
+run under containerd:
+
+- **Getting the image to the cluster**: if you don't have a registry
+  reachable from your RKE2 nodes, `containerd` supports importing a locally
+  built image directly, bypassing a registry entirely:
+
+  ```sh
+  docker save dratchet-server:local -o dratchet-server.tar
+  # on each RKE2 node (or via your node-provisioning tooling):
+  sudo ctr -n k8s.io images import dratchet-server.tar
+  ```
+
+  Then reference it in `values.yaml`/`--set` with a tag `containerd` already
+  has locally and `image.pullPolicy: IfNotPresent` (the chart's default) so
+  it doesn't try to pull from a registry that doesn't have it.
+- **Private registries**: if you do use one, set `imagePullSecrets` in
+  `values.yaml` (the chart wires it straight into the pod spec) — same as
+  any other Kubernetes distribution; RKE2 doesn't need anything extra.
+- **Ingress**: RKE2 ships an nginx-based ingress controller by default
+  (`rke2-ingress-nginx`), which already handles WebSocket upgrades
+  correctly out of the box — no special annotation is required for the
+  upgrade itself, just make sure `ingress.className` matches what your RKE2
+  install uses (`nginx` unless you changed it) if you enable `ingress` in
+  the chart.
+
+### A note on what was, and wasn't, verified in the environment this was built in
+
+`cargo build`/`cargo test` (the Rust code itself, including the `SIGTERM`
+change above) were run and passed directly. `helm lint`, `helm template`
+against several value combinations, and `kubeconform -strict` validation of
+every rendered manifest were also run directly and passed. Actually running
+`docker build` and deploying to a live cluster were **not** possible in the
+sandbox this was developed in — its egress policy blocks pulls from Docker
+Hub's image storage CDN — so the `Dockerfile` itself was reviewed carefully
+but not executed; CI's new `docker` job (`.github/workflows/ci.yml`) builds
+it for real on every push/PR from here on, which is the first real build
+signal for it. Treat the first CI run and your own first `helm install`
+against a real RKE2 cluster as the actual verification of those two pieces.
+
 ## Testing
 
 ```sh
