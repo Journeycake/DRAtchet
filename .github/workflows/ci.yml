@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: fmt, clippy, build, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      - name: Test
+        run: cargo test --workspace
+
+  fuzz-smoke:
+    name: fuzz smoke test (decode_envelope, unpad_payload)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo registry and fuzz build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            core/fuzz/target
+          key: ${{ runner.os }}-cargo-fuzz-${{ hashFiles('core/fuzz/Cargo.lock') }}
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Fuzz decode_envelope (60s)
+        working-directory: core
+        run: cargo fuzz run decode_envelope -- -max_total_time=60
+
+      - name: Fuzz unpad_payload (60s)
+        working-directory: core
+        run: cargo fuzz run unpad_payload -- -max_total_time=60
+
+  docker:
+    name: build container image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (not pushed)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: dratchet-server:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  helm:
+    name: lint and validate Helm chart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+
+      - name: helm lint
+        run: helm lint chart/dratchet-server
+
+      - name: helm template (default values)
+        run: helm template test chart/dratchet-server > /tmp/rendered-default.yaml
+
+      - name: helm template (ingress/PDB/multi-replica/pull-secret enabled)
+        run: |
+          helm template test chart/dratchet-server \
+            --set ingress.enabled=true \
+            --set podDisruptionBudget.enabled=true \
+            --set replicaCount=3 \
+            --set imagePullSecrets[0].name=my-registry-secret \
+            --set serviceAccount.create=false \
+            --set serviceAccount.name=existing-sa \
+            > /tmp/rendered-full.yaml
+
+      - name: Validate rendered manifests against the Kubernetes API schema
+        run: |
+          go install github.com/yannh/kubeconform/cmd/kubeconform@latest
+          "$(go env GOPATH)/bin/kubeconform" -summary -strict /tmp/rendered-default.yaml
+          "$(go env GOPATH)/bin/kubeconform" -summary -strict /tmp/rendered-full.yaml

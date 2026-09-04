@@ -1,0 +1,30 @@
+dratchet-server ({{ .Chart.AppVersion }}) has been deployed as "{{ include "dratchet-server.fullname" . }}"
+in namespace {{ .Release.Namespace }}.
+
+WebSocket endpoint (in-cluster): ws://{{ include "dratchet-server.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}/v1/ws
+Health check:                   http://{{ include "dratchet-server.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}/healthz
+
+{{- if not .Values.ingress.enabled }}
+
+No Ingress is enabled (ingress.enabled=false). To reach this service from
+outside the cluster, either enable the chart's Ingress (--set ingress.enabled=true
+and configure ingress.hosts), or port-forward for local testing:
+
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "dratchet-server.fullname" . }} 8787:{{ .Values.service.port }}
+{{- end }}
+
+{{- if gt (.Values.replicaCount | int) 1 }}
+
+*** replicaCount is {{ .Values.replicaCount }} ***
+dratchetd holds all state in-memory, per pod (docs/SERVERS.md §1.4) — see
+values.yaml's replicaCount comment. Running more than one replica behind
+this single Service means clients are load-balanced across independent,
+inconsistent copies of the prekey directory/presence/mailbox state. Confirm
+this is intentional (and that you've solved routing consistency some other
+way) before relying on it.
+{{- end }}
+
+Run the chart's smoke test (a Pod that curls /healthz from inside the
+cluster):
+
+  helm test {{ .Release.Name }} -n {{ .Release.Namespace }}

@@ -1,0 +1,30 @@
+[package]
+name = "dratchet-server"
+version = "0.1.0"
+edition = "2021"
+description = "DRAtchet Signaling & Presence Service — prekey directory, WebRTC rendezvous, Tier 1 mailbox, presence (docs/SERVERS.md §1)"
+license = "GPL-3.0-only"
+
+[[bin]]
+name = "dratchetd"
+path = "src/main.rs"
+
+[dependencies]
+dratchet-core = { path = "../core" }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+axum = { version = "0.7", features = ["ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
+ciborium = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+sha2 = "0.10"
+futures-util = "0.3"
+thiserror = "1"
+rand_core = { version = "0.6", features = ["getrandom"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+
+[dev-dependencies]
+tokio-tungstenite = "0.21"
+proptest = "1"

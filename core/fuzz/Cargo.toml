@@ -1,0 +1,33 @@
+[package]
+name = "dratchet-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Standalone workspace: this crate needs nightly + sanitizer instrumentation, which
+# would break a plain `cargo build`/`cargo test` on the parent workspace at the repo
+# root if it were swept in. Keeping it self-contained is the standard cargo-fuzz setup.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.dratchet-core]
+path = ".."
+
+[[bin]]
+name = "decode_envelope"
+path = "fuzz_targets/decode_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "unpad_payload"
+path = "fuzz_targets/unpad_payload.rs"
+test = false
+doc = false
+bench = false
