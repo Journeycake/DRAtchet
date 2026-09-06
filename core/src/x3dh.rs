@@ -3,7 +3,7 @@
 
 use hkdf::Hkdf;
 use rand_core::OsRng;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::error::Result;
@@ -88,6 +88,33 @@ pub fn respond(
     )
 }
 
+/// Mailbox id for the *very first* message of a new conversation — before a
+/// root key exists on both sides to derive the normal, unlinkable
+/// `HKDF(root_key, "mailbox" ‖ direction)` id from (`ARCHITECTURE.md` §4.2/
+/// §11.1). The responder can't compute that id until they've already
+/// received the initiator's X3DH handshake fields, and those have to travel
+/// through *some* mailbox first — a real bootstrap gap, not one the existing
+/// design resolves.
+///
+/// Fix, deliberately minimal: derive this one id from the recipient's own
+/// public identity alone, so anyone who has fetched their prekey bundle can
+/// compute it and write the handshake there. This is a **known, bounded**
+/// exception to §11.1's unlinkability property: a relay can observe "someone
+/// new wrote to this recipient" once per new relationship (never once per
+/// message, and never *who* — the writer's identity isn't revealed by the id
+/// itself). Every message after this first one reverts to the fully
+/// unlinkable, root-key-derived id, exactly as designed. See `ARCHITECTURE.md`
+/// §11.1 for the write-up of this trade-off.
+pub fn bootstrap_mailbox_id(recipient_identity_fingerprint: &[u8]) -> [u8; 16] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"dratchet-x3dh-bootstrap-v1");
+    hasher.update(recipient_identity_fingerprint);
+    let digest = hasher.finalize();
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest[..16]);
+    out
+}
+
 fn derive_root_key(
     dh1: &[u8; 32],
     dh2: &[u8; 32],
@@ -106,4 +133,23 @@ fn derive_root_key(
     hk.expand(b"dratchet-x3dh-root", &mut root_key)
         .expect("32 is a valid HKDF-SHA256 output length");
     root_key
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bootstrap_mailbox_id_is_deterministic() {
+        let fp = [7u8; 32];
+        assert_eq!(bootstrap_mailbox_id(&fp), bootstrap_mailbox_id(&fp));
+    }
+
+    #[test]
+    fn bootstrap_mailbox_id_differs_per_recipient() {
+        assert_ne!(
+            bootstrap_mailbox_id(&[1u8; 32]),
+            bootstrap_mailbox_id(&[2u8; 32])
+        );
+    }
 }

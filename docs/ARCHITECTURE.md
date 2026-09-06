@@ -296,15 +296,21 @@ without becoming a durable archive.
   auto-wipe on delivery acknowledgment — a mailbox, not an archive. The
   relay envelope wraps the opaque ratchet message envelope with only
   routing metadata: a `mailbox_id`, a TTL, and a delivery token. `mailbox_id`
-  is **not** a static per-device inbox — it's derived per conversation
-  *direction* from ratchet state (`HKDF(root_key, "mailbox" ‖ direction)`,
-  rotating in step with the DH ratchet) — see §11.1 for why: a static
-  per-device id would let the relay trivially see "how many distinct
-  contacts write to this device," which a derived, unguessable-without-the-
-  handshake id avoids. This wrapper is a thin, tier-specific addition on
-  top of the ratchet message envelope defined in §2 of `MESSAGE_SCHEMA.md`,
-  which stays identical across all tiers — the relay never needs to
-  understand it, only pass it along.
+  is **not** a static per-device inbox — it's a per-pairing **session
+  routing id**, generated fresh out-of-band at pairing time (§6.3a) and
+  hashed pairwise (`core::conversation_id`-style, sorted) rather than
+  derived from either identity's long-term key material or from evolving
+  ratchet state. (An earlier draft of this section derived it from ratchet
+  state directly — `HKDF(root_key, "mailbox" ‖ direction)` — which turned
+  out not to work: §11.1 has the full account of why, found while
+  implementing the first reference client.) See §11.1 for why a static,
+  identity-derived id would still let the relay trivially see "how many
+  distinct contacts write to this device" — the fresh-per-pairing routing
+  id avoids that by never being tied to either party's long-term identity
+  at all. This wrapper is a thin, tier-specific addition on top of the
+  ratchet message envelope defined in §2 of `MESSAGE_SCHEMA.md`, which
+  stays identical across all tiers — the relay never needs to understand
+  it, only pass it along.
 - This is the recommended **default** for v1: pure Tier 0 is more
   privacy-strict but has a materially worse offline-delivery experience for
   an MVP; Tier 1's relay never sees plaintext or ratchet state and holds
@@ -324,12 +330,12 @@ sequenceDiagram
     participant B as Bob's client
 
     Note over A: Presence cache says Bob offline,<br/>or the Tier 0 attempt (§4.1) timed out
-    A->>A: mailbox_id = HKDF(root_key, "mailbox" ‖ direction) (§11.1)
+    A->>A: mailbox_id = sorted-hash(A's routing id, B's routing id) (§6.3a/§11.1)<br/>— fixed at pairing time, not derived from ratchet state
     A->>S: MailboxWrite(mailbox_id, ratchet_envelope, ttl=14d)
     Note over S: Ciphertext held transiently, TTL-bound (§4.5)
     Note over B: … time passes, Bob's client comes online later …
     B->>S: WS connect + auth (SERVERS.md §1.2)
-    B->>S: MailboxFetch(mailbox_id) — computed locally from Bob's own<br/>ratchet state per active conversation, never enumerated by asking the server
+    B->>S: MailboxFetch(mailbox_id) — computed locally from the routing<br/>ids exchanged at pairing time, never enumerated by asking the server
     S-->>B: ratchet_envelope
     B->>B: Ratchet-decrypt
     B->>S: MailboxDelete(mailbox_id, entry_id)
@@ -557,6 +563,80 @@ that address — match marks the contact **Verified**; mismatch is a hard
 stop, never silently marked verified. Because the fingerprint came straight
 from a physically-present device, this path doesn't need to trust the
 directory server at all — it's the strongest of the two.
+
+### 6.3a Path 1, extended — server-independent handshake + SAS liveness confirmation — **v2, future**
+
+Two hardenings to Path 1 above, planned for a later pass, not v1. Both were
+prompted by the same design question: what would it take for the
+*directory server itself* to be removable from the pairing path entirely,
+and for the pairing ceremony to resist an active attacker, not just a
+stale/replayed code?
+
+**1. QR carries the actual handshake material, not just a verifying
+fingerprint.** As written, §6.3 still routes the *key exchange* through the
+directory server: the client fetches a prekey bundle via `username#NNNN`
+first (§4.1), and the QR code only carries a fingerprint to verify that
+fetched bundle against. That means the directory server is still on the
+critical path for establishing a session, even though it can't silently
+substitute a bundle undetected (§6.3's "mismatch is a hard stop" already
+covers that). The extension: the QR instead carries the full material
+needed to run X3DH (or a simpler live mutual DH — see the open question
+below) directly between the two devices — identity key, identity DH key,
+and either a signed prekey or a fresh session-only ephemeral key — plus a
+freshly-generated, single-use **session routing id**, separate from the
+long-term identity fingerprint. The routing id (not the fingerprint) is
+what gets hashed into the Tier 1 `mailbox_id` for this conversation
+(`core::conversation_id`-style: a hash of both sides' routing ids, sorted),
+so the relay never learns either party's long-term identity *or* gets to
+correlate this conversation's traffic with any other conversation either
+party has — a strictly better property than deriving routing from the
+identity fingerprint directly, since the fingerprint may also be used
+elsewhere (e.g. directory-based discovery for other contacts). Because the
+routing id is freshly generated per pairing rather than derived from a
+permanent identity, deleting a conversation genuinely retires that address
+— re-pairing the same two people later mints a new one, rather than
+recomputing the same deterministic value every time.
+
+Open question, not resolved here: whether this reuses X3DH as-is (one
+handshake code path shared with §6.4's remote pairing, where the responder
+genuinely may be offline) or adopts a simpler live mutual X25519 exchange
+specific to this synchronous, both-parties-present case (X3DH's signed-
+prekey/one-time-prekey machinery exists specifically to support
+*asynchronous* establishment, which isn't needed when both devices are
+online in the same room). Leaning toward reusing X3DH for one shared
+implementation rather than maintaining two handshakes, but flagging this
+as a real fork rather than assuming it.
+
+**2. A mandatory Short Authentication String (SAS) comparison, closing a
+real gap in §6.3 as written.** §6.3's nonce only defends against replaying
+a *stale* screenshotted code — it does not defend against a live relay
+attack: an attacker who captures Alice's QR and relays it in real time to
+a colluding device near Bob (and vice versa) could insert themselves as a
+MITM, and both fingerprint comparisons would still "match" — each side
+would just be matching against the attacker's substituted key rather than
+each other's. The fix is the same one Signal's safety numbers, ZRTP, and
+Bluetooth Secure Simple Pairing's numeric-comparison mode all use: after
+the handshake, both devices independently compute a short, human-
+comparable string (a handful of digits or words) derived from *both*
+sides' actual exchanged keys, display it, and require the two humans to
+confirm out loud that both screens show the same value before the contact
+is marked Verified. If either side's key was substituted in transit, the
+two computed values will not match — this is a strictly stronger version
+of the same "match marks Verified; mismatch is a hard stop" mechanism
+§6.2 already defines, not a new concept bolted on.
+
+Precisely scoped, not oversold: this defeats an active network-level
+relay/MITM in the exchange channel, cryptographically — a substituted key
+provably produces a mismatched code. It does **not** fully defeat a
+different threat sometimes bundled under "bot intervention": a fully
+automated client script driving the pairing UI itself, impersonating a
+human rather than attacking the channel. No purely software-side check
+can rule that out with certainty — the same fundamental limit any anti-
+automation measure (CAPTCHAs included) runs into once the attacker
+controls the software making the confirmation. The honest best mitigation
+there is UX friction (a deliberate, not-trivially-scriptable confirmation
+step) that raises the cost of automating the ceremony, not a guarantee of
+detecting it.
 
 ### 6.4 Path 2 — remote pairing via username + single-use code
 
@@ -829,13 +909,26 @@ visibility trade-off (§13.4) rather than inheriting this section silently.
 
 In scope:
 - Passive network eavesdropping.
+- **Ratchet state never leaves the client, as a hard invariant, not an
+  emergent property to be reverified each time a feature is added.**
+  `RatchetState` (`core/src/ratchet.rs`) is never serialized, never sent
+  over the wire, and never held by any server component — the Signaling &
+  Presence Service, the Recovery Store, and the future Group Coordination
+  Service (§13) all see, at most, opaque ciphertext (`Envelope::encode()`
+  bytes) and routing metadata, never root keys, chain keys, or message
+  keys. This must stay true of any future feature — a "sync my
+  conversations across devices" option (§14) or a server-assisted backup
+  (§7) included — without exception; a design that needs the server to
+  hold ratchet state to work is a design to reject, not a trade-off to
+  weigh.
 - A compromised or malicious Tier 1 relay, or a compromised signaling/
   directory service (§4) — neither ever sees plaintext, ratchet state, or
   long-term key material; the relay's ciphertext access is also
   time-bounded by its TTL (§4.2), not indefinite, and its ability to link
   mailbox writes to a specific device is reduced (not eliminated — see
-  §11.1) by deriving `mailbox_id` from ratchet state instead of using a
-  static per-device value.
+  §11.1) by using a per-pairing routing id, fixed at pairing time and never
+  tied to either party's long-term identity, instead of a static
+  per-device value.
 - A recipient being unable to prove message authorship to a third party
   even if they wanted to — the AEAD-based message authentication (§3.5)
   is deniable by design, the same property OTR pioneered; see §11.6.
@@ -939,9 +1032,11 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
    `MESSAGE_SCHEMA.md` §2 (padding needs an explicit length prefix to stay
    unambiguous).
 2. **v1 — desktop MVP**: Tauri app, 1:1 chat only, Tier 1 delivery
-   (ephemeral relay-assisted, §4.2, using ratchet-derived `mailbox_id`s per
-   §11.1, the fallback state machine and timeout/retry parameters from
-   §4.5, and `DeliveryAck`-driven outbox pruning from §4.6) as the default
+   (ephemeral relay-assisted, §4.2, addressed by a per-pairing session
+   routing id exchanged out-of-band at pairing time rather than derived
+   from evolving ratchet state — §11.1's corrected discussion, §6.3a — the
+   fallback state machine and timeout/retry parameters from §4.5, and
+   `DeliveryAck`-driven outbox pruning from §4.6) as the default
    with Tier 0 direct P2P attempted first when reachable, the Signaling &
    Presence Service (`SERVERS.md` §1, combined with the Tier 1 mailbox for
    v1 simplicity, prekey-fetch rate limiting and registration proof-of-work
@@ -964,7 +1059,11 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
    (§7 option b, §4.3), post-quantum hardening — hybrid handshake now,
    extended to the ratchet itself once that ships (§11.4), duress
    response — quick wipe and a separately-gated full identity wipe,
-   client-only, no protocol change (§11.9).
+   client-only, no protocol change (§11.9), and the extended in-person
+   pairing ceremony from §6.3a: QR-carried handshake material (removing
+   the directory server from the pairing path entirely) plus a mandatory
+   SAS liveness/anti-relay confirmation step before a contact can be
+   marked Verified.
 4. **Research track, not scheduled**: Tor/onion-routed transport (§11.2),
    key transparency for the directory (§11.7), federated (multi-operator)
    server-based deployments (§12.4), reducing multi-device fan-out
@@ -1061,6 +1160,72 @@ metadata (source IP, timing) can still let a relay operator correlate
 writes even without a stable id — this is a partial mitigation, not
 sealed-sender's full guarantee, and doesn't need Signal's server-issued
 certificate infrastructure to deliver most of the benefit.
+
+**A second gap, found while building the first reference client (`client/`)
+against this design, not caught during the original write-up:** "writing to
+a mailbox requires having done the X3DH handshake that produced the root
+key" is true for the *responder*, but the responder can only complete their
+side of that handshake once they've *received* the initiator's X3DH fields
+(`MESSAGE_SCHEMA.md` §3) — and those have to travel through some mailbox
+first. A brand-new conversation's very first message can't use the
+root-key-derived id described above, because that id doesn't exist on the
+responder's side yet. This is a genuine bootstrap circularity the design as
+written doesn't resolve, not a client bug.
+
+Adopted fix, deliberately minimal: the *first* message of a new
+conversation addresses a mailbox derived only from the recipient's public
+identity — `bootstrap_mailbox_id = SHA-256("dratchet-x3dh-bootstrap-v1" ‖
+recipient_identity_fingerprint)[:16]` (`core::x3dh::bootstrap_mailbox_id`)
+— computable by anyone who has fetched the recipient's prekey bundle
+(which any initiator has, by construction). Every message after that first
+one reverts to the fully unlinkable, root-key-derived id above. Stated
+plainly: this reintroduces a bounded version of the exact leak this
+section exists to prevent — a relay can observe "someone new wrote to this
+recipient" once per new relationship — but only once per *relationship*,
+never once per *message*, and the id itself never reveals *who* wrote it.
+This is the same shape of trade every protocol that supports cold-start
+contact makes somewhere (Signal's own initial-session establishment is
+addressed by a stable identifier too, before sealed-sender-style opaque
+routing takes over); DRAtchet's version is scoped to exactly the one
+message that needs it.
+
+**Correction, found immediately after writing the above while implementing
+the first reference client — the "adopted fix" two paragraphs up is not
+viable, not just incomplete:** `root_key` is never held identically by
+both sides at any observable moment, by construction. Double Ratchet's
+receiver-side step doesn't just derive a matching receiving chain for the
+message that just arrived — it *also* eagerly derives the receiver's own
+next sending chain, in the same atomic operation, before the receiver has
+sent anything. So the moment a message is decrypted, the receiver's
+`root_key` is already one derivation ahead of what the sender's was. There
+is no shared, simultaneously-held snapshot of "the current root key" for
+both sides to independently hash into an address — the formula at the top
+of this section assumes a synchronization point that doesn't exist. Worse,
+this isn't limited to a conversation's first message (which the bootstrap
+fix above does correctly handle): it recurs at *every* DH ratchet
+transition, which in ordinary back-and-forth chat is nearly every message,
+since a fresh ephemeral key each reply is the entire mechanism Double
+Ratchet uses for forward secrecy. A receiver fundamentally cannot
+precompute an address that depends on a peer's not-yet-received fresh key.
+
+**Adopted fix for v1, replacing the rotating scheme above entirely:**
+decouple mailbox routing from ratchet state altogether. §6.3a describes
+the mechanism — a session routing id, generated fresh at pairing time
+(QR exchange or, for v1, the equivalent out-of-band step) and exchanged
+before either side ever talks to the Signaling & Presence Service, with
+the actual Tier 1 `mailbox_id` computed as a `core::conversation_id`-style
+sorted hash of both sides' routing ids. Because it's fixed for the
+lifetime of the pairing rather than trying to rotate with the ratchet, both
+sides can always compute it, with no dependency on ratchet state or fresh
+keys — the exact property the formula above needed but couldn't deliver.
+The trade is being explicit about what's given up: the relay can observe
+that this pair of (unlinkable-to-real-identity) routing ids keeps
+exchanging messages for as long as the pairing exists, rather than the
+per-round unlinkability originally intended. `bootstrap_mailbox_id` above
+stays relevant for the directory-discovery path (§6.4), where no prior
+out-of-band exchange has happened; it's simply no longer needed for the
+QR-paired path, which never has a bootstrap problem to begin with since
+both routing ids are already mutually known before the first message.
 
 ### 11.2 Direct-P2P IP exposure between contacts — inspired by Briar (Tor-based P2P), SimpleX's private message routing, and Signal/WhatsApp's always-relayed model — **v1 (toggle), v2 (private routing), research (Tor transport)**
 
