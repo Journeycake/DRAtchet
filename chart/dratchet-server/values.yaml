@@ -99,6 +99,49 @@ affinity: {}
 ingress:
   enabled: false
   className: ""
+  # --- TLS / wss:// ---
+  # dratchetd itself speaks plain `ws://` only — it has no built-in TLS
+  # support, and isn't meant to (see server/README.md's "TLS / wss://"
+  # section). TLS termination belongs at this Ingress, the standard place
+  # for it in Kubernetes. Once the Ingress is serving HTTPS for a host, the
+  # WebSocket upgrade on that same connection automatically becomes
+  # `wss://` from the client's point of view — there is no separate "turn
+  # on wss" switch beyond configuring TLS below. Traffic from the Ingress
+  # to the pod stays plain `ws://` inside the cluster network, which is the
+  # normal, expected pattern (that hop never crosses the internet).
+  #
+  # Leaving `tls: []` while `enabled: true` is valid but means the
+  # endpoint(s) below are served as plain, unencrypted `ws://` externally —
+  # the rendered NOTES.txt calls this out explicitly after `helm install`
+  # so it's never a silent gap.
+  #
+  # Two ways to populate `tls:`:
+  #
+  # 1. cert-manager (recommended if your cluster has it installed) — point
+  #    it at an issuer via annotation, and it creates/renews the Secret
+  #    named below for you automatically:
+  #
+  #      annotations:
+  #        cert-manager.io/cluster-issuer: letsencrypt-prod
+  #      tls:
+  #        - hosts: ["dratchet.example.com"]
+  #          secretName: dratchet-tls
+  #
+  # 2. A TLS Secret you already have (manually issued, or from another
+  #    process) — just reference it, no annotation needed:
+  #
+  #      kubectl create secret tls dratchet-tls --cert=fullchain.pem --key=privkey.pem
+  #
+  #      tls:
+  #        - hosts: ["dratchet.example.com"]
+  #          secretName: dratchet-tls
+  #
+  # Note this chart's scope: exposing a plain Service directly (NodePort or
+  # a cloud LoadBalancer, `ingress.enabled: false`) has no TLS story of its
+  # own — `wss://` in that case would need a TLS-terminating layer of your
+  # own in front (a cloud LB with TLS termination, a sidecar proxy, etc.),
+  # which this chart doesn't set up. The Ingress path above is the
+  # supported way to get `wss://`.
   annotations: {}
   hosts:
     - host: dratchet.example.com

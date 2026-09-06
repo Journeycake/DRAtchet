@@ -116,8 +116,18 @@ jobs:
             --set serviceAccount.name=existing-sa \
             > /tmp/rendered-full.yaml
 
+      - name: helm template (ingress with TLS)
+        run: |
+          helm template test chart/dratchet-server \
+            --set ingress.enabled=true \
+            --set ingress.tls[0].secretName=dratchet-tls \
+            --set ingress.tls[0].hosts[0]=dratchet.example.com \
+            > /tmp/rendered-tls.yaml
+          grep -q 'secretName: dratchet-tls' /tmp/rendered-tls.yaml
+
       - name: Validate rendered manifests against the Kubernetes API schema
         run: |
           go install github.com/yannh/kubeconform/cmd/kubeconform@latest
           "$(go env GOPATH)/bin/kubeconform" -summary -strict /tmp/rendered-default.yaml
           "$(go env GOPATH)/bin/kubeconform" -summary -strict /tmp/rendered-full.yaml
+          "$(go env GOPATH)/bin/kubeconform" -summary -strict /tmp/rendered-tls.yaml

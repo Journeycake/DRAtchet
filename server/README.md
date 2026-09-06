@@ -248,9 +248,64 @@ helm test dratchet
 | `probes.liveness` / `probes.readiness` | both hit `/healthz` | Identical by design — there's no dependency (database, external call) for readiness to check that liveness doesn't already cover. |
 | `terminationGracePeriodSeconds` | `30` | Time given to `SIGTERM`-triggered graceful shutdown (see above) to let in-flight WebSocket connections wind down before a forced kill. |
 | `ingress.enabled` | `false` | See the WebSocket-upgrade note in `templates/ingress.yaml` if you enable it — your ingress controller needs WebSocket support and long-enough proxy timeouts for a persistent connection. |
+| `ingress.tls` | `[]` | See [TLS / wss://](#tls--wss) directly below — required to get `wss://` instead of plain `ws://` externally. |
 | `podDisruptionBudget.enabled` | `false` | Off by default since it's only meaningful once you've deliberately decided to run more than one replica. |
 
 Full reference: [`chart/dratchet-server/values.yaml`](../chart/dratchet-server/values.yaml).
+
+### TLS / wss://
+
+`dratchetd` itself speaks plain `ws://` only — it has no built-in TLS
+support, by design: TLS termination belongs at the Ingress, the standard
+place for it in Kubernetes, not duplicated into every application. Once
+the Ingress serves HTTPS for a host, the WebSocket upgrade on that same
+connection automatically becomes `wss://` from the client's point of
+view — there's no separate "turn on wss" toggle beyond configuring TLS on
+the Ingress. The hop from the Ingress to the pod stays plain `ws://` inside
+the cluster network, which is expected (that hop never crosses the
+internet).
+
+Two ways to populate `ingress.tls` (see the fuller comment in
+[`values.yaml`](../chart/dratchet-server/values.yaml) for the exact
+shape):
+
+- **cert-manager** (recommended if your cluster has it) — add its issuer
+  annotation to `ingress.annotations` and reference the Secret name it'll
+  create in `ingress.tls`; cert-manager issues and renews the certificate
+  for you.
+- **A TLS Secret you already have** — `kubectl create secret tls ...`,
+  then reference that `secretName` in `ingress.tls` directly. No
+  annotation needed.
+
+Leaving `ingress.tls: []` while `ingress.enabled: true` is valid — the
+chart doesn't require TLS — but it means the endpoint is served as plain,
+unencrypted `ws://` externally. The chart surfaces this explicitly rather
+than silently: `helm install`'s printed `NOTES.txt` lists the actual
+`ws://`/`wss://` URL(s) it computed per host based on `ingress.tls`, and
+calls out in bold when none of them are covered by TLS.
+
+**Scope this chart doesn't cover**: exposing a plain `Service` directly
+(`NodePort` or a cloud `LoadBalancer`, with `ingress.enabled: false`) has
+no TLS story of its own in this chart — that's exactly the posture
+[`docs/DEPLOY_RKE2.md`](../docs/DEPLOY_RKE2.md)'s test-cluster runbook
+uses (`NodePort`, for a quick smoke test), and it is **not** meant to be
+carried into a real deployment for that reason. Getting `wss://` on that
+path would need a TLS-terminating layer of your own in front (a cloud
+load balancer with TLS termination, a sidecar, etc.) — use the Ingress
+path above instead if you need `wss://`.
+
+Verifying it once deployed:
+
+```sh
+# From any machine that can resolve/reach the ingress host:
+curl -v https://dratchet.example.com/healthz          # confirms the cert
+openssl s_client -connect dratchet.example.com:443 -alpn http/1.1 </dev/null
+
+# A WebSocket-aware client, if you have one installed (e.g. `websocat` or
+# `wscat`) is the real end-to-end check, since curl doesn't speak the
+# WebSocket upgrade itself:
+websocat wss://dratchet.example.com/v1/ws
+```
 
 ### Validating the chart
 

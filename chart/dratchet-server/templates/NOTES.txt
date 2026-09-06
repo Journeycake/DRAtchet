@@ -11,6 +11,30 @@ outside the cluster, either enable the chart's Ingress (--set ingress.enabled=tr
 and configure ingress.hosts), or port-forward for local testing:
 
   kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "dratchet-server.fullname" . }} 8787:{{ .Values.service.port }}
+{{- else }}
+
+External WebSocket endpoint(s):
+{{- $tlsHosts := list }}
+{{- range .Values.ingress.tls }}
+{{- range .hosts }}
+{{- $tlsHosts = append $tlsHosts . }}
+{{- end }}
+{{- end }}
+{{- range .Values.ingress.hosts }}
+{{- $scheme := "ws" }}
+{{- if has .host $tlsHosts }}
+{{- $scheme = "wss" }}
+{{- end }}
+  {{ $scheme }}://{{ .host }}/v1/ws
+{{- end }}
+{{- if not $tlsHosts }}
+
+*** No TLS configured on this Ingress (ingress.tls is empty) ***
+The endpoint(s) above are plain, unencrypted ws:// as seen from outside the
+cluster. See values.yaml's ingress.tls comment (or server/README.md's
+"TLS / wss://" section) for how to add it — typically a couple of lines if
+your cluster already has cert-manager installed.
+{{- end }}
 {{- end }}
 
 {{- if gt (.Values.replicaCount | int) 1 }}
