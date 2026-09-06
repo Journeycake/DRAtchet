@@ -195,6 +195,13 @@ above, an optional `Ingress` (disabled by default), an optional
 `PodDisruptionBudget` (disabled by default), and a `helm test` hook that
 curls `/healthz` from inside the cluster.
 
+For a copy-paste-able, step-by-step walkthrough of deploying this to an
+actual test RKE2 cluster (build → ship the image → install → verify →
+tear down), including a companion script that automates all of it, see
+[`docs/DEPLOY_RKE2.md`](../docs/DEPLOY_RKE2.md). The rest of this section
+covers the chart's configuration surface in general — not tied to any one
+cluster.
+
 ### Before you deploy: this service does not horizontally scale by default
 
 **Read `values.yaml`'s `replicaCount` comment before setting it above `1`.**

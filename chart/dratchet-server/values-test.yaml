@@ -1,0 +1,40 @@
+# Overlay for a throwaway test-cluster deploy (docs/DEPLOY_RKE2.md) — not a
+# production posture. Layer over values.yaml with:
+#
+#   helm install dratchet chart/dratchet-server -f chart/dratchet-server/values-test.yaml \
+#     --set image.repository=<...> --set image.tag=<...>
+#
+# What this changes vs. values.yaml's defaults, and why:
+#
+# - service.type: NodePort — a bare test RKE2 cluster may not have its
+#   default ingress controller (rke2-ingress-nginx) enabled, or you may not
+#   want to bother wiring up a hostname/DNS just to confirm the service
+#   comes up. NodePort gets you a reachable port on every node with zero
+#   extra setup. Not something to carry into a real deployment (ingress or
+#   a LoadBalancer Service is the normal path there).
+# - config.logLevel: debug — you're actively watching this deploy; more
+#   log output is a feature during a smoke test, not during steady-state
+#   operation.
+# - resources: trimmed further — a test cluster is often resource-
+#   constrained (e.g. a handful of small VMs), and this service is light
+#   enough that the values.yaml defaults are already conservative; this
+#   overlay just gives a bit more headroom on a small node.
+
+service:
+  type: NodePort
+
+config:
+  logLevel: "debug"
+
+resources:
+  requests:
+    cpu: 20m
+    memory: 24Mi
+  limits:
+    cpu: 250m
+    memory: 128Mi
+
+# A single-pod smoke test has no meaningful "unavailable during rollout"
+# window to protect, and a short grace period gets a stuck test deploy out
+# of the way faster than the chart's production default (30s).
+terminationGracePeriodSeconds: 5
