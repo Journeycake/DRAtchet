@@ -13,6 +13,7 @@ use chacha20poly1305::{ChaCha20Poly1305, Key as AeadKey, Nonce};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use rand_core::OsRng;
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
@@ -351,6 +352,182 @@ impl RatchetState {
     #[cfg(test)]
     pub fn skipped_key_count(&self) -> usize {
         self.skipped.len()
+    }
+
+    /// Serialize this ratchet's full live state to bytes — CBOR-encoded,
+    /// covering every field (root key, both chain keys, the DH keypair, and
+    /// the skipped-message-key cache). **Not an at-rest-safe format on its
+    /// own**: this is exactly the key material forward secrecy protects, so
+    /// a caller persisting these bytes (`store/`'s local database) must
+    /// encrypt them first and never write them anywhere unencrypted.
+    pub fn export(&self) -> Vec<u8> {
+        let exported = ExportedRatchetState::from(self);
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&exported, &mut bytes)
+            .expect("CBOR encoding of a well-formed struct cannot fail");
+        bytes
+    }
+
+    /// The inverse of [`RatchetState::export`] — reconstructs a ratchet
+    /// exactly as it was at export time, ready to keep sending/receiving
+    /// immediately, including its skipped-message-key cache (so a message
+    /// that arrives late after a restart still decrypts).
+    pub fn import(bytes: &[u8]) -> Result<Self> {
+        let exported: ExportedRatchetState = ciborium::from_reader(bytes)
+            .map_err(|_| Error::MalformedExportedState("not valid CBOR for this shape"))?;
+        exported.try_into()
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct ExportedSkippedEntry {
+    #[serde(with = "serde_bytes")]
+    dh_pub: Vec<u8>,
+    n: u32,
+    #[serde(with = "serde_bytes")]
+    key: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ExportedSkippedOrderEntry {
+    #[serde(with = "serde_bytes")]
+    dh_pub: Vec<u8>,
+    n: u32,
+}
+
+/// Every field of [`RatchetState`], as plain bytes — the shape
+/// [`RatchetState::export`]/[`RatchetState::import`] (de)serialize. Private:
+/// nothing outside this module constructs one directly.
+#[derive(Serialize, Deserialize)]
+struct ExportedRatchetState {
+    #[serde(with = "serde_bytes")]
+    conversation_id: Vec<u8>,
+    max_skip: u32,
+    #[serde(with = "serde_bytes")]
+    root_key: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    dh_self_secret: Option<Vec<u8>>,
+    #[serde(with = "serde_bytes")]
+    dh_self_public: Option<Vec<u8>>,
+    #[serde(with = "serde_bytes")]
+    dh_remote: Option<Vec<u8>>,
+    #[serde(with = "serde_bytes")]
+    sending_chain_key: Option<Vec<u8>>,
+    #[serde(with = "serde_bytes")]
+    receiving_chain_key: Option<Vec<u8>>,
+    send_n: u32,
+    recv_n: u32,
+    prev_chain_len: u32,
+    skipped: Vec<ExportedSkippedEntry>,
+    skipped_order: Vec<ExportedSkippedOrderEntry>,
+}
+
+impl From<&RatchetState> for ExportedRatchetState {
+    fn from(r: &RatchetState) -> Self {
+        ExportedRatchetState {
+            conversation_id: r.conversation_id.to_vec(),
+            max_skip: r.max_skip,
+            root_key: r.root_key.to_vec(),
+            dh_self_secret: r.dh_self.as_ref().map(|(s, _)| s.to_bytes().to_vec()),
+            dh_self_public: r.dh_self.as_ref().map(|(_, p)| p.as_bytes().to_vec()),
+            dh_remote: r.dh_remote.map(|p| p.as_bytes().to_vec()),
+            sending_chain_key: r.sending_chain_key.as_ref().map(|k| k.to_vec()),
+            receiving_chain_key: r.receiving_chain_key.as_ref().map(|k| k.to_vec()),
+            send_n: r.send_n,
+            recv_n: r.recv_n,
+            prev_chain_len: r.prev_chain_len,
+            skipped: r
+                .skipped
+                .iter()
+                .map(|((dh, n), k)| ExportedSkippedEntry {
+                    dh_pub: dh.0.to_vec(),
+                    n: *n,
+                    key: k.to_vec(),
+                })
+                .collect(),
+            skipped_order: r
+                .skipped_order
+                .iter()
+                .map(|(dh, n)| ExportedSkippedOrderEntry {
+                    dh_pub: dh.0.to_vec(),
+                    n: *n,
+                })
+                .collect(),
+        }
+    }
+}
+
+fn to_array32(v: Vec<u8>, what: &'static str) -> Result<[u8; 32]> {
+    v.try_into()
+        .map_err(|_| Error::MalformedExportedState(what))
+}
+
+impl TryFrom<ExportedRatchetState> for RatchetState {
+    type Error = Error;
+
+    fn try_from(e: ExportedRatchetState) -> Result<Self> {
+        let conversation_id: [u8; 16] = e
+            .conversation_id
+            .try_into()
+            .map_err(|_| Error::MalformedExportedState("conversation_id"))?;
+
+        let dh_self = match (e.dh_self_secret, e.dh_self_public) {
+            (Some(s), Some(p)) => Some((
+                StaticSecret::from(to_array32(s, "dh_self_secret")?),
+                PublicKey::from(to_array32(p, "dh_self_public")?),
+            )),
+            (None, None) => None,
+            _ => {
+                return Err(Error::MalformedExportedState(
+                    "dh_self must be fully present or fully absent",
+                ))
+            }
+        };
+
+        let skipped = e
+            .skipped
+            .into_iter()
+            .map(|entry| -> Result<SkippedEntry> {
+                let dh_pub = DhPubBytes(to_array32(entry.dh_pub, "skipped[].dh_pub")?);
+                let key = Zeroizing::new(to_array32(entry.key, "skipped[].key")?);
+                Ok(((dh_pub, entry.n), key))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+
+        let skipped_order = e
+            .skipped_order
+            .into_iter()
+            .map(|entry| -> Result<(DhPubBytes, u32)> {
+                Ok((
+                    DhPubBytes(to_array32(entry.dh_pub, "skipped_order[].dh_pub")?),
+                    entry.n,
+                ))
+            })
+            .collect::<Result<VecDeque<_>>>()?;
+
+        Ok(RatchetState {
+            conversation_id,
+            max_skip: e.max_skip,
+            root_key: Zeroizing::new(to_array32(e.root_key, "root_key")?),
+            dh_self,
+            dh_remote: e
+                .dh_remote
+                .map(|p| to_array32(p, "dh_remote").map(PublicKey::from))
+                .transpose()?,
+            sending_chain_key: e
+                .sending_chain_key
+                .map(|k| to_array32(k, "sending_chain_key").map(Zeroizing::new))
+                .transpose()?,
+            receiving_chain_key: e
+                .receiving_chain_key
+                .map(|k| to_array32(k, "receiving_chain_key").map(Zeroizing::new))
+                .transpose()?,
+            send_n: e.send_n,
+            recv_n: e.recv_n,
+            prev_chain_len: e.prev_chain_len,
+            skipped,
+            skipped_order,
+        })
     }
 }
 
@@ -1052,6 +1229,116 @@ mod tests {
             attacker.decrypt_raw(&msg3).is_err(),
             "leaked state decrypted a message sent after the session had healed — \
              post-compromise security violated"
+        );
+    }
+
+    /// `export`/`import` (Phase 1.5.1 — local storage needs a ratchet to
+    /// survive an app restart) must round-trip a ratchet well enough to
+    /// keep chatting in both directions afterward, not just decode without
+    /// erroring.
+    #[test]
+    fn export_then_import_can_still_send_and_receive_in_both_directions() {
+        let (mut alice, mut bob) = matched_pair();
+
+        // Some real history before the "restart", so more than just a
+        // freshly-initialized ratchet gets exercised.
+        let a0 = alice.encrypt(&chat("before restart, from alice")).unwrap();
+        assert_eq!(
+            read_chat(&bob.decrypt_raw(&a0).unwrap()),
+            "before restart, from alice"
+        );
+        let b0 = bob.encrypt(&chat("before restart, from bob")).unwrap();
+        assert_eq!(
+            read_chat(&alice.decrypt_raw(&b0).unwrap()),
+            "before restart, from bob"
+        );
+
+        let alice_bytes = alice.export();
+        let bob_bytes = bob.export();
+        let mut alice = RatchetState::import(&alice_bytes).unwrap();
+        let mut bob = RatchetState::import(&bob_bytes).unwrap();
+
+        let a1 = alice.encrypt(&chat("after restart, from alice")).unwrap();
+        assert_eq!(
+            read_chat(&bob.decrypt_raw(&a1).unwrap()),
+            "after restart, from alice"
+        );
+        let b1 = bob.encrypt(&chat("after restart, from bob")).unwrap();
+        assert_eq!(
+            read_chat(&alice.decrypt_raw(&b1).unwrap()),
+            "after restart, from bob"
+        );
+
+        // And several more turns past that, to prove the reconstructed
+        // ratchet keeps advancing correctly, not just working once.
+        for round in 0..5 {
+            let from_alice = alice.encrypt(&chat(&format!("a{round}"))).unwrap();
+            assert_eq!(
+                read_chat(&bob.decrypt_raw(&from_alice).unwrap()),
+                format!("a{round}")
+            );
+            let from_bob = bob.encrypt(&chat(&format!("b{round}"))).unwrap();
+            assert_eq!(
+                read_chat(&alice.decrypt_raw(&from_bob).unwrap()),
+                format!("b{round}")
+            );
+        }
+    }
+
+    /// A message skipped-over before the "restart" (queued in the
+    /// skipped-key cache, per `tests/queue_depth.rs`) must still decrypt
+    /// after an export/import cycle — the cache itself has to round-trip,
+    /// not just the chain keys.
+    #[test]
+    fn a_skipped_message_key_survives_export_and_import_then_still_decrypts() {
+        let (mut alice, mut bob) = matched_pair();
+
+        let stray = alice.encrypt(&chat("delivered very late")).unwrap();
+        let delivered = alice.encrypt(&chat("delivered on time")).unwrap();
+        assert_eq!(
+            read_chat(&bob.decrypt_raw(&delivered).unwrap()),
+            "delivered on time"
+        );
+        assert_eq!(
+            bob.skipped_key_count(),
+            1,
+            "the skipped stray key should be cached"
+        );
+
+        let bob_bytes = bob.export();
+        let mut bob = RatchetState::import(&bob_bytes).unwrap();
+        assert_eq!(
+            bob.skipped_key_count(),
+            1,
+            "the skipped-key cache must survive the export/import round trip"
+        );
+
+        assert_eq!(
+            read_chat(&bob.decrypt_raw(&stray).unwrap()),
+            "delivered very late",
+            "a late arrival must still decrypt after a simulated restart"
+        );
+    }
+
+    /// The exported bytes must actually carry the real key material, not a
+    /// stub — a spot check against the live, pre-export values, so a future
+    /// change that accidentally exports garbage (a bug that would otherwise
+    /// only show up as import() failing, or worse, silently reconstructing
+    /// a *different* working-but-wrong ratchet) gets caught here directly.
+    #[test]
+    fn exported_bytes_contain_the_same_key_material_as_the_live_state() {
+        let (alice, _bob) = matched_pair();
+        let exported: ExportedRatchetState = ciborium::from_reader(alice.export().as_slice())
+            .expect("export() must produce what it claims to");
+
+        assert_eq!(exported.root_key, alice.root_key.to_vec());
+        assert_eq!(
+            exported.sending_chain_key,
+            alice.sending_chain_key.as_ref().map(|k| k.to_vec())
+        );
+        assert_eq!(
+            exported.dh_self_secret,
+            alice.dh_self.as_ref().map(|(s, _)| s.to_bytes().to_vec())
         );
     }
 }

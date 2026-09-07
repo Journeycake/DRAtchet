@@ -443,11 +443,14 @@ name = "dratchet-core"
 version = "0.1.0"
 dependencies = [
  "chacha20poly1305",
+ "ciborium",
  "ed25519-dalek",
  "hkdf",
  "hmac",
  "proptest",
  "rand_core 0.6.4",
+ "serde",
+ "serde_bytes",
  "sha2",
  "thiserror",
  "x25519-dalek",

@@ -25,6 +25,9 @@ pub enum Error {
 
     #[error("payload is malformed: {0}")]
     MalformedPayload(&'static str),
+
+    #[error("exported ratchet state is malformed: {0}")]
+    MalformedExportedState(&'static str),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
