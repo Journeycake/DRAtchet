@@ -18,19 +18,29 @@ WORKDIR /build
 RUN apk add --no-cache musl-dev
 
 # --- Dependency layer: cached as long as Cargo.toml/Cargo.lock don't change ---
+# Every workspace member's Cargo.toml has to be present for cargo to resolve
+# the workspace at all, even though this image only ever builds
+# dratchet-server — client/ isn't in dratchet-server's own dependency graph,
+# but its manifest still has to exist here (see client/Cargo.toml below).
 COPY Cargo.toml Cargo.lock ./
 COPY core/Cargo.toml core/Cargo.toml
 COPY server/Cargo.toml server/Cargo.toml
-RUN mkdir -p core/src server/src \
+COPY client/Cargo.toml client/Cargo.toml
+RUN mkdir -p core/src server/src client/src \
     && echo "fn main() {}" > server/src/main.rs \
-    && touch core/src/lib.rs server/src/lib.rs \
+    && echo "fn main() {}" > client/src/main.rs \
+    && touch core/src/lib.rs server/src/lib.rs client/src/lib.rs \
     && cargo build --release -p dratchet-server \
-    && rm -rf core/src server/src
+    && rm -rf core/src server/src client/src
 
 # --- Application layer: only re-compiles dratchet-core/dratchet-server themselves ---
 COPY core core
 COPY server server
-RUN touch core/src/lib.rs server/src/lib.rs server/src/main.rs \
+COPY client/Cargo.toml client/Cargo.toml
+RUN mkdir -p client/src \
+    && echo "fn main() {}" > client/src/main.rs \
+    && touch client/src/lib.rs \
+    && touch core/src/lib.rs server/src/lib.rs server/src/main.rs \
     && cargo build --release -p dratchet-server \
     && cp target/release/dratchetd /build/dratchetd
 
