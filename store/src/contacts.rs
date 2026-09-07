@@ -38,6 +38,12 @@ pub struct Contact {
     #[serde(with = "serde_bytes")]
     pub mailbox_id: Vec<u8>,
     pub created_at: u64,
+    /// Disappearing-message timer for this conversation, per §11.5: `None`
+    /// (the default) keeps messages until manually deleted; `Some(secs)`
+    /// makes every *new* message eligible for `Db::sweep_expired_messages`
+    /// `secs` seconds after it's saved. Changing this only affects
+    /// messages saved from then on — never retroactive.
+    pub disappearing_timer_secs: Option<u64>,
 }
 
 fn contact_key(fingerprint: &[u8]) -> String {
@@ -101,6 +107,7 @@ mod tests {
             verification_state: VerificationState::Pending,
             mailbox_id: vec![0xAB; 16],
             created_at: 1_700_000_000,
+            disappearing_timer_secs: None,
         }
     }
 
