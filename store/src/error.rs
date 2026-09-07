@@ -35,6 +35,13 @@ pub enum Error {
     #[error("stored record failed to decrypt (corrupted or tampered)")]
     DecryptionFailed,
 
+    /// §6.5's mandatory-verification gate: chat content cannot be sent to
+    /// or released from a contact that isn't `Verified` yet. Distinct from
+    /// `DecryptionFailed` — the ratchet decrypt itself succeeded; this is a
+    /// policy refusal, not a cryptographic one.
+    #[error("contact is not verified — chat content is blocked until §6.2's mandatory gate is satisfied")]
+    NotVerified,
+
     #[error(transparent)]
     Core(#[from] dratchet_core::error::Error),
 }

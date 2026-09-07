@@ -10,9 +10,11 @@ pub mod error;
 
 mod contacts;
 mod db;
+mod gate;
 mod messages;
 
 pub use contacts::{Contact, VerificationState};
 pub use db::Db;
 pub use error::{Error, Result};
+pub use gate::{decrypt_gated, encrypt_gated};
 pub use messages::Message;
