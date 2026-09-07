@@ -116,10 +116,19 @@ async fn chat_loop(
                 if line.is_empty() {
                     continue;
                 }
-                send_message(conn, &mut ratchet, &mailbox_id, &line).await?;
+                // A single failed send (e.g. the responder side trying to
+                // send before it's received anything — the ratchet has no
+                // sending chain yet until then, standard Double Ratchet
+                // behavior, see client/README.md) must not take down the
+                // whole session: report it and keep chatting.
+                if let Err(e) = send_message(conn, &mut ratchet, &mailbox_id, &line).await {
+                    eprintln!("(could not send: {e})");
+                }
             }
             _ = poll.tick() => {
-                receive_pending(conn, &mut ratchet, &mailbox_id).await?;
+                if let Err(e) = receive_pending(conn, &mut ratchet, &mailbox_id).await {
+                    eprintln!("(could not check for messages: {e})");
+                }
             }
         }
     }

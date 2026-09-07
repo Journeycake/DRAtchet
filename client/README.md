@@ -60,9 +60,14 @@ placeholder — only the QR rendering/scanning step itself is stubbed out.
    Choose **scan**, then paste in the blob client A printed. Client B
    prints a `PairingResponse` blob back.
 4. Paste client B's response blob into client A's terminal.
-5. Both sides are now paired and share a mailbox id. Type a line and press
-   Enter in either terminal to send it; each side polls for new messages
-   every couple of seconds.
+5. Both sides are now paired and share a mailbox id. **Client B (the one
+   that chose "scan") must send the first message** — standard Double
+   Ratchet behavior: the responder side has no sending chain until it's
+   received and ratcheted forward on the initiator's first message.
+   Client B sending first is a protocol requirement here, not a client
+   limitation; after that, either side can send in any order. Type a line
+   and press Enter in either terminal to send it; each side polls for new
+   messages every couple of seconds.
 6. `/quit` to exit either side.
 
 By default both point at `ws://127.0.0.1:8787/v1/ws`; pass `--server
