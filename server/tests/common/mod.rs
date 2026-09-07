@@ -16,7 +16,12 @@ pub type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Bind the real service to an OS-assigned port and serve it in the
 /// background for the duration of the test process. Returns the base
-/// `ws://` URL for the WebSocket endpoint.
+/// `ws://` URL for the WebSocket endpoint. Unused by `breach.rs`, which
+/// needs the `AppState` handle this discards and so defines its own
+/// `spawn_server_with_state()` instead — each test binary compiles this
+/// module separately, so it shows as unused dead code from that binary's
+/// point of view (see `send_raw`'s doc above for the same situation).
+#[allow(dead_code)]
 pub async fn spawn_server() -> String {
     let (router, _state) = dratchet_server::app();
     let listener = TcpListener::bind("127.0.0.1:0")
