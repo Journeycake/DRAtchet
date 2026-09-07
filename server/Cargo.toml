@@ -9,6 +9,16 @@ license = "GPL-3.0-only"
 name = "dratchetd"
 path = "src/main.rs"
 
+# The interactive deploy-time config wizard — a separate binary, not a
+# subcommand of `dratchetd` itself, and gated behind the `wizard` feature
+# (off by default) so `cargo build --bin dratchetd` never compiles its
+# dependencies into the binary the Dockerfile actually ships. See
+# `src/wizard.rs`'s module doc.
+[[bin]]
+name = "dratchetd-config-wizard"
+path = "src/bin/config_wizard.rs"
+required-features = ["wizard"]
+
 [dependencies]
 dratchet-core = { path = "../core" }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
@@ -24,6 +34,17 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
+# Only pulled in by the `wizard` feature (interactive prompts, and the
+# `--non-interactive` JSON escape hatch used by tests/CI) — see
+# `src/wizard.rs`. `dialoguer`'s only non-pure-Rust-crypto/storage
+# dependency is `console` for terminal control (libc/winapi), the same
+# category of thing `tokio` already pulls in, not the OpenSSL/SQLCipher-
+# style native dependency this workspace has otherwise avoided.
+dialoguer = { version = "0.11", optional = true }
+serde_json = { version = "1", optional = true }
+
+[features]
+wizard = ["dep:dialoguer", "dep:serde_json"]
 
 [dev-dependencies]
 tokio-tungstenite = "0.21"

@@ -139,6 +139,12 @@ not shared between replicas — multiple replicas behind one Service means
 independent, inconsistent copies of that state, not a scaled-out view of
 one.
 
+For a real (non-test-node) deployment, rather than hand-writing a values
+override, `cargo run --features wizard --bin dratchetd-config-wizard` walks
+through the same fields interactively (image, replicas, resources,
+ingress/TLS) and writes a ready `-f <file>` for the `helm upgrade` command
+above — see `server/README.md`'s "Generating a starting values override".
+
 ## Step 4 — Verify it's actually up
 
 ```sh

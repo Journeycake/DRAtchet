@@ -8,6 +8,8 @@ pub mod abuse;
 pub mod error;
 pub mod protocol;
 pub mod state;
+#[cfg(feature = "wizard")]
+pub mod wizard;
 pub mod ws;
 
 use std::sync::Arc;

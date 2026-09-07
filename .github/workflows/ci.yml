@@ -41,6 +41,11 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      - name: Clippy & test dratchetd-config-wizard (feature = "wizard", off by default)
+        run: |
+          cargo clippy -p dratchet-server --all-targets --features wizard -- -D warnings
+          cargo test -p dratchet-server --features wizard
+
   fuzz-smoke:
     name: fuzz smoke test (decode_envelope, unpad_payload)
     runs-on: ubuntu-latest
@@ -125,9 +130,76 @@ jobs:
             > /tmp/rendered-tls.yaml
           grep -q 'secretName: dratchet-tls' /tmp/rendered-tls.yaml
 
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build dratchetd-config-wizard
+        run: cargo build --release --features wizard --bin dratchetd-config-wizard -p dratchet-server
+
+      - name: Generate values overrides with the wizard, then helm template each
+        run: |
+          WIZARD=target/release/dratchetd-config-wizard
+
+          cat > /tmp/wizard-answers-default.json <<'EOF'
+          {
+            "service_port": 8787,
+            "log_level": "info",
+            "image_repository": "dratchet-server",
+            "image_tag": "latest",
+            "replica_count": 1,
+            "resource_tier": "Dev",
+            "ingress": null,
+            "pod_disruption_budget": false
+          }
+          EOF
+
+          cat > /tmp/wizard-answers-full.json <<'EOF'
+          {
+            "service_port": 8787,
+            "log_level": "info",
+            "image_repository": "registry.example.com/dratchet-server",
+            "image_tag": "v1.0.0",
+            "replica_count": 3,
+            "resource_tier": "SmallProd",
+            "ingress": {
+              "host": "dratchet.example.com",
+              "tls": {
+                "CertManager": {
+                  "cluster_issuer": "letsencrypt-prod",
+                  "secret_name": "dratchet-tls"
+                }
+              }
+            },
+            "pod_disruption_budget": true
+          }
+          EOF
+
+          "$WIZARD" --non-interactive /tmp/wizard-answers-default.json -o /tmp/wizard-values-default.yaml
+          "$WIZARD" --non-interactive /tmp/wizard-answers-full.json -o /tmp/wizard-values-full.yaml
+
+          helm template test chart/dratchet-server -f /tmp/wizard-values-default.yaml \
+            > /tmp/rendered-wizard-default.yaml
+
+          helm template test chart/dratchet-server -f /tmp/wizard-values-full.yaml \
+            > /tmp/rendered-wizard-full.yaml
+          grep -q 'replicas: 3' /tmp/rendered-wizard-full.yaml
+          grep -q 'secretName: dratchet-tls' /tmp/rendered-wizard-full.yaml
+          grep -q 'cert-manager.io/cluster-issuer: letsencrypt-prod' /tmp/rendered-wizard-full.yaml
+
       - name: Validate rendered manifests against the Kubernetes API schema
         run: |
           go install github.com/yannh/kubeconform/cmd/kubeconform@latest
           "$(go env GOPATH)/bin/kubeconform" -summary -strict /tmp/rendered-default.yaml
           "$(go env GOPATH)/bin/kubeconform" -summary -strict /tmp/rendered-full.yaml
           "$(go env GOPATH)/bin/kubeconform" -summary -strict /tmp/rendered-tls.yaml
+          "$(go env GOPATH)/bin/kubeconform" -summary -strict /tmp/rendered-wizard-default.yaml
+          "$(go env GOPATH)/bin/kubeconform" -summary -strict /tmp/rendered-wizard-full.yaml

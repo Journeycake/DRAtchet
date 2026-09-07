@@ -253,6 +253,23 @@ helm test dratchet
 
 Full reference: [`chart/dratchet-server/values.yaml`](../chart/dratchet-server/values.yaml).
 
+**Generating a starting values override**: rather than hand-editing
+`values.yaml`, an interactive wizard can walk you through the table above
+and write a ready `-f`-able override file:
+
+```sh
+cargo run --features wizard --bin dratchetd-config-wizard
+# Wrote dratchet-values.generated.yaml
+helm upgrade --install dratchet chart/dratchet-server -f dratchet-values.generated.yaml
+```
+
+It's a separate, optional binary (`feature = "wizard"`, off by default) —
+building the regular `dratchetd` service binary never pulls in its
+dependencies. It only covers this deploy-time surface; like everything
+else in this section, a change to the generated file still requires a
+`helm upgrade` + pod restart to take effect (see the Configuration section
+above — `dratchetd` itself has no runtime config reload).
+
 ### TLS / wss://
 
 `dratchetd` itself speaks plain `ws://` only — it has no built-in TLS
