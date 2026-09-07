@@ -12,9 +12,11 @@ mod contacts;
 mod db;
 mod gate;
 mod messages;
+mod routing;
 
 pub use contacts::{Contact, VerificationState};
 pub use db::Db;
 pub use error::{Error, Result};
 pub use gate::{decrypt_gated, encrypt_gated};
 pub use messages::Message;
+pub use routing::compute_mailbox_id;

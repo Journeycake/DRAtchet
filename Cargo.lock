@@ -505,15 +505,20 @@ name = "dratchet-store"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "axum",
  "chacha20poly1305",
  "ciborium",
  "dratchet-core",
+ "dratchet-server",
+ "futures-util",
  "rand_core 0.6.4",
  "redb",
  "serde",
  "serde_bytes",
  "tempfile",
  "thiserror",
+ "tokio",
+ "tokio-tungstenite 0.21.0",
  "x25519-dalek",
  "zeroize",
 ]

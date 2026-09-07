@@ -6,11 +6,21 @@
 //! short chat message of similar length pad to the same bucket and aren't
 //! distinguishable by size alone.
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::{Error, Result};
 
 pub const PAYLOAD_CHAT: u8 = 0;
 pub const PAYLOAD_DELIVERY_ACK: u8 = 1;
 pub const PAYLOAD_RECOVERY_PROFILE_ANNOUNCE: u8 = 2;
+/// `docs/ARCHITECTURE.md` §11.1's final adopted mailbox-addressing fix,
+/// Phase 1.6.2: each side announces a fresh routing id over
+/// `x3dh::bootstrap_mailbox_id` right after the session is established, so
+/// both can independently compute the routing-id-derived `mailbox_id`
+/// (`crate::conversation_id`-style) every message after the first uses.
+/// Not user-visible chat content, so `docs/ARCHITECTURE.md` §6.5's
+/// mandatory-verification gate doesn't apply to it — see `store::gate`.
+pub const PAYLOAD_ROUTING_ID_ANNOUNCE: u8 = 3;
 
 /// Bucket size messages are padded to (next multiple of this, up to `MAX_PADDED_LEN`).
 pub const PAD_BUCKET: usize = 160;
@@ -66,6 +76,30 @@ pub fn untag_and_unpad(data: &[u8]) -> Result<(u8, Vec<u8>)> {
     Ok((payload_type, data[content_start..content_end].to_vec()))
 }
 
+/// `PAYLOAD_ROUTING_ID_ANNOUNCE`'s content — CBOR-encoded, the same
+/// pattern `MESSAGE_SCHEMA.md` §7 already documents for `DeliveryAck`/
+/// `RecoveryProfileAnnounce`: a small struct carried as an ordinary
+/// ratchet message's plaintext, tagged and padded like any other payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoutingIdAnnounce {
+    #[serde(with = "serde_bytes")]
+    pub routing_id: Vec<u8>,
+}
+
+impl RoutingIdAnnounce {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        ciborium::into_writer(self, &mut bytes)
+            .expect("CBOR encoding of a well-formed struct cannot fail");
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        ciborium::from_reader(bytes)
+            .map_err(|_| Error::MalformedPayload("not a valid RoutingIdAnnounce"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,5 +148,26 @@ mod tests {
     fn oversized_content_is_rejected() {
         let big = vec![0u8; MAX_PADDED_LEN];
         assert!(tag_and_pad(PAYLOAD_CHAT, &big).is_err());
+    }
+
+    #[test]
+    fn routing_id_announce_round_trips_through_encode_and_tag_and_pad() {
+        let announce = RoutingIdAnnounce {
+            routing_id: vec![7u8; 32],
+        };
+        let encoded = announce.encode();
+        let decoded = RoutingIdAnnounce::decode(&encoded).unwrap();
+        assert_eq!(decoded, announce);
+
+        // And through the same tag-and-pad wrapping any other payload gets.
+        let padded = tag_and_pad(PAYLOAD_ROUTING_ID_ANNOUNCE, &encoded).unwrap();
+        let (ty, content) = untag_and_unpad(&padded).unwrap();
+        assert_eq!(ty, PAYLOAD_ROUTING_ID_ANNOUNCE);
+        assert_eq!(RoutingIdAnnounce::decode(&content).unwrap(), announce);
+    }
+
+    #[test]
+    fn garbage_bytes_are_rejected_not_panicking() {
+        assert!(RoutingIdAnnounce::decode(&[0xFF, 0x00, 0x01]).is_err());
     }
 }

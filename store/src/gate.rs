@@ -105,6 +105,8 @@ mod tests {
             mailbox_id: vec![0xAB; 16],
             created_at: 0,
             disappearing_timer_secs: None,
+            local_routing_id: vec![0xCD; 32],
+            peer_routing_id: None,
         }
     }
 

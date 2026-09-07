@@ -20,3 +20,10 @@ zeroize = "1"
 [dev-dependencies]
 tempfile = "3"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
+# For tests/routing_id_exchange.rs's real spawned-server end-to-end test
+# only — store/ itself has no transport dependency.
+dratchet-server = { path = "../server" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+tokio-tungstenite = "0.21"
+futures-util = "0.3"
+axum = { version = "0.7", features = ["ws"] }

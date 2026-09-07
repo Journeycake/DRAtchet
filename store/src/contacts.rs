@@ -34,7 +34,8 @@ pub struct Contact {
     pub verification_state: VerificationState,
     /// The Tier 1 mailbox this conversation currently addresses — starts as
     /// `bootstrap_mailbox_id` and transitions to the routing-id-derived one
-    /// once both sides have exchanged `RoutingIdAnnounce` (Phase 1.6.2).
+    /// once both sides have exchanged `RoutingIdAnnounce` (Phase 1.6.2, see
+    /// `crate::routing`).
     #[serde(with = "serde_bytes")]
     pub mailbox_id: Vec<u8>,
     pub created_at: u64,
@@ -44,6 +45,16 @@ pub struct Contact {
     /// `secs` seconds after it's saved. Changing this only affects
     /// messages saved from then on — never retroactive.
     pub disappearing_timer_secs: Option<u64>,
+    /// This side's own fresh routing id for this conversation — generated
+    /// once, at contact creation, and announced to the peer immediately
+    /// (`crate::routing`).
+    #[serde(with = "serde_bytes")]
+    pub local_routing_id: Vec<u8>,
+    /// The peer's routing id, once their `RoutingIdAnnounce` has arrived.
+    /// `None` until then — `mailbox_id` stays on `bootstrap_mailbox_id`
+    /// the whole time.
+    #[serde(with = "serde_bytes")]
+    pub peer_routing_id: Option<Vec<u8>>,
 }
 
 fn contact_key(fingerprint: &[u8]) -> String {
@@ -108,6 +119,8 @@ mod tests {
             mailbox_id: vec![0xAB; 16],
             created_at: 1_700_000_000,
             disappearing_timer_secs: None,
+            local_routing_id: vec![0xCD; 32],
+            peer_routing_id: None,
         }
     }
 
