@@ -13,6 +13,7 @@ mod db;
 mod gate;
 mod messages;
 mod routing;
+mod verification;
 
 pub use contacts::{Contact, VerificationState};
 pub use db::Db;
@@ -20,3 +21,7 @@ pub use error::{Error, Result};
 pub use gate::{decrypt_gated, encrypt_gated};
 pub use messages::Message;
 pub use routing::compute_mailbox_id;
+pub use verification::{
+    PairingCode, QrVerificationPayload, PAIRING_CODE_MAX_ATTEMPTS, PAIRING_CODE_TTL_SECS,
+    QR_VALIDITY_SECS,
+};

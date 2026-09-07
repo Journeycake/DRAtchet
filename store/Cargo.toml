@@ -16,6 +16,11 @@ serde_bytes = "0.11"
 ciborium = "0.2"
 thiserror = "1"
 zeroize = "1"
+# QR code image generation for §6.3's in-person verification path — pure
+# Rust (no native imaging library), rendered to a real PNG so it can
+# actually be scanned, not just a placeholder image.
+qrcode = { version = "0.14", features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [dev-dependencies]
 tempfile = "3"
@@ -27,3 +32,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 tokio-tungstenite = "0.21"
 futures-util = "0.3"
 axum = { version = "0.7", features = ["ws"] }
+# To prove a generated QR PNG is genuinely decodable, not just "an image
+# got written" — the pure-Rust counterpart to the `qrcode` crate.
+rqrr = "0.7"
