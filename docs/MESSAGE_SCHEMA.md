@@ -76,8 +76,9 @@ encryption) in `ARCHITECTURE.md` §10, rather than solved here.
 
 **Payload type:** the plaintext (before padding, inside what becomes
 `ciphertext`) starts with a 1-byte `payload_type` tag: `0 = chat message`,
-`1 = DeliveryAck` (§7), `2 = RecoveryProfileAnnounce` (§8), reserved values
-for future control payloads (e.g. a `ReadReceipt`, `ARCHITECTURE.md` §4.6).
+`1 = DeliveryAck` (§7), `2 = RecoveryProfileAnnounce` (§8),
+`3 = RoutingIdAnnounce` (§7), reserved values for future control payloads
+(e.g. a `ReadReceipt`, `ARCHITECTURE.md` §4.6).
 This is what lets a recipient tell a chat message apart from a control
 message like `DeliveryAck` or `RecoveryProfileAnnounce` after decrypting —
 all travel inside the same ratchet envelope and get the same
@@ -201,24 +202,29 @@ as §6.
 | `MailboxWrite` (sender → service) | `mailbox_id` | bytes (16) | derived per `ARCHITECTURE.md` §11.1, not a static device id |
 | | `envelope` | bytes | the ratchet message envelope (§2), opaque to the service |
 | | `ttl` | uint32 | seconds; 14 days default (`ARCHITECTURE.md` §4.5) |
-| `MailboxFetch` (recipient → service, on reconnect) | `mailbox_id` | bytes (16) | computed locally from the recipient's own ratchet state, never enumerated via the service |
+| `MailboxFetch` (recipient → service, on reconnect) | `mailbox_id` | bytes (16) | computed locally from the two routing ids exchanged at pairing time (`ARCHITECTURE.md` §11.1) — or, before that exchange completes, `x3dh::bootstrap_mailbox_id` (§11.1) — never enumerated via the service |
 | `MailboxDelete` (recipient → service, after successful decrypt) | `mailbox_id` | bytes (16) | |
 | | `entry_id` | bytes (16) | service-assigned on write, echoed back on fetch |
 | `DeliveryAck` (recipient → sender, routed like any other message) | `conversation_id` | bytes (16) | same derivation as §2 |
 | | `acked_n` | uint32 | the ratchet header's `n` (§2) being acknowledged |
+| `RoutingIdAnnounce` (either side → the other, routed like any other message) | `routing_id` | bytes (32) | this side's fresh, single-use routing id (`ARCHITECTURE.md` §11.1) — sent once, right after the session is established |
 
 `DeliveryAck`'s two fields (`conversation_id`, `acked_n`) are CBOR-encoded
 and become the *content* of a ratchet envelope's plaintext, tagged with
 `payload_type = 1` (§2) — it's carried as an ordinary ratchet message, not
 a separate wire format, and gets the same encryption, padding, and (for
-Tier 1) mailbox routing as a chat message. The rendezvous and mailbox
-control messages above it in this table (`RendezvousOffer` through
-`MailboxDelete`) are different in kind: they're exchanged with the
-Signaling & Presence Service itself, before or outside any given ratchet
-session, so they're plain CBOR over the WebSocket with no ratchet
-encryption of their own — the service has to be able to read routing
-metadata to do its job (§4.1/§4.2 of `ARCHITECTURE.md`), unlike message
-content.
+Tier 1) mailbox routing as a chat message. `RoutingIdAnnounce` is the same
+shape of thing, tagged `payload_type = 3` (§2) — sent over
+`bootstrap_mailbox_id` before either side has a routing-id-derived mailbox
+to use yet, and, like `DeliveryAck`, never gated by `ARCHITECTURE.md`
+§6.5's mandatory-verification rule (it's protocol machinery, not chat
+content). The rendezvous and mailbox control messages above these two in
+this table (`RendezvousOffer` through `MailboxDelete`) are different in
+kind: they're exchanged with the Signaling & Presence Service itself,
+before or outside any given ratchet session, so they're plain CBOR over
+the WebSocket with no ratchet encryption of their own — the service has to
+be able to read routing metadata to do its job (§4.1/§4.2 of
+`ARCHITECTURE.md`), unlike message content.
 
 ## 8. Recovery profile negotiation (CBOR) — §7.2/§7.3/§7.5 of `ARCHITECTURE.md`
 

@@ -484,10 +484,20 @@ as different stacks.
     core benefits from memory safety and this mature, audited crate
     ecosystem; Tauri's footprint and update size are also substantially
     smaller than Electron's.
-- Local storage: SQLite (SQLCipher-encrypted) for session/ratchet state, with
-  the local database encryption key sealed via the OS credential store —
-  Windows DPAPI, macOS Keychain, Linux Secret Service (libsecret) — not a
-  user password alone.
+- Local storage (implemented — `store/`, Phase 1.5): a pure-Rust embedded
+  database (`redb`) for accounts, contacts, ratchet sessions, and messages,
+  with every value encrypted at rest via `chacha20poly1305`. Originally
+  specified here as SQLite (SQLCipher-encrypted) — corrected once it came
+  time to actually build it: SQLCipher is a native C dependency (itself
+  needing OpenSSL or an equivalent crypto provider), and the project has
+  stayed deliberately pure Rust with zero native/C dependencies since
+  dropping OpenPGP/sequoia (§3.1) — the same reasoning applies here, not
+  just to identity keys. The encryption key itself is still sealed via the
+  OS credential store as designed — Windows DPAPI, macOS Keychain, Linux
+  Secret Service (libsecret) — not a user password alone, with a
+  passphrase-derived (Argon2id) fallback when no OS credential store is
+  available (the Linux caveat two paragraphs down already anticipated
+  needing one).
 - IPC between the web UI and Rust core stays within Tauri's command bridge;
   the UI never handles raw key material, only decrypted message text and
   metadata.
@@ -531,6 +541,11 @@ completed verified key exchange. This is a deliberate reversal of most
 consumer messengers' default ("chat immediately, flag risk later") in
 favor of the opposite trade — no unverified messaging exists as a usable
 state at all. See §6.5 for exactly what this blocks and what it doesn't.
+**Implemented (Phase 1.6.1, `store::gate`)**: `encrypt_gated`/
+`decrypt_gated` enforce this directly — chat content is refused both ways
+for anything other than a `Verified` contact, while the ratchet itself
+(and non-chat protocol messages, like §11.1's routing-id exchange) keeps
+running underneath exactly as §6.5 describes.
 
 Every contact is either:
 
@@ -563,6 +578,22 @@ that address — match marks the contact **Verified**; mismatch is a hard
 stop, never silently marked verified. Because the fingerprint came straight
 from a physically-present device, this path doesn't need to trust the
 directory server at all — it's the strongest of the two.
+
+**Implemented (Phase 1.6.3, `store::verification`)** as data layer: the QR
+payload above (CBOR-encoded, with a 5-minute staleness window on the
+nonce+timestamp) and rendering a real, scannable PNG via a pure-Rust QR
+encoder. Not yet wired to a live camera scan or any GUI — that's the
+eventual Tauri shell's job, out of reach in a display-less environment.
+**This path never carries a routing id** — that's still true even though
+§9/§11.1's mailbox-addressing fix does give v1 per-pairing routing-id
+addressing already: the two routing ids are exchanged automatically, as an
+ordinary encrypted protocol message (`RoutingIdAnnounce`,
+`MESSAGE_SCHEMA.md` §7) sent the moment the X3DH session exists, over
+`bootstrap_mailbox_id` (§11.1) — not something either person has to
+physically relay through this QR. §6.3a's "QR carries the actual handshake
+material" extension is a separate, later change (v2) that would remove the
+directory from the critical path entirely, not a prerequisite for the
+routing-id addressing v1 already has.
 
 ### 6.3a Path 1, extended — server-independent handshake + SAS liveness confirmation — **v2, future**
 
@@ -669,6 +700,14 @@ security rests entirely on the secrecy/integrity of whatever side channel
 carried the code — the same property Signal's "compare safety number over a
 phone call" verification has. It is not stronger than the channel used to
 convey the code.
+
+**Implemented (Phase 1.6.3, `store::verification::PairingCode`)** as data
+layer: a real 6-digit code, ~10-minute TTL, bound to the specific session
+it was generated for, with attempts rate-limited — exhausting the budget
+refuses even the correct code until a fresh one is generated, matching
+point 5 above exactly. As with §6.3, the routing-id exchange this path's
+session needs (§9/§11.1) travels automatically as its own encrypted
+protocol message, not through this pairing code.
 
 ### 6.5 What the mandatory gate blocks, and what it doesn't
 
@@ -1335,17 +1374,21 @@ with periodic post-quantum rekeying through the session, not just at setup.
 Gap, currently unaddressed by anything else in this document: the Double
 Ratchet's forward secrecy protects against a *future* key compromise, but
 says nothing about the plaintext that's already been decrypted and sits in
-the local SQLCipher-encrypted database (§5) once a conversation has history.
+the local encrypted database (§5) once a conversation has history.
 An unlocked device, or a compromised local database key, exposes all
 retained history regardless of how aggressively ratchet keys themselves get
 discarded — a different threat than anything §3.4's key-lifecycle table
 covers, because it's about the *client's own* durable copy, not a
 third party's.
 
-- **v1**: per-conversation disappearing-message timer, user-configurable,
-  default "keep until manually deleted" but easy to set short (an hour, a
-  day, a week — standard presets). On expiry, the client deletes the local
-  plaintext row. §11.9's duress-response wipe is the immediate,
+- **v1 (implemented, Phase 1.5.3, `store::Message`/`Db::sweep_expired_messages`)**:
+  per-conversation disappearing-message timer, user-configurable, default
+  "keep until manually deleted" but easy to set short (an hour, a day, a
+  week — standard presets, in seconds at the storage layer). On expiry,
+  the client deletes the local plaintext row — genuinely, swept on every
+  read and via an explicit periodic sweep, not merely hidden. Changing a
+  conversation's timer only affects messages saved after the change, never
+  retroactively. §11.9's duress-response wipe is the immediate,
   user-triggered version of this same on-device-retention concern, rather
   than a time-based one.
 - **Explicit interaction to surface in the UI, not just this document**: a
