@@ -926,4 +926,132 @@ mod tests {
             "a late arrival well within the cache's lifetime cap must still decrypt"
         );
     }
+
+    /// A full copy of a `RatchetState`'s live fields, as if an attacker had exfiltrated
+    /// a process's entire memory at this instant — not a public `Clone` impl (the
+    /// production type deliberately doesn't offer one; nothing legitimate needs to
+    /// duplicate live ratchet secrets), just direct field access from within this
+    /// module, the same way `matched_pair` already builds `RatchetState`s directly.
+    fn snapshot(r: &RatchetState) -> RatchetState {
+        RatchetState {
+            conversation_id: r.conversation_id,
+            max_skip: r.max_skip,
+            root_key: r.root_key.clone(),
+            dh_self: r.dh_self.clone(),
+            dh_remote: r.dh_remote,
+            sending_chain_key: r.sending_chain_key.clone(),
+            receiving_chain_key: r.receiving_chain_key.clone(),
+            send_n: r.send_n,
+            recv_n: r.recv_n,
+            prev_chain_len: r.prev_chain_len,
+            skipped: r.skipped.clone(),
+            skipped_order: r.skipped_order.clone(),
+        }
+    }
+
+    /// `docs/ARCHITECTURE.md` §2 goal 1: "compromise of a current key must not expose
+    /// past messages." Checked directly: an attacker who exfiltrates Bob's *entire*
+    /// live state right after he's processed a run of messages still cannot decrypt any
+    /// of them again from that snapshot — the chain key has already moved past them via
+    /// `KDF_CK`'s one-way step, and no message key is ever retained once consumed (see
+    /// `decrypt_raw`'s doc comment: nothing is stored beyond the advanced chain key
+    /// until a *skip* is involved, which none of these are). This isn't the same claim
+    /// as `each_message_key_is_single_use_replay_is_rejected` below: that test replays
+    /// against the *same* object, which could in principle be explained away as mere
+    /// bookkeeping ("already marked used"). Here the attempt runs against a completely
+    /// independent, freshly-built `RatchetState` holding nothing but the snapshotted
+    /// key material — so a decrypt failure here means the key genuinely isn't
+    /// recoverable from that state, not that some other field remembers it was used.
+    #[test]
+    fn forward_secrecy_a_full_state_leak_cannot_decrypt_already_consumed_messages() {
+        let (mut alice, mut bob) = matched_pair();
+
+        let history: Vec<Envelope> = (0..5)
+            .map(|i| alice.encrypt(&chat(&format!("secret {i}"))).unwrap())
+            .collect();
+        for envelope in &history {
+            bob.decrypt_raw(envelope).unwrap();
+        }
+
+        // The leak: an attacker walks away with a complete copy of Bob's live state,
+        // right after he's read all five messages.
+        let mut attacker = snapshot(&bob);
+
+        for (i, envelope) in history.iter().enumerate() {
+            assert!(
+                attacker.decrypt_raw(envelope).is_err(),
+                "leaked state decrypted an already-consumed message (index {i}) — \
+                 forward secrecy violated"
+            );
+        }
+
+        // The leak isn't a generally broken clone, though — specifically the *past* is
+        // unrecoverable. The attacker's copy is still a live, functioning ratchet that
+        // (for now — see the post-compromise test below) can keep reading new traffic,
+        // same as the real Bob could.
+        let next = alice.encrypt(&chat("not secret yet")).unwrap();
+        assert_eq!(
+            read_chat(&attacker.decrypt_raw(&next).unwrap()),
+            "not secret yet"
+        );
+    }
+
+    /// `docs/ARCHITECTURE.md` §2 goal 2: "post-compromise (self-healing) security:
+    /// after a compromise, the session heals." A one-time leak of Bob's full live state
+    /// does *not* compromise the conversation forever — checked directly, not just
+    /// asserted. The mechanism: `compute_dh_ratchet_step` draws a fresh `StaticSecret`
+    /// from `OsRng` every time a party *receives* a new incoming DH key. An attacker's
+    /// frozen snapshot, run forward on its own, draws its *own* independent randomness
+    /// at that same step — so the instant both the real Bob and the attacker's copy
+    /// have each processed one more incoming ratcheted message since the leak, their
+    /// two DH keypairs are different values that happen to share an origin, not the
+    /// same secret. The exposure isn't instantaneous, though, and this test checks the
+    /// honest shape of it, not just the eventual good outcome: the very next ratcheted
+    /// message after the leak is *still* readable by the attacker (it was already
+    /// determined by key material the snapshot has), and only the one after *that* —
+    /// once fresh randomness has actually been drawn on both sides — is finally out of
+    /// reach.
+    #[test]
+    fn post_compromise_security_heals_after_the_next_ratchet_step() {
+        let (mut alice, mut bob) = matched_pair();
+
+        // Bob's first ratchet step, bootstrapping his receiving chain against Alice's
+        // initial ephemeral key.
+        let msg0 = alice.encrypt(&chat("msg0")).unwrap();
+        bob.decrypt_raw(&msg0).unwrap();
+
+        // The leak: right here, right after Bob's first ratchet.
+        let mut attacker = snapshot(&bob);
+
+        // Bob replies (no ratchet on send); Alice decrypts and ratchets, establishing a
+        // fresh sending chain of her own.
+        let msg1 = bob.encrypt(&chat("msg1")).unwrap();
+        alice.decrypt_raw(&msg1).unwrap();
+
+        // Alice's reply carries *her* fresh key — the first incoming ratchet either Bob
+        // or the attacker's frozen copy has seen since the leak. Both still have the
+        // exact same pre-ratchet state (Bob hasn't received anything in between), so
+        // both can still derive the correct receiving chain from it: this message is
+        // still exposed.
+        let msg2 = alice.encrypt(&chat("msg2")).unwrap();
+        assert_eq!(read_chat(&bob.decrypt_raw(&msg2).unwrap()), "msg2");
+        assert_eq!(
+            read_chat(&attacker.decrypt_raw(&msg2).unwrap()),
+            "msg2",
+            "the first post-leak ratchet is expected to still be exposed — healing \
+             takes one more step"
+        );
+
+        // But processing msg2 just drew fresh randomness independently on *both* the
+        // real Bob and the attacker's copy — two different `OsRng` calls, two
+        // different new DH secrets. From here on they've diverged. Bob's next reply is
+        // encrypted under a sending chain the attacker's copy has no way to derive.
+        let msg3 = bob.encrypt(&chat("msg3")).unwrap();
+        assert_eq!(read_chat(&alice.decrypt_raw(&msg3).unwrap()), "msg3");
+        assert!(
+            attacker.decrypt_raw(&msg3).is_err(),
+            "leaked state decrypted a message sent after the session had healed — \
+             post-compromise security violated"
+        );
+    }
 }
