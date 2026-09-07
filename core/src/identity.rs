@@ -102,6 +102,23 @@ impl Identity {
         let sig = self.signing_key.sign(message);
         Ok(sig.to_bytes().to_vec())
     }
+
+    /// Export this identity's raw 32-byte Ed25519 secret key — the seed the
+    /// full keypair (and so the public key/fingerprint) is deterministically
+    /// derived from. Like `RatchetState::export`, **not an at-rest-safe
+    /// format on its own**: local storage must encrypt this before
+    /// persisting it and decrypt before calling
+    /// [`Identity::from_secret_key`].
+    pub fn export_secret_key(&self) -> [u8; 32] {
+        self.signing_key.to_bytes()
+    }
+
+    /// The inverse of [`Identity::export_secret_key`].
+    pub fn from_secret_key(secret_key: [u8; 32]) -> Self {
+        Identity {
+            signing_key: SigningKey::from_bytes(&secret_key),
+        }
+    }
 }
 
 /// Verify an arbitrary Ed25519 signature against a raw 32-byte public key —
@@ -141,6 +158,32 @@ mod tests {
         let exported = id.export_public_key().unwrap();
         assert_eq!(exported.len(), 32);
         assert!(!id.fingerprint().to_hex().is_empty());
+    }
+
+    #[test]
+    fn secret_key_export_then_import_reconstructs_the_same_identity() {
+        let id = Identity::generate().unwrap();
+        let restored = Identity::from_secret_key(id.export_secret_key());
+
+        assert_eq!(restored.fingerprint(), id.fingerprint());
+        assert_eq!(
+            restored.export_public_key().unwrap(),
+            id.export_public_key().unwrap()
+        );
+
+        // And it can actually still sign/verify, not just report the same
+        // fingerprint.
+        let prekey_public = [9u8; 32];
+        let sig = restored.sign_prekey(1, &prekey_public).unwrap();
+        Identity::verify_prekey_signature(
+            &id.export_public_key().unwrap(),
+            1,
+            &prekey_public,
+            &sig,
+        )
+        .expect(
+            "a signature from the restored identity must verify against the original's public key",
+        );
     }
 
     #[test]
