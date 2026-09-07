@@ -89,11 +89,11 @@ impl TestClient {
         let (tag, challenge): (_, AuthChallenge) = self.recv().await;
         assert_eq!(tag, FrameTag::AuthChallenge);
         let signature = account.identity.sign(&challenge.nonce).unwrap();
-        let fingerprint = account.identity.fingerprint().as_bytes().to_vec();
+        let identity_key = account.identity.export_public_key().unwrap();
         self.send(
             FrameTag::AuthResponse,
             &AuthResponse {
-                identity_fingerprint: fingerprint,
+                identity_key,
                 signature,
             },
         )

@@ -16,7 +16,12 @@ engine, Ed25519/X25519 identity — **plus Phase 1.1 of the v1 build plan**,
 the **Signaling & Presence Service** (`server/`): prekey directory, WebRTC
 rendezvous, Tier 1 mailbox, and presence, all over one WebSocket endpoint.
 See [`server/README.md`](server/README.md) for installing and running it.
-No UI yet.
+
+A reference CLI client (`client/`) exercises the real protocol end to end:
+two instances pair directly with each other (X3DH client-to-client, no
+directory involved — `ARCHITECTURE.md` §6.3a) and chat over the server's
+Tier 1 mailbox. It's a test harness, not the production app — see
+[`client/README.md`](client/README.md). No production UI yet.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full protocol and
 system design, [`docs/MESSAGE_SCHEMA.md`](docs/MESSAGE_SCHEMA.md) for the
@@ -83,6 +88,10 @@ For the Signaling & Presence Service specifically — installing it,
 running it, its configuration and endpoints, and what each of its four
 test suites (including a concurrent-client stress test) covers — see
 [`server/README.md`](server/README.md).
+
+For the reference CLI client — pairing two instances against a running
+server and chatting through it, plus what it stands in for versus the
+production app — see [`client/README.md`](client/README.md).
 
 Fuzz targets for the two parsers that handle untrusted bytes off the wire
 (`Envelope::decode`, `payload::untag_and_unpad`) live in `core/fuzz/` — see

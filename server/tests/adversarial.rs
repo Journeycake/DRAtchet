@@ -69,26 +69,19 @@ async fn mailbox_and_rendezvous_and_presence_subscribe_require_auth_first() {
 #[tokio::test]
 async fn auth_response_with_a_fabricated_signature_is_rejected() {
     let url = spawn_server().await;
-    let (_account, bundle) = fresh_account_and_bundle("alice", 1, 0);
-    let identity_key_bytes = bundle.identity_key.clone();
-
-    let mut publisher = TestClient::connect(&url).await;
-    publisher
-        .send(FrameTag::PublishBundle, &PublishBundle { bundle })
-        .await;
+    // AuthResponse is self-certifying (no PublishBundle/directory lookup
+    // involved at all) — a real identity key, but no private key behind
+    // this signature: just noise of the right length.
+    let (account, _bundle) = fresh_account_and_bundle("alice", 1, 0);
+    let identity_key = account.identity.export_public_key().unwrap();
 
     let mut attacker = TestClient::connect(&url).await;
     let (_, _challenge): (_, AuthChallenge) = attacker.recv().await;
-    // No private key involved at all — just noise of the right length.
-    let target_fingerprint =
-        dratchet_core::identity::fingerprint_of_public_key(&identity_key_bytes)
-            .as_bytes()
-            .to_vec();
     attacker
         .send(
             FrameTag::AuthResponse,
             &AuthResponse {
-                identity_fingerprint: target_fingerprint,
+                identity_key,
                 signature: vec![0xAB; 64],
             },
         )
@@ -106,23 +99,12 @@ async fn replaying_a_signature_from_a_previous_connection_fails_against_the_new_
     // Each connection gets its own fresh nonce (`SERVERS.md` §1.2) — this is
     // exactly what stops a captured AuthResponse from being replayed to
     // hijack a *different* connection, including one opened moments later.
+    // AuthResponse is self-certifying (no directory lookup involved), so
+    // this needs no PublishBundle at all — a real identity's signature,
+    // just computed over the wrong (stale) nonce.
     let url = spawn_server().await;
     let account = Account::generate().unwrap();
-    let (_owner, bundle) = fresh_account_and_bundle("alice", 1, 0);
-    // Publish under alice's real identity so a lookup succeeds, but attempt
-    // to authenticate as her using a signature produced for a stale nonce
-    // from an unrelated, already-generated identity — never a match either
-    // way, but this specifically exercises "signature bytes that parse fine
-    // but were computed over the wrong message."
-    let mut publisher = TestClient::connect(&url).await;
-    publisher
-        .send(
-            FrameTag::PublishBundle,
-            &PublishBundle {
-                bundle: bundle.clone(),
-            },
-        )
-        .await;
+    let identity_key = account.identity.export_public_key().unwrap();
 
     let mut first = TestClient::connect(&url).await;
     let (_, challenge1): (_, AuthChallenge) = first.recv().await;
@@ -139,7 +121,7 @@ async fn replaying_a_signature_from_a_previous_connection_fails_against_the_new_
         .send(
             FrameTag::AuthResponse,
             &AuthResponse {
-                identity_fingerprint: bundle.identity_key.clone(),
+                identity_key,
                 signature: stale_signature,
             },
         )

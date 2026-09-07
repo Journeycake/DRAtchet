@@ -92,10 +92,15 @@ pub struct AuthChallenge {
     pub nonce: Vec<u8>,
 }
 
+/// Self-certifying: carries the raw public key itself rather than a claimed
+/// fingerprint, so the server can verify the signature and derive the
+/// fingerprint directly — no prior `PublishBundle`/directory registration
+/// required. See `ws.rs`'s module doc for why this, and not a
+/// directory-backed lookup, is what authenticates a connection.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AuthResponse {
     #[serde(with = "serde_bytes")]
-    pub identity_fingerprint: Vec<u8>,
+    pub identity_key: Vec<u8>,
     #[serde(with = "serde_bytes")]
     pub signature: Vec<u8>,
 }

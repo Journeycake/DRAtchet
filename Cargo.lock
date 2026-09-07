@@ -418,6 +418,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "dratchet-client"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64",
+ "ciborium",
+ "clap",
+ "dratchet-core",
+ "dratchet-server",
+ "futures-util",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_bytes",
+ "tokio",
+ "tokio-tungstenite 0.21.0",
+ "tracing",
+ "tracing-subscriber",
+ "x25519-dalek",
+]
+
+[[package]]
 name = "dratchet-core"
 version = "0.1.0"
 dependencies = [

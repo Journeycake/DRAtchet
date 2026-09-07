@@ -20,6 +20,16 @@
 //! the directory, never grants privilege. Presence, rendezvous, and mailbox
 //! operations all separately require the nonce-signature auth to have
 //! succeeded on *this* connection.
+//!
+//! **`AuthResponse` is self-certifying, not directory-backed:** it carries
+//! the raw public key alongside the signature, so the fingerprint that gets
+//! authenticated is derived directly from the key that signed the nonce —
+//! never looked up from a previously-published bundle. This is what lets a
+//! connection authenticate without ever having called `PublishBundle` at
+//! all, which out-of-band-paired clients (QR/session-routing-id pairing,
+//! `ARCHITECTURE.md` §6.3a — no directory registration involved) need:
+//! they have no reason to ever be discoverable by `username#NNNN`, only to
+//! authenticate to read/write the Tier 1 mailbox they already agreed on.
 
 use std::sync::Arc;
 
@@ -168,22 +178,10 @@ async fn dispatch(
                 return Err(Error::AlreadyAuthenticated);
             }
             let req: AuthResponse = decode_body(body)?;
-            let fp: Fingerprint = req
-                .identity_fingerprint
-                .as_slice()
-                .try_into()
-                .map_err(|_| Error::MalformedFrame("identity_fingerprint must be 32 bytes"))?;
-
-            let public_key = {
-                let inner = state.inner.read().await;
-                inner
-                    .directory
-                    .get(&fp)
-                    .map(|sb| sb.bundle.identity_key.clone())
-                    .ok_or(Error::AuthFailed)?
-            };
-            identity::verify_signature(&public_key, nonce, &req.signature)
+            identity::verify_signature(&req.identity_key, nonce, &req.signature)
                 .map_err(|_| Error::AuthFailed)?;
+            let fp: Fingerprint =
+                *identity::fingerprint_of_public_key(&req.identity_key).as_bytes();
 
             *authenticated = Some(fp);
             let subscribers = {

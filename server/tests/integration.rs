@@ -133,6 +133,21 @@ async fn full_auth_handshake_succeeds_for_a_published_identity() {
     client.authenticate(&account).await;
 }
 
+/// `AuthResponse` is self-certifying (`ws.rs`'s module doc) — this is the
+/// capability that actually matters: an out-of-band-paired identity
+/// (`ARCHITECTURE.md` §6.3a's session-routing-id pairing) never calls
+/// `PublishBundle` at all, since it has no reason to be discoverable by
+/// `username#NNNN`, only to authenticate so it can read/write the Tier 1
+/// mailbox both sides already agreed on.
+#[tokio::test]
+async fn authentication_succeeds_with_no_prior_publish_bundle_at_all() {
+    let url = spawn_server().await;
+    let account = dratchet_core::account::Account::generate().unwrap();
+
+    let mut client = TestClient::connect(&url).await;
+    client.authenticate(&account).await;
+}
+
 #[tokio::test]
 async fn presence_subscribe_requires_prior_fetch_evidence_then_delivers_updates() {
     let url = spawn_server().await;
