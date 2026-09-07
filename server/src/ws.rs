@@ -91,8 +91,13 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     // Identifies this connection for the rate limiter (`crate::abuse`) only
     // — unrelated to the auth nonce above, and never sent to the client.
     let connection_id: ConnectionId = random_16();
+    // Logged as an opaque id only, never alongside presence state — see
+    // `crate::pruning`'s module doc for the "presence is not logged for
+    // analytics" constraint (`docs/SERVERS.md` §1.3) this must respect.
+    tracing::debug!(connection = %hex_encode(&connection_id), "connection opened");
 
     let mut authenticated: Option<Fingerprint> = None;
+    let mut frames_processed: u64 = 0;
 
     loop {
         let Some(next) = ws_receiver.next().await else {
@@ -122,6 +127,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             }
         };
 
+        frames_processed += 1;
         if let Err(e) = dispatch(
             tag,
             body,
@@ -141,6 +147,13 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             ));
         }
     }
+
+    tracing::debug!(
+        connection = %hex_encode(&connection_id),
+        frames_processed,
+        authenticated = authenticated.is_some(),
+        "connection closed",
+    );
 
     if let Some(fp) = authenticated {
         let last_seen = now_unix();
@@ -178,10 +191,20 @@ async fn dispatch(
                 return Err(Error::AlreadyAuthenticated);
             }
             let req: AuthResponse = decode_body(body)?;
-            identity::verify_signature(&req.identity_key, nonce, &req.signature)
-                .map_err(|_| Error::AuthFailed)?;
+            if identity::verify_signature(&req.identity_key, nonce, &req.signature).is_err() {
+                tracing::debug!(
+                    connection = %hex_encode(&connection_id),
+                    "authentication failed: bad nonce signature",
+                );
+                return Err(Error::AuthFailed);
+            }
             let fp: Fingerprint =
                 *identity::fingerprint_of_public_key(&req.identity_key).as_bytes();
+            tracing::debug!(
+                connection = %hex_encode(&connection_id),
+                fingerprint = %hex_encode(&fp),
+                "connection authenticated",
+            );
 
             *authenticated = Some(fp);
             let subscribers = {
@@ -410,6 +433,11 @@ async fn publish_bundle(state: &Arc<AppState>, wire: PrekeyBundleWire) -> Result
                 )
             });
             if !solved {
+                tracing::warn!(
+                    username = %wire.username,
+                    discriminator = wire.discriminator,
+                    "PublishBundle rejected: missing or invalid registration proof-of-work",
+                );
                 return Err(Error::ProofOfWorkRequired);
             }
         }
@@ -449,6 +477,10 @@ async fn fetch_bundle(
     // Rate-limit *before* touching the one-time-prekey pool — a rejected
     // fetch must not itself consume anything (`crate::abuse`).
     if !inner.fetch_rate_limiter.allow(connection_id, target_fp) {
+        tracing::warn!(
+            target_fingerprint = %hex_encode(&target_fp),
+            "FetchBundle rejected: rate limit exceeded (crate::abuse)",
+        );
         return Err(Error::RateLimited);
     }
 

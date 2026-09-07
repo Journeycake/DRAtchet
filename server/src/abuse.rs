@@ -87,6 +87,28 @@ impl FetchRateLimiter {
             false
         }
     }
+
+    /// Remove buckets idle longer than `older_than` — `ConnectionId` is a
+    /// fresh random value per connection (module doc) that's never reused,
+    /// so once a connection has gone quiet this long its bucket is pure
+    /// bookkeeping garbage: it would have refilled to full capacity long
+    /// before `older_than` given `FETCH_RATE_LIMIT_REFILL_PER_SEC`, so
+    /// removing it changes no observable throttling behavior, only frees
+    /// memory (a later request for the same key just lazily reinserts via
+    /// `allow`'s `or_insert_with`). Called periodically by
+    /// `crate::pruning::sweep_once`. Returns the number removed, for that
+    /// sweep's summary log line.
+    pub fn sweep_stale(&mut self, older_than: std::time::Duration, now: Instant) -> usize {
+        let before = self.buckets.len();
+        self.buckets
+            .retain(|_, bucket| now.duration_since(bucket.last_refill) < older_than);
+        before - self.buckets.len()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.buckets.len()
+    }
 }
 
 /// How many leading zero bits a solution's hash must have. ~2^12 average
@@ -188,6 +210,36 @@ mod tests {
             limiter.allow(requester, [3u8; 32]),
             "a different target has its own budget"
         );
+    }
+
+    #[test]
+    fn sweep_stale_removes_buckets_idle_past_the_threshold_but_keeps_recently_used_ones() {
+        let mut limiter = FetchRateLimiter::default();
+        // `allow` always stamps `last_refill` with the real `Instant::now()`
+        // (there's no way to inject a fake time into it), so both buckets'
+        // `last_refill` is effectively "now" — staleness is then purely a
+        // function of how far past "now" the `now` passed to `sweep_stale`
+        // is.
+        limiter.allow([1u8; 16], [2u8; 32]);
+        limiter.allow([9u8; 16], [2u8; 32]);
+        assert_eq!(limiter.len(), 2);
+
+        let just_created = Instant::now();
+        let threshold = std::time::Duration::from_secs(600);
+
+        let removed = limiter.sweep_stale(threshold, just_created + threshold / 2);
+        assert_eq!(
+            removed, 0,
+            "buckets younger than the staleness threshold must survive"
+        );
+        assert_eq!(limiter.len(), 2);
+
+        let removed = limiter.sweep_stale(threshold, just_created + threshold * 2);
+        assert_eq!(
+            removed, 2,
+            "buckets idle well past the staleness threshold must be swept"
+        );
+        assert_eq!(limiter.len(), 0);
     }
 
     #[test]
