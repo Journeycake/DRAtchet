@@ -75,6 +75,70 @@ jobs:
         working-directory: core
         run: cargo fuzz run unpad_payload -- -max_total_time=60
 
+  ui:
+    name: fmt, clippy, build (ui/ Tauri + Svelte)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ui/src-tauri links against webkit2gtk/gtk3 at build time (Tauri's
+      # Linux webview backend) — these aren't needed anywhere else in the
+      # repo, which is why they're only installed in this job, not the
+      # root "test" job.
+      - name: Install Tauri Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and build artifacts (ui/src-tauri)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ui/src-tauri/target
+          key: ${{ runner.os }}-cargo-ui-${{ hashFiles('ui/src-tauri/Cargo.lock') }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: npm ci
+        working-directory: ui
+        run: npm ci
+
+      - name: svelte-check
+        working-directory: ui
+        run: npm run check
+
+      # ui/src-tauri is a standalone Cargo workspace (its own [workspace]
+      # table), deliberately separate from the root dratchet-* workspace
+      # (see its Cargo.toml) — so these run with --manifest-path rather
+      # than joining the root "test" job's `--workspace` commands.
+      - name: Format check
+        working-directory: ui/src-tauri
+        run: cargo fmt --check
+
+      - name: Clippy (deny warnings)
+        working-directory: ui/src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build
+        working-directory: ui/src-tauri
+        run: cargo build --all-targets
+
+      - name: Test
+        working-directory: ui/src-tauri
+        run: cargo test
+
   docker:
     name: build container image
     runs-on: ubuntu-latest
