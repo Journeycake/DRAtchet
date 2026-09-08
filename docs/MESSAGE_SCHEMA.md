@@ -78,8 +78,12 @@ encryption) in `ARCHITECTURE.md` §10, rather than solved here.
 `ciphertext`) starts with a 1-byte `payload_type` tag: `0 = chat message`,
 `1 = DeliveryAck` (§7), `2 = RecoveryProfileAnnounce` (§8),
 `3 = RoutingIdAnnounce` (§7), `4 = ConversationWipePolicyAnnounce` (§10),
-`5 = ConversationWipeRequest` (§10), reserved values for future control
-payloads (e.g. a `ReadReceipt`, `ARCHITECTURE.md` §4.6).
+`5 = ConversationWipeRequest` (§10), `6 = FirstContactContent` (§3 — the
+one exception to "every payload here travels inside an ordinary envelope
+already backed by a session": this one is the content of a
+`FirstContactWire.envelope` specifically, encrypted under a root key just
+derived, not an existing ratchet's chain key), reserved values for future
+control payloads (e.g. a `ReadReceipt`, `ARCHITECTURE.md` §4.6).
 This is what lets a recipient tell a chat message apart from a control
 message like `DeliveryAck` or `RecoveryProfileAnnounce` after decrypting —
 all travel inside the same ratchet envelope and get the same
@@ -124,29 +128,65 @@ equivalent (packet headers + MPI-encoded fields across a PKESK/SKESK +
 SEIPD packet pair) typically runs several times that for a short chat
 message.
 
-## 3. X3DH session-establishment message (CBOR)
+## 3. First contact: `FirstContactWire` (CBOR) — **implemented**
 
-The *first* message of a new session — carries the extra fields the
-recipient needs to derive the shared root key, since they don't have
-ratchet state yet. After this, all further messages use the fixed
-ratchet envelope above.
+The *first* message of a new session, and the actual, shipped shape of
+what this section used to describe only speculatively (an
+"X3DH session-establishment message" carrying just
+`initiator_identity_fingerprint`, and a separate `PairingChallenge`/
+`PairingResponse` exchange in what was §4). Both are superseded by this
+single message, built around `docs/ARCHITECTURE.md` §6.4's now-atomic,
+pairing-code-gated add-contact flow: a leaked or guessed `username#NNNN`
+must never be enough by itself to make an attempt appear on someone's
+device, so the code the recipient generated and shared out of band
+*before* anything was sent travels inside this same message, checked
+before any `Contact` record is ever created.
+
+`core::first_contact::FirstContactWire`, sent via an ordinary
+`MailboxWrite` to `bootstrap_mailbox_id(recipient_fingerprint)` — not
+wrapped in a ratchet envelope itself, since the recipient has no ratchet
+to decrypt anything with until they've derived one from this message's
+own cleartext fields. Distinguishable on receipt from an ordinary §2
+envelope because that's a fixed-layout binary format, not CBOR.
 
 | Field | Type | Notes |
 |---|---|---|
-| `initiator_identity_fingerprint` | bytes (32) | SHA-256 of initiator's identity key |
-| `initiator_ephemeral_pub` | bytes (32) | `EK_A`, fresh per session |
+| `initiator_identity_key` | bytes (32) | the initiator's raw Ed25519 signing public key — self-certifying, same as `PublishBundle`'s `identity_key` (§1); the recipient derives the fingerprint from it directly |
+| `initiator_identity_dh_public` | bytes (32) | `IK_A`, the X3DH identity DH key |
+| `initiator_identity_dh_signature` | bytes | binds `initiator_identity_dh_public` to `initiator_identity_key` — verified before trusting anything derived from these fields, the same check `PublishBundle`'s bundle-signature verification does |
+| `initiator_ephemeral_public` | bytes (32) | `EK_A`, fresh per session |
 | `used_signed_prekey_id` | uint32 | which of the recipient's signed prekeys was used |
-| `used_one_time_prekey_id` | uint32, optional | omitted if the recipient had none available (X3DH degrades gracefully but loses one DH term — flagged in `ARCHITECTURE.md` open decisions if this needs hardening) |
-| `initial_envelope` | bytes | the first ratchet message envelope (§2), encrypted under the HKDF-derived root/chain key |
+| `used_one_time_prekey_id` | uint32, optional | omitted if the recipient had none available (X3DH degrades gracefully but loses one DH term) |
+| `envelope` | bytes | a §2 ratchet envelope, encrypted under the HKDF-derived root key, `payload_type = PAYLOAD_FIRST_CONTACT` (§2's payload-type list), content = the `FirstContactContent` below |
 
-## 4. Peer-pairing messages (CBOR) — §6.4 remote pairing
+`FirstContactContent` (the `envelope` field's decrypted payload —
+encrypted, unlike everything above, so a passive observer of the relay
+never sees the pairing code, only the same public key material a
+directory fetch already exposes):
 
-| Message | Field | Type | Notes |
-|---|---|---|---|
-| `PairingChallenge` (recipient → initiator, out-of-band) | `pairing_id` | bytes (16) | correlates challenge/response if relayed through an untrusted channel |
-| | `expires_at` | uint64 | ~10 min TTL (§9 of `ARCHITECTURE.md`) |
-| `PairingResponse` (initiator → recipient) | `pairing_id` | bytes (16) | echoes the challenge |
-| | `code_proof` | bytes (32) | `HMAC(key = code, msg = session_transcript_hash)` — **not the raw code**, so a transport that isn't fully trusted (e.g. an ephemeral relay, §4 of `ARCHITECTURE.md`) never observes the code itself or gets a replayable value against a different session |
+| Field | Type | Notes |
+|---|---|---|
+| `pairing_code` | string (6 digits) | the code the recipient generated and read out over an already-trusted channel |
+| `username` | string | the initiator's own registered username, so the recipient's client can label the new contact without a directory round-trip |
+| `discriminator` | uint16 | the initiator's own registered discriminator |
+
+**On receipt**: the recipient checks the enclosed `pairing_code` against
+whatever it currently has stored for itself (single-use, short TTL,
+rate-limited attempts — §6.4). A match creates an already-`Verified`
+`Contact` and consumes the code; anything else — no code stored, wrong
+code, expired, attempts exhausted, or a bad identity-binding signature —
+deletes the mailbox entry and produces no other effect at all: no
+contact, no error, no reply to the sender. There is no delivery receipt
+either way, the same limitation every other ungated protocol message in
+this document already has.
+
+## 4. Superseded — see §3
+
+This section used to describe a separate `PairingChallenge`/
+`PairingResponse` exchange for §6.4's remote pairing, speculative and
+never implemented. `FirstContactWire`'s `pairing_code` field (§3) folds
+that exchange directly into first contact instead — do not implement the
+shape this section used to describe.
 
 ## 5. Recovery backup entry (CBOR) — §7 opt-in recovery
 

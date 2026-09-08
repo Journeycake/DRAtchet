@@ -15,10 +15,15 @@ dratchet-store = { path = "../store" }
 dratchet-client = { path = "../client" }
 dratchet-server = { path = "../server" }
 thiserror = "1"
+# `publish_own_bundle`'s random discriminator (§6.1) — real, not dev-only,
+# since a shipped client needs it too.
+rand_core = { version = "0.6", features = ["getrandom"] }
+# `add_contact_by_username` converts a fetched `FetchedBundleWire` into a
+# real `core::prekey::PrekeyBundle` to run X3DH against — needs the same
+# `PublicKey` type every other X3DH caller in this workspace uses.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 axum = { version = "0.7", features = ["ws"] }
 tempfile = "3"
-rand_core = { version = "0.6", features = ["getrandom"] }
-x25519-dalek = { version = "2", features = ["static_secrets"] }

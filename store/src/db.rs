@@ -450,7 +450,6 @@ mod tests {
             verification_state: VerificationState::Verified,
             mailbox_id: vec![0xAB; 16],
             created_at: 0,
-            disappearing_timer_secs: None,
             local_routing_id: vec![0xCD; 32],
             peer_routing_id: None,
             wipe_ask_before_delete: false,
@@ -647,7 +646,6 @@ mod tests {
                 sender_is_local: true,
                 content: b"gone after a quick wipe".to_vec(),
                 timestamp: 100,
-                expires_at: None,
             },
         )
         .unwrap();
@@ -701,7 +699,6 @@ mod tests {
                 sender_is_local: true,
                 content: b"written after the wipe, under the new key".to_vec(),
                 timestamp: 200,
-                expires_at: None,
             },
         )
         .unwrap();

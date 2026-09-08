@@ -73,7 +73,6 @@ mod tests {
             verification_state: VerificationState::Pending,
             mailbox_id: bootstrap_mailbox_id(&[fingerprint; 32]).to_vec(),
             created_at: 0,
-            disappearing_timer_secs: None,
             local_routing_id,
             peer_routing_id: None,
             wipe_ask_before_delete: false,

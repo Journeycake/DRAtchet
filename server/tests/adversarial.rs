@@ -143,7 +143,12 @@ async fn presence_subscribe_without_ever_having_fetched_the_target_is_rejected()
     let (alice, alice_bundle) = fresh_account_and_bundle("alice", 1, 0);
     let (bob, bob_bundle) = fresh_account_and_bundle("bob", 2, 0);
 
+    // Authenticate before publishing (order doesn't matter functionally —
+    // `PublishBundle` never requires prior auth — but it does here, so the
+    // `AuthChallenge` that arrives immediately on connect is consumed
+    // before anything else queues behind it).
     let mut alice_c = TestClient::connect(&url).await;
+    alice_c.authenticate(&alice).await;
     alice_c
         .send(
             FrameTag::PublishBundle,
@@ -152,16 +157,17 @@ async fn presence_subscribe_without_ever_having_fetched_the_target_is_rejected()
             },
         )
         .await;
-    alice_c.authenticate(&alice).await;
+    let (_, _ack): (_, Ack) = alice_c.recv().await;
 
     let mut bob_c = TestClient::connect(&url).await;
+    bob_c.authenticate(&bob).await;
     bob_c
         .send(
             FrameTag::PublishBundle,
             &PublishBundle { bundle: bob_bundle },
         )
         .await;
-    bob_c.authenticate(&bob).await;
+    let (_, _ack): (_, Ack) = bob_c.recv().await;
 
     // Alice never fetched Bob's bundle — no evidence of any attempted session.
     alice_c
@@ -193,6 +199,7 @@ async fn fetching_a_different_mailbox_id_never_returns_another_mailboxs_entries(
     let url = spawn_server().await;
     let (alice, alice_bundle) = fresh_account_and_bundle("alice", 1, 0);
     let mut client = TestClient::connect(&url).await;
+    client.authenticate(&alice).await;
     client
         .send(
             FrameTag::PublishBundle,
@@ -201,7 +208,7 @@ async fn fetching_a_different_mailbox_id_never_returns_another_mailboxs_entries(
             },
         )
         .await;
-    client.authenticate(&alice).await;
+    let (_, _ack): (_, Ack) = client.recv().await;
 
     client
         .send(
@@ -309,6 +316,7 @@ async fn a_tampered_bundle_is_never_stored_a_later_valid_publish_still_wins() {
             },
         )
         .await;
+    let (_, _ack): (_, Ack) = client.recv().await;
     client
         .send(
             FrameTag::FetchBundle,
@@ -364,6 +372,7 @@ async fn malformed_frames_never_crash_the_connection_valid_traffic_still_works_a
     client
         .send(FrameTag::PublishBundle, &PublishBundle { bundle })
         .await;
+    let (_, _ack): (_, Ack) = client.recv().await;
     client
         .send(
             FrameTag::FetchBundle,

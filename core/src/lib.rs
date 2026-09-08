@@ -9,6 +9,7 @@
 pub mod account;
 pub mod envelope;
 pub mod error;
+pub mod first_contact;
 pub mod identity;
 pub mod payload;
 pub mod prekey;

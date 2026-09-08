@@ -18,6 +18,18 @@ pub enum Error {
     #[error("the server did not acknowledge the request")]
     NotAcknowledged,
 
+    /// `publish_own_bundle`/`rename_own_profile`: the chosen `username#NNNN`
+    /// is already registered to a different identity. Callers retry with a
+    /// fresh discriminator up to a small attempt limit before surfacing
+    /// this.
+    #[error("that username is already taken")]
+    UsernameTaken,
+
+    /// `add_contact_by_username`: no account is registered under the given
+    /// `username#NNNN`.
+    #[error("no account is registered under that username")]
+    NoSuchAccount,
+
     #[error("filesystem error: {0}")]
     Io(#[from] std::io::Error),
 }

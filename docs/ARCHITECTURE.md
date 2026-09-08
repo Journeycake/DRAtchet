@@ -521,9 +521,9 @@ as different stacks.
 
 ### 6.1 Addressing: `username#NNNN`
 
-Each account has a self-chosen **username** plus a server-assigned random
-**4-digit discriminator**, e.g. `alice#4821` — regenerated on collision
-within that username (Discord's original scheme). The directory server maps
+Each account has a self-chosen **username** plus a random **4-digit
+discriminator**, e.g. `alice#4821` — regenerated on collision within that
+username (Discord's original scheme). The directory server maps
 `username#NNNN` → account ID → current prekey bundle (§3.2). This address is
 how you *locate* someone's prekey bundle; it is **not** proof of who
 controls it — the server could in principle be compromised or coerced into
@@ -531,6 +531,23 @@ serving a substituted bundle, which is exactly what §6.2 defends against.
 (Namespace note: a 4-digit discriminator caps a single username at 10,000
 accounts before it runs out — fine at the scale this project is targeting;
 flagged in §9 as revisitable if that ever becomes a real constraint.)
+
+**Implemented** (`dratchet_app::publish_own_bundle`/`rename_own_profile`):
+self-registration and rename are both a `PublishBundle` publish under a
+chosen username — a rename is nothing more than publishing again under a
+new one, no separate wire message. "Regenerated on collision" is a
+client-side behavior, not a server one: the wire protocol has the
+*client* propose a discriminator and the server only reject a collision
+(`Error::UsernameTaken`, surfaced via an explicit `Ack`/`Error` response
+`PublishBundle` didn't originally have — added specifically so a real
+client can detect the collision and retry), so `publish_own_bundle` is
+what actually makes the "regenerated on collision" promise true in
+practice, retrying with a fresh random discriminator a few times before
+giving up. Renaming also releases the account's *previous* username in
+the directory (`server/src/ws.rs`'s `publish_bundle`) — a real,
+independently-found gap in the original implementation where a stale
+handle would stay permanently resolvable, fixed as part of building
+rename rather than left for later.
 
 ### 6.2 Trust levels
 
@@ -557,7 +574,13 @@ Every contact is either:
   never as an active chat thread — until it resolves to Verified. There is
   no timeout that silently promotes a Pending contact to usable; the only
   way out is completing Path 1 or Path 2, or the user abandoning the
-  attempt.
+  attempt. **Path 2 (§6.4) as actually implemented never produces this
+  state at all** — its pairing-code gate gets checked *before* any contact
+  is created, so a Path 2 attempt either lands as `Verified` immediately
+  or leaves no contact (and no trace) at all; `Pending` remains reachable
+  only via Path 1 (§6.3)'s in-person QR flow, or a session established
+  some other way (e.g. this document's own dev-seeding tooling) that
+  hasn't been confirmed yet.
 - **Verified**: the identity key's fingerprint has been confirmed through
   one of the two paths below, and is pinned locally. Only a Verified
   contact's conversation can send/receive application messages. If the
@@ -669,45 +692,70 @@ there is UX friction (a deliberate, not-trivially-scriptable confirmation
 step) that raises the cost of automating the ceremony, not a guarantee of
 detecting it.
 
-### 6.4 Path 2 — remote pairing via username + single-use code
+### 6.4 Path 2 — remote pairing via username + single-use code — **v1, implemented**
 
-For contacts who aren't in the same room:
+For contacts who aren't in the same room. **Atomic and code-gated, not a
+two-step "TOFU-fetch, then upgrade Pending→Verified" flow** — an earlier
+draft of this section described the latter (fetch a bundle by
+`username#NNNN` first, land in `Pending`, exchange a code afterward to
+upgrade), which was deliberately reworked: a leaked or guessed username
+must never be enough, by itself, to make a contact/conversation attempt
+appear on someone's device at all, `Pending` included. The code doesn't
+confirm an already-established attempt here — it's the gate that decides
+whether an attempt is ever allowed to exist locally in the first place.
 
-1. Initiator looks up `username#NNNN` on the directory server and fetches
-   the prekey bundle — this alone is TOFU, no stronger than any first
-   contact today.
-2. The recipient's app generates a random, single-use, short-TTL numeric
+1. The recipient's app generates a random, single-use, short-TTL numeric
    pairing code (e.g. 6 digits, ~10-minute expiry; generating a new one
-   invalidates the previous code).
-3. The recipient reads that code to the initiator over a channel they
+   invalidates the previous code) — **before** the initiator does anything
+   at all.
+2. The recipient reads that code to the initiator over a channel they
    already trust more than the directory server (phone call, an existing
    verified DRAtchet conversation, in person, etc.) — the code is the "MFA"
    factor here: proof that the person on the other end of that channel
    currently controls the account, demonstrated by generating and reading
    it out.
-4. The initiator enters the code in-app. The client sends it back bound to
-   the current handshake's key material (so it can't be replayed against a
-   different session); the recipient's device checks the match, and both
-   sides are marked **Verified**.
-5. The code is consumed (deleted) on first successful match or on expiry,
-   whichever comes first; a fresh code is required for another attempt, and
-   attempts are rate-limited — a 6-digit space is brute-forceable without
-   that limit.
+3. The initiator enters `username#NNNN` and the code together, in one
+   action. Their client looks up the bundle, runs X3DH, and sends a single
+   message (`core::first_contact::FirstContactWire`,
+   `MESSAGE_SCHEMA.md` §3) whose *encrypted* content carries the code —
+   never the bare directory lookup on its own, and never anything the
+   recipient has to separately notice and decide to respond to.
+4. The recipient's device — scanning its own bootstrap inbox for exactly
+   this shape of message — derives the session, decrypts, and checks the
+   enclosed code against whatever it currently has stored. **A match**:
+   both sides' contact is created already `Verified`, atomically, and the
+   code is consumed. **Anything else** — wrong code, no code currently
+   stored, expired, attempts exhausted, or a bad identity-binding
+   signature on the message itself — and the attempt is discarded
+   silently: no contact, no error, no reply, no trace left to reprocess.
+   A prober gets no oracle for "does this account exist" or "was my guess
+   close."
+5. Attempts against a live code are rate-limited (exhausting the budget
+   refuses even the correct code until a fresh one is generated) — a
+   6-digit space is brute-forceable without that limit.
 
 Be precise about what this does and doesn't prove: it authenticates that
 whoever generated the code controls the account being paired with, and its
 security rests entirely on the secrecy/integrity of whatever side channel
 carried the code — the same property Signal's "compare safety number over a
 phone call" verification has. It is not stronger than the channel used to
-convey the code.
+convey the code. A leaked or forwarded (not just guessed) code within its
+TTL window would let someone else complete the exchange — same limitation
+any one-time code has, mitigated by the short TTL and single-use
+consumption, not eliminated.
 
-**Implemented (Phase 1.6.3, `store::verification::PairingCode`)** as data
-layer: a real 6-digit code, ~10-minute TTL, bound to the specific session
-it was generated for, with attempts rate-limited — exhausting the budget
-refuses even the correct code until a fresh one is generated, matching
-point 5 above exactly. As with §6.3, the routing-id exchange this path's
-session needs (§9/§11.1) travels automatically as its own encrypted
-protocol message, not through this pairing code.
+**Implemented** (`store::verification::PairingCode` for the code itself,
+persisted via `Db::save_pairing_code`/`load_pairing_code`/
+`clear_pairing_code`; `dratchet_app::generate_pairing_code`/
+`add_contact_by_username`/`receive_first_contact_attempts` for the flow
+end to end): the initiator side (fetch, X3DH, send) and the responder
+side (scan the shared bootstrap inbox — the same one §11.1 already
+documents as shared across every not-yet-transitioned contact — for
+`FirstContactWire`-shaped entries, verify, accept or silently discard)
+are both real, network-facing code, not data-layer-only. As with §6.3,
+the routing-id exchange this path's session needs (§11.1) travels
+automatically as its own encrypted protocol message once the contact
+exists, not through this pairing code.
 
 ### 6.5 What the mandatory gate blocks, and what it doesn't
 
@@ -1083,13 +1131,15 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
    verification (§6), message padding (§11.3), an "always relay, never
    direct-connect" per-contact privacy toggle (§11.2 — this is also what
    turns a v1 install into the server-based deployment model from §12 when
-   paired with running the relay on durable infrastructure), per-
-   conversation disappearing-message timers (§11.5), the three-level Tier 2
-   recovery profile system (§7) with a self-custodied recovery phrase,
-   hosted via storage option 1, the purpose-built server (`SERVERS.md`
-   §3.2), duress response — quick wipe and a separately-gated full
-   identity wipe, client-only, no protocol change (§11.9), and a
-   bilateral per-conversation wipe ("delete for everyone," §11.9a).
+   paired with running the relay on durable infrastructure), on-device
+   message retention as purge-on-request rather than a timer (§11.5), the
+   three-level Tier 2 recovery profile system (§7) with a self-custodied
+   recovery phrase, hosted via storage option 1, the purpose-built server
+   (`SERVERS.md` §3.2), duress response — quick wipe and a separately-gated
+   full identity wipe, client-only, no protocol change (§11.9), a
+   bilateral per-conversation wipe ("delete for everyone," §11.9a), and
+   self-registration/rename under `username#NNNN` (§6.1) with the
+   pairing-code-gated add-contact flow (§6.4) built end to end.
 3. **v2**: multi-device support (full roadmap, including the per-device
    identity model and how recovery profiles stay consistent across a
    user's own devices, in §14), group chat (MLS/RFC 9420 — full roadmap,
@@ -1371,7 +1421,7 @@ with periodic post-quantum rekeying through the session, not just at setup.
   extensibility point (above) actually proves out under real use, rather
   than shipping alongside it.
 
-### 11.5 On-device message retention — inspired by Signal/WhatsApp/Telegram disappearing messages — **v1**
+### 11.5 On-device message retention — **v1, implemented — deliberately not time-based**
 
 Gap, currently unaddressed by anything else in this document: the Double
 Ratchet's forward secrecy protects against a *future* key compromise, but
@@ -1383,25 +1433,28 @@ discarded — a different threat than anything §3.4's key-lifecycle table
 covers, because it's about the *client's own* durable copy, not a
 third party's.
 
-- **v1 (implemented, Phase 1.5.3, `store::Message`/`Db::sweep_expired_messages`)**:
-  per-conversation disappearing-message timer, user-configurable, default
-  "keep until manually deleted" but easy to set short (an hour, a day, a
-  week — standard presets, in seconds at the storage layer). On expiry,
-  the client deletes the local plaintext row — genuinely, swept on every
-  read and via an explicit periodic sweep, not merely hidden. Changing a
-  conversation's timer only affects messages saved after the change, never
-  retroactively. §11.9's duress-response wipe is the immediate,
-  user-triggered version of this same on-device-retention concern, rather
-  than a time-based one.
-- **Explicit interaction to surface in the UI, not just this document**: a
-  disappearing-message timer and Tier 2 recovery (§7) can be in tension — a
-  short local timer does not retroactively purge an already-agreed,
-  already-uploaded recovery backup entry. That's the existing, separate
-  "delete my backups" action from §7, not something a local timer triggers
-  automatically. A user enabling both features without understanding this
-  could reasonably believe "disappearing" means gone everywhere; the UI
-  needs to make the distinction visible at the point both settings are
-  live together, not leave it to this document.
+**Decided model: no time-based deletion at all.** An earlier v1 draft of
+this section specified a Signal/WhatsApp/Telegram-style per-conversation
+disappearing-message timer (`store::Message::expires_at`,
+`Db::sweep_expired_messages`, a periodic background sweep). Asked
+directly, the answer was to reject that whole model: deletion here is
+exclusively **user-triggered**, via exactly two actions —
+
+1. **Purge** — messages only, this device's copy.
+2. **Emergency purge** — messages *and* this conversation's ratchet/session
+   state, ending it.
+
+Both already exist as §11.9a's per-conversation wipe
+(`Db::wipe_conversation(conv_id, include_session)`,
+`dratchet_app::request_conversation_wipe`) — `include_session = false` is
+the purge, `true` is the emergency purge. Nothing new needed building for
+enforcement; the disappearing-timer code (the `expires_at` field, the
+sweep, and its never-wired-into-the-shell background task) was removed
+outright rather than left dormant, since dead code implementing a
+rejected deletion model has no place lingering in a security-sensitive
+app. §7's Tier 2 recovery still has its own, separate "delete my backups"
+action — unaffected by this section either way, since it was never a
+timer-driven interaction in the first place.
 
 ### 11.6 Deniability — the OTR (Off-the-Record Messaging) lineage — **documentation-only**
 
@@ -1872,7 +1925,7 @@ still holds. New, group-specific items:
    group envelope.
 2. **v2.1 — groups hardening**: epoch authenticator / manual group-state
    verification (split-view detection, §13.4), Delivery Service abuse
-   resistance (§13.4), group-aware disappearing-message timers (§11.5,
+   resistance (§13.4), group-aware purge/emergency-purge (§11.5/§11.9a,
    extended the same way recovery was).
 3. **Research track**: federated (multi-operator) Group Coordination
    Services — the group-chat analog of §12.4's single-operator-vs-

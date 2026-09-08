@@ -11,23 +11,18 @@
 //! toolkit, a database schema, or a network detail beyond what
 //! `dratchet_client::net::Connection`/`dratchet_store::Db` already expose.
 //!
-//! **Deliberately not built here — a real, currently-unimplemented
-//! protocol gap found while scoping this crate, not a shortcut**:
-//! starting a brand-new conversation purely from a `username#NNNN`
-//! lookup. `docs/MESSAGE_SCHEMA.md` §3 documents an "X3DH session-
-//! establishment message" wire format carrying
-//! `initiator_identity_fingerprint` (so a responder can identify who's
-//! messaging them) bundled with the first ratchet envelope — but
-//! `core::x3dh::X3dhInitMessage` (what's actually implemented) carries
-//! neither of those, and no wire type for it exists in
-//! `dratchet_server::protocol`. Without that, a responder who's never
-//! heard of the initiator has no way to discover the attempt or
-//! reconstruct their side of the ratchet from the wire alone. Every
-//! function below therefore operates on a contact whose `RatchetState`
-//! already exists (persisted via `Db::save_ratchet`) — exactly the
-//! shape `store/tests/routing_id_exchange.rs` already proves end-to-end.
-//! Fixing the gap above is real follow-on work, flagged here rather than
-//! worked around.
+//! **Starting a brand-new conversation purely from a `username#NNNN`
+//! lookup** used to be a real, flagged gap here: the responder had no way
+//! to discover an unsolicited first-contact attempt at all. Closed by
+//! [`add_contact_by_username`] (initiator) and
+//! [`receive_first_contact_attempts`] (responder), built around
+//! `core::first_contact::FirstContactWire` — and deliberately *not* just
+//! "fetch a bundle and land in Pending": a leaked or guessed username must
+//! never be enough by itself to make an attempt appear on someone's
+//! device, so the wire message is gated on a pairing code the recipient
+//! generates and shares out of band *before* anything can reach them
+//! (`docs/ARCHITECTURE.md` §6.4). Every other function below still
+//! operates on a contact whose `RatchetState` already exists.
 
 pub mod error;
 
@@ -37,16 +32,25 @@ use dratchet_client::net::Connection;
 use dratchet_core::account::Account;
 use dratchet_core::conversation_id;
 use dratchet_core::envelope::Envelope;
+use dratchet_core::first_contact::FirstContactWire;
+use dratchet_core::identity::fingerprint_of_public_key;
 use dratchet_core::payload::{
-    ConversationWipePolicyAnnounce, RoutingIdAnnounce, PAYLOAD_CHAT,
+    ConversationWipePolicyAnnounce, FirstContactContent, RoutingIdAnnounce, PAYLOAD_CHAT,
     PAYLOAD_CONVERSATION_WIPE_POLICY_ANNOUNCE, PAYLOAD_CONVERSATION_WIPE_REQUEST,
-    PAYLOAD_ROUTING_ID_ANNOUNCE,
+    PAYLOAD_FIRST_CONTACT, PAYLOAD_ROUTING_ID_ANNOUNCE,
 };
-use dratchet_core::x3dh::bootstrap_mailbox_id;
+use dratchet_core::prekey::{OneTimePrekeyPublic, PrekeyBundle, SignedPrekeyPublic};
+use dratchet_core::ratchet::{RatchetState, DEFAULT_MAX_SKIP};
+use dratchet_core::x3dh::{self, bootstrap_mailbox_id};
 use dratchet_server::protocol::{
-    Ack, FrameTag, MailboxDelete, MailboxEntries, MailboxFetch, MailboxWrite,
+    Ack, BundleResult, ErrorFrame, FetchBundle, FetchedBundleWire, FrameTag, MailboxDelete,
+    MailboxEntries, MailboxFetch, MailboxWrite, OneTimePrekeyWire, PrekeyBundleWire, PublishBundle,
 };
-use dratchet_store::{decrypt_gated, encrypt_gated, Contact, Db, Message};
+use dratchet_store::{
+    decrypt_gated, encrypt_gated, Contact, Db, Message, OwnProfile, PairingCode, VerificationState,
+};
+use rand_core::{OsRng, RngCore};
+use x25519_dalek::PublicKey;
 
 /// Load the local account, or generate and persist a fresh one if this is
 /// a brand-new `Db` — the one-time "first launch" path a UI's startup
@@ -76,6 +80,460 @@ fn conversation_id_for(account: &Account, contact: &Contact) -> [u8; 16] {
         account.identity.fingerprint().as_bytes(),
         &contact.fingerprint,
     )
+}
+
+fn now_unix() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after the Unix epoch")
+        .as_secs()
+}
+
+fn random_routing_id() -> Vec<u8> {
+    let mut buf = [0u8; 32];
+    OsRng.fill_bytes(&mut buf);
+    buf.to_vec()
+}
+
+/// Convert a directory-fetched `FetchedBundleWire` into the real
+/// `core::prekey::PrekeyBundle` X3DH needs — the same shape every test in
+/// this workspace already hand-rolls (`app/tests/pairing_and_chat.rs`
+/// among others), promoted here since [`add_contact_by_username`] is the
+/// first *production* code path that needs it.
+fn to_core_bundle(wire: &FetchedBundleWire) -> Result<PrekeyBundle> {
+    let identity_dh_public: [u8; 32] =
+        wire.identity_dh_public.as_slice().try_into().map_err(|_| {
+            Error::Connection("fetched bundle: identity_dh_public must be 32 bytes".into())
+        })?;
+    let signed_prekey_public: [u8; 32] =
+        wire.signed_prekey.as_slice().try_into().map_err(|_| {
+            Error::Connection("fetched bundle: signed_prekey must be 32 bytes".into())
+        })?;
+    Ok(PrekeyBundle {
+        identity_public_key: wire.identity_key.clone(),
+        identity_dh_public: PublicKey::from(identity_dh_public),
+        identity_dh_signature: wire.identity_dh_signature.clone(),
+        signed_prekey: SignedPrekeyPublic {
+            id: wire.signed_prekey_id,
+            public: PublicKey::from(signed_prekey_public),
+            signature: wire.signed_prekey_sig.clone(),
+        },
+        one_time_prekey: wire
+            .one_time_prekey
+            .as_ref()
+            .map(|otp| -> Result<OneTimePrekeyPublic> {
+                let public: [u8; 32] = otp.key.as_slice().try_into().map_err(|_| {
+                    Error::Connection("fetched bundle: one_time_prekey.key must be 32 bytes".into())
+                })?;
+                Ok(OneTimePrekeyPublic {
+                    id: otp.id,
+                    public: PublicKey::from(public),
+                })
+            })
+            .transpose()?,
+    })
+}
+
+/// Send a `PublishBundle` and interpret the real response — unlike every
+/// other command this crate sends, a successful `PublishBundle` used to
+/// get no response at all (`server/src/ws.rs` now sends an explicit
+/// `Ack`, added specifically so this function can detect `UsernameTaken`
+/// and retry with a fresh discriminator, per §6.1's "regenerated on
+/// collision"). `Connection::recv`'s usual "decode the body as the type I
+/// expect" doesn't work here since the response could be either an `Ack`
+/// or an `Error` — this reads the raw frame and dispatches on its tag
+/// instead.
+async fn publish_bundle_wire(conn: &mut Connection, wire: PrekeyBundleWire) -> Result<()> {
+    conn.send(FrameTag::PublishBundle, &PublishBundle { bundle: wire })
+        .await?;
+    let raw = conn.recv_raw().await?;
+    let (tag, body) =
+        dratchet_server::protocol::split_tag(&raw).map_err(|e| Error::Connection(e.to_string()))?;
+    match tag {
+        FrameTag::Ack => Ok(()),
+        FrameTag::Error => {
+            let err: ErrorFrame = dratchet_server::protocol::decode_body(body)
+                .map_err(|e| Error::Connection(e.to_string()))?;
+            if err.message == dratchet_server::error::Error::UsernameTaken.to_string() {
+                Err(Error::UsernameTaken)
+            } else {
+                Err(Error::Connection(err.message))
+            }
+        }
+        other => Err(Error::Connection(format!(
+            "unexpected frame tag {other:?} from PublishBundle"
+        ))),
+    }
+}
+
+const ONE_TIME_PREKEY_BATCH: u32 = 10;
+const DISCRIMINATOR_RETRY_ATTEMPTS: u32 = 5;
+
+fn random_discriminator() -> u16 {
+    (OsRng.next_u32() % 10_000) as u16
+}
+
+/// Self-registration, `docs/ARCHITECTURE.md` §6.1: publish this device's
+/// own prekey bundle under `desired_username`, picking a random 4-digit
+/// discriminator and retrying with a fresh one on `Error::UsernameTaken`.
+/// Persists both `account` (the freshly generated one-time prekeys' secret
+/// halves need to survive for [`receive_first_contact_attempts`] to spend
+/// later) and the resulting [`OwnProfile`].
+pub async fn publish_own_bundle(
+    db: &Db,
+    conn: &mut Connection,
+    account: &mut Account,
+    desired_username: &str,
+) -> Result<OwnProfile> {
+    let otp_publics = account.generate_one_time_prekeys(ONE_TIME_PREKEY_BATCH);
+    let bundle = account.publish_bundle(false)?;
+    let one_time_prekeys: Vec<OneTimePrekeyWire> = otp_publics
+        .into_iter()
+        .map(|otp| OneTimePrekeyWire {
+            id: otp.id,
+            key: otp.public.as_bytes().to_vec(),
+        })
+        .collect();
+
+    let mut last_err = Error::UsernameTaken;
+    for _ in 0..DISCRIMINATOR_RETRY_ATTEMPTS {
+        let discriminator = random_discriminator();
+        let wire = PrekeyBundleWire {
+            username: desired_username.to_string(),
+            discriminator,
+            identity_key: bundle.identity_public_key.clone(),
+            identity_dh_public: bundle.identity_dh_public.as_bytes().to_vec(),
+            identity_dh_signature: bundle.identity_dh_signature.clone(),
+            signed_prekey_id: bundle.signed_prekey.id,
+            signed_prekey: bundle.signed_prekey.public.as_bytes().to_vec(),
+            signed_prekey_sig: bundle.signed_prekey.signature.clone(),
+            signed_prekey_expires_at: 0,
+            one_time_prekeys: one_time_prekeys.clone(),
+            registration_pow: Some(dratchet_server::abuse::solve_registration_pow(
+                desired_username,
+                discriminator,
+                &bundle.identity_public_key,
+            )),
+        };
+        match publish_bundle_wire(conn, wire).await {
+            Ok(()) => {
+                db.save_account(account)?;
+                let profile = OwnProfile {
+                    username: desired_username.to_string(),
+                    discriminator,
+                    signed_prekey_id: bundle.signed_prekey.id,
+                };
+                db.save_own_profile(&profile)?;
+                return Ok(profile);
+            }
+            Err(Error::UsernameTaken) => {
+                last_err = Error::UsernameTaken;
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err)
+}
+
+/// A rename is nothing more than re-publishing under a new username —
+/// [`publish_own_bundle`] already handles the collision-retry and
+/// persistence either way.
+pub async fn rename_own_profile(
+    db: &Db,
+    conn: &mut Connection,
+    account: &mut Account,
+    new_username: &str,
+) -> Result<OwnProfile> {
+    publish_own_bundle(db, conn, account, new_username).await
+}
+
+/// Generate and persist a fresh pairing code for `docs/ARCHITECTURE.md`
+/// §6.4's pairing-code-gated add-contact flow — display it in the UI to
+/// be read out over an already-trusted channel (phone call, an existing
+/// verified conversation, in person). Generating a new one invalidates
+/// whatever was stored before, per §6.4: `Db::save_pairing_code` is a
+/// singleton.
+pub fn generate_pairing_code(db: &Db) -> Result<PairingCode> {
+    let code = PairingCode::generate(vec![], now_unix());
+    db.save_pairing_code(&code)?;
+    Ok(code)
+}
+
+/// `docs/ARCHITECTURE.md` §6.4's pairing-code-gated add-contact — the
+/// *initiator* side. Fetches `username#discriminator`'s bundle, runs
+/// X3DH, and sends a `FirstContactWire` whose ratchet-encrypted content
+/// carries `pairing_code` (the code the peer read out over an
+/// already-trusted channel) plus this side's own `username#NNNN` (so the
+/// peer's client can label the new contact without a directory
+/// round-trip). The new contact is saved locally as already `Verified` —
+/// the code exchange over a trusted side channel *is* this path's
+/// authentication (matches §6.4's own documented limits: it authenticates
+/// that whoever generated the code controls the account, no stronger than
+/// the channel that carried it).
+///
+/// There is no reply to wait for (this crate's standing no-delivery-
+/// receipt limitation — see [`decline_pending_wipe`]'s doc), so a wrong or
+/// expired code produces no visible difference on this side either: the
+/// peer's device just never surfaces anything, silently, by design (see
+/// [`receive_first_contact_attempts`]).
+pub async fn add_contact_by_username(
+    db: &Db,
+    conn: &mut Connection,
+    account: &Account,
+    own_profile: &OwnProfile,
+    username: &str,
+    discriminator: u16,
+    pairing_code: &str,
+) -> Result<Contact> {
+    conn.send(
+        FrameTag::FetchBundle,
+        &FetchBundle {
+            username: username.to_string(),
+            discriminator,
+        },
+    )
+    .await?;
+    let (_, result): (_, BundleResult) = conn.recv().await?;
+    let fetched = result.bundle.ok_or(Error::NoSuchAccount)?;
+
+    let core_bundle = to_core_bundle(&fetched)?;
+    let init = x3dh::initiate(
+        account.identity_dh_secret(),
+        account.identity_dh_public,
+        &core_bundle,
+    )?;
+
+    let peer_fp = *fingerprint_of_public_key(&fetched.identity_key).as_bytes();
+    let conv_id = conversation_id(account.identity.fingerprint().as_bytes(), &peer_fp);
+    let mut ratchet = RatchetState::init_as_initiator(
+        conv_id,
+        init.root_key,
+        core_bundle.signed_prekey.public,
+        DEFAULT_MAX_SKIP,
+    )?;
+
+    let self_bundle = account.publish_bundle(false)?;
+    let content = FirstContactContent {
+        pairing_code: pairing_code.to_string(),
+        username: own_profile.username.clone(),
+        discriminator: own_profile.discriminator,
+    }
+    .encode();
+    let envelope = ratchet.encrypt_payload(PAYLOAD_FIRST_CONTACT, &content)?;
+
+    let wire = FirstContactWire {
+        initiator_identity_key: self_bundle.identity_public_key,
+        initiator_identity_dh_public: self_bundle.identity_dh_public.as_bytes().to_vec(),
+        initiator_identity_dh_signature: self_bundle.identity_dh_signature,
+        initiator_ephemeral_public: init.message.initiator_ephemeral_public.as_bytes().to_vec(),
+        used_signed_prekey_id: init.message.used_signed_prekey_id,
+        used_one_time_prekey_id: init.message.used_one_time_prekey_id,
+        envelope: envelope.encode(),
+    };
+
+    conn.send(
+        FrameTag::MailboxWrite,
+        &MailboxWrite {
+            mailbox_id: bootstrap_mailbox_id(&peer_fp).to_vec(),
+            envelope: wire.encode(),
+            ttl: 14 * 24 * 60 * 60,
+        },
+    )
+    .await?;
+    let (_, ack): (_, Ack) = conn.recv().await?;
+    if !ack.ok {
+        return Err(Error::NotAcknowledged);
+    }
+
+    let routing_id = random_routing_id();
+    let contact = Contact {
+        fingerprint: peer_fp.to_vec(),
+        username: Some(fetched.username),
+        discriminator: Some(fetched.discriminator),
+        verification_state: VerificationState::Verified,
+        mailbox_id: bootstrap_mailbox_id(&peer_fp).to_vec(),
+        created_at: now_unix(),
+        local_routing_id: routing_id.clone(),
+        peer_routing_id: None,
+        wipe_ask_before_delete: false,
+        peer_wipe_ask_before_delete: None,
+        wipe_include_session: false,
+        peer_wipe_include_session: None,
+        wipe_request_pending: false,
+    };
+    db.save_contact(&contact)?;
+    db.save_ratchet(conv_id, &ratchet)?;
+
+    announce_routing_id(db, conn, account, &contact, routing_id).await?;
+    Ok(contact)
+}
+
+/// `docs/ARCHITECTURE.md` §6.4's pairing-code-gated add-contact — the
+/// *responder* side. Scans the shared pre-transition inbox
+/// (`bootstrap_mailbox_id(account's fp)` — the same one
+/// [`receive_pending`]'s doc describes as shared across every
+/// not-yet-transitioned contact) for entries that don't decode as an
+/// ordinary `Envelope` — those are left alone for `receive_pending` to
+/// process — and do decode as a `FirstContactWire`: verifies the
+/// initiator's identity-binding signature, runs `x3dh::respond`, and
+/// checks the enclosed pairing code against whatever this device
+/// currently has stored (`Db::load_pairing_code`).
+///
+/// **On a match**: consumes the stored code (single-use), saves a new
+/// already-`Verified` `Contact` + ratchet, announces this side's routing
+/// id, and includes the new contact in the returned list.
+///
+/// **On anything else** — no code stored, wrong code, expired, attempts
+/// exhausted, or a bad identity-binding signature — the mailbox entry is
+/// still deleted (so it isn't reprocessed every poll), but nothing else
+/// happens: no contact, no error, no reply to the sender. A leaked or
+/// guessed username must never be enough by itself to make an attempt
+/// appear here — that's the whole point of gating on the code rather than
+/// the earlier "fetch a bundle, land in Pending" shape.
+pub async fn receive_first_contact_attempts(
+    db: &Db,
+    conn: &mut Connection,
+    account: &mut Account,
+) -> Result<Vec<Contact>> {
+    let own_fp = *account.identity.fingerprint().as_bytes();
+    let inbox = bootstrap_mailbox_id(&own_fp).to_vec();
+
+    conn.send(
+        FrameTag::MailboxFetch,
+        &MailboxFetch {
+            mailbox_id: inbox.clone(),
+        },
+    )
+    .await?;
+    let (_, entries): (_, MailboxEntries) = conn.recv().await?;
+
+    let mut new_contacts = Vec::new();
+    let mut account_dirty = false;
+    for entry in &entries.entries {
+        // Ordinary ratchet envelopes (already-known contacts' traffic
+        // sharing this same pre-transition inbox) decode successfully
+        // here — leave those alone for `receive_pending` to handle.
+        if Envelope::decode(&entry.envelope).is_ok() {
+            continue;
+        }
+        let Ok(wire) = FirstContactWire::decode(&entry.envelope) else {
+            continue;
+        };
+
+        if let Some(contact) = try_accept_first_contact(db, account, &wire, &mut account_dirty)? {
+            let routing_id = contact.local_routing_id.clone();
+            announce_routing_id(db, conn, account, &contact, routing_id).await?;
+            new_contacts.push(contact);
+        }
+
+        conn.send(
+            FrameTag::MailboxDelete,
+            &MailboxDelete {
+                mailbox_id: inbox.clone(),
+                entry_id: entry.entry_id.clone(),
+            },
+        )
+        .await?;
+        let (_, ack): (_, Ack) = conn.recv().await?;
+        if !ack.ok {
+            return Err(Error::NotAcknowledged);
+        }
+    }
+
+    if account_dirty {
+        db.save_account(account)?;
+    }
+    Ok(new_contacts)
+}
+
+/// The actual accept/reject decision for one [`FirstContactWire`] —
+/// factored out of [`receive_first_contact_attempts`] since that function
+/// already has its hands full with the mailbox loop. Returns `Ok(None)`
+/// for every rejection path (never an `Err`, since a malformed or
+/// adversarial first-contact attempt must never abort the whole batch —
+/// see the caller's `let Ok(...) = ... else { continue }` precedent one
+/// level up for the same reasoning applied to decode failures).
+fn try_accept_first_contact(
+    db: &Db,
+    account: &mut Account,
+    wire: &FirstContactWire,
+    account_dirty: &mut bool,
+) -> Result<Option<Contact>> {
+    if wire.verify_identity_binding().is_err() {
+        return Ok(None);
+    }
+    let Ok(init_message) = wire.x3dh_init_message() else {
+        return Ok(None);
+    };
+
+    let otp_secret = init_message
+        .used_one_time_prekey_id
+        .and_then(|id| account.take_one_time_prekey_secret(id));
+    if init_message.used_one_time_prekey_id.is_some() && otp_secret.is_none() {
+        // Named an id we don't have (already consumed, or never existed) —
+        // can't derive the same root key the initiator did.
+        return Ok(None);
+    }
+    let root_key = x3dh::respond(
+        account.identity_dh_secret(),
+        account.signed_prekey_secret(),
+        otp_secret.as_ref(),
+        &init_message,
+    );
+    if otp_secret.is_some() {
+        *account_dirty = true;
+    }
+
+    let peer_fp = *fingerprint_of_public_key(&wire.initiator_identity_key).as_bytes();
+    let conv_id = conversation_id(account.identity.fingerprint().as_bytes(), &peer_fp);
+    let Ok(mut ratchet) = RatchetState::init_as_responder(
+        conv_id,
+        root_key,
+        account.signed_prekey_secret().clone(),
+        DEFAULT_MAX_SKIP,
+    ) else {
+        return Ok(None);
+    };
+
+    let Ok((PAYLOAD_FIRST_CONTACT, content)) =
+        Envelope::decode(&wire.envelope).and_then(|env| ratchet.decrypt_payload(&env))
+    else {
+        return Ok(None);
+    };
+    let Ok(announced) = FirstContactContent::decode(&content) else {
+        return Ok(None);
+    };
+
+    let Some(mut stored_code) = db.load_pairing_code()? else {
+        return Ok(None);
+    };
+    let matched = stored_code.verify(&announced.pairing_code, &[], now_unix());
+    db.save_pairing_code(&stored_code)?;
+    if !matched {
+        return Ok(None);
+    }
+    db.clear_pairing_code()?;
+
+    let contact = Contact {
+        fingerprint: peer_fp.to_vec(),
+        username: Some(announced.username),
+        discriminator: Some(announced.discriminator),
+        verification_state: VerificationState::Verified,
+        mailbox_id: bootstrap_mailbox_id(&peer_fp).to_vec(),
+        created_at: now_unix(),
+        local_routing_id: random_routing_id(),
+        peer_routing_id: None,
+        wipe_ask_before_delete: false,
+        peer_wipe_ask_before_delete: None,
+        wipe_include_session: false,
+        peer_wipe_include_session: None,
+        wipe_request_pending: false,
+    };
+    db.save_contact(&contact)?;
+    db.save_ratchet(conv_id, &ratchet)?;
+    Ok(Some(contact))
 }
 
 /// Encrypt and send `content` to `contact`, refusing (via
@@ -110,7 +568,7 @@ pub async fn send_message(
     }
 
     db.save_ratchet(conv_id, &ratchet)?;
-    Ok(db.save_message_now(conv_id, contact, content.to_vec(), true)?)
+    Ok(db.save_message_now(conv_id, content.to_vec(), true)?)
 }
 
 /// Fetch and process everything currently sitting in the mailbox `contact`
@@ -197,7 +655,7 @@ pub async fn receive_pending(
                 db.record_peer_routing_id(&contact.fingerprint, announce.routing_id)?;
             }
             Ok((PAYLOAD_CHAT, content)) => {
-                received.push(db.save_message_now(conv_id, contact, content, false)?);
+                received.push(db.save_message_now(conv_id, content, false)?);
             }
             Ok((PAYLOAD_CONVERSATION_WIPE_POLICY_ANNOUNCE, content)) => {
                 let announce = ConversationWipePolicyAnnounce::decode(&content)?;

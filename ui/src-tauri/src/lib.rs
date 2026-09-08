@@ -37,7 +37,15 @@ const INBOX_UPDATED_EVENT: &str = "dratchet://inbox-updated";
 struct AppState {
     db: Db,
     db_path: PathBuf,
-    account: Account,
+    // Behind a `Mutex` (not just `db`/`db_path`) because
+    // `register_own_profile`/`rename_own_profile`/the poll loop's
+    // first-contact scan all need `&mut Account` — self-registration and
+    // discovering a first-contact attempt both consume one-time-prekey
+    // secrets that have to survive in memory (and get persisted back to
+    // `db`) between calls. `tokio::sync::Mutex`, not `std::sync::Mutex`,
+    // since these calls hold it across real network `.await`s — same
+    // reason `conn` already uses one.
+    account: Arc<Mutex<Account>>,
     conn: Arc<Mutex<Connection>>,
 }
 
@@ -68,6 +76,32 @@ struct MessageDto {
     sender_is_local: bool,
     content: String,
     timestamp: u64,
+}
+
+/// This device's own directory-facing profile (`dratchet_store::OwnProfile`),
+/// reshaped as `username#NNNN` the same way `ContactDto::handle` is.
+#[derive(Serialize)]
+struct OwnProfileDto {
+    handle: String,
+    username: String,
+    discriminator: u16,
+}
+
+fn to_own_profile_dto(profile: &dratchet_store::OwnProfile) -> OwnProfileDto {
+    OwnProfileDto {
+        handle: format!("{}#{:04}", profile.username, profile.discriminator),
+        username: profile.username.clone(),
+        discriminator: profile.discriminator,
+    }
+}
+
+/// A freshly generated pairing code, reshaped for the frontend: an
+/// absolute expiry timestamp (Unix seconds) instead of a TTL, so the UI's
+/// countdown doesn't need to know `PAIRING_CODE_TTL_SECS` itself.
+#[derive(Serialize)]
+struct PairingCodeDto {
+    code: String,
+    expires_at: u64,
 }
 
 fn to_contact_dto(contact: &Contact) -> ContactDto {
@@ -120,15 +154,19 @@ fn list_contacts(state: State<AppState>) -> Result<Vec<ContactDto>, String> {
 }
 
 #[tauri::command]
-fn list_messages(state: State<AppState>, fingerprint: String) -> Result<Vec<MessageDto>, String> {
+async fn list_messages(
+    state: State<'_, AppState>,
+    fingerprint: String,
+) -> Result<Vec<MessageDto>, String> {
     let fp = hex::decode(&fingerprint)?;
     let contact = state
         .db
         .load_contact(&fp)
         .map_err(|e| e.to_string())?
         .ok_or("no such contact")?;
-    let messages = dratchet_app::list_messages(&state.db, &state.account, &contact)
-        .map_err(|e| e.to_string())?;
+    let account = state.account.lock().await;
+    let messages =
+        dratchet_app::list_messages(&state.db, &account, &contact).map_err(|e| e.to_string())?;
     Ok(messages.iter().map(to_message_dto).collect())
 }
 
@@ -145,15 +183,11 @@ async fn send_message(
         .map_err(|e| e.to_string())?
         .ok_or("no such contact")?;
     let mut conn = state.conn.lock().await;
-    let message = dratchet_app::send_message(
-        &state.db,
-        &mut conn,
-        &state.account,
-        &contact,
-        content.as_bytes(),
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+    let account = state.account.lock().await;
+    let message =
+        dratchet_app::send_message(&state.db, &mut conn, &account, &contact, content.as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
     Ok(to_message_dto(&message))
 }
 
@@ -173,10 +207,11 @@ async fn set_wipe_policy(
         .map_err(|e| e.to_string())?
         .ok_or("no such contact")?;
     let mut conn = state.conn.lock().await;
+    let account = state.account.lock().await;
     dratchet_app::announce_wipe_policy(
         &state.db,
         &mut conn,
-        &state.account,
+        &account,
         &contact,
         ask_before_delete,
         include_session,
@@ -201,22 +236,26 @@ async fn request_conversation_wipe(
         .map_err(|e| e.to_string())?
         .ok_or("no such contact")?;
     let mut conn = state.conn.lock().await;
-    dratchet_app::request_conversation_wipe(&state.db, &mut conn, &state.account, &contact)
+    let account = state.account.lock().await;
+    dratchet_app::request_conversation_wipe(&state.db, &mut conn, &account, &contact)
         .await
         .map_err(|e| e.to_string())
 }
 
 /// The "Allow" side of an incoming wipe request (`ContactDto::wipe_request_pending`).
 #[tauri::command]
-fn confirm_pending_wipe(state: State<AppState>, fingerprint: String) -> Result<usize, String> {
+async fn confirm_pending_wipe(
+    state: State<'_, AppState>,
+    fingerprint: String,
+) -> Result<usize, String> {
     let fp = hex::decode(&fingerprint)?;
     let contact = state
         .db
         .load_contact(&fp)
         .map_err(|e| e.to_string())?
         .ok_or("no such contact")?;
-    dratchet_app::confirm_pending_wipe(&state.db, &state.account, &contact)
-        .map_err(|e| e.to_string())
+    let account = state.account.lock().await;
+    dratchet_app::confirm_pending_wipe(&state.db, &account, &contact).map_err(|e| e.to_string())
 }
 
 /// The "Decline" side of an incoming wipe request.
@@ -230,6 +269,91 @@ fn decline_pending_wipe(state: State<AppState>, fingerprint: String) -> Result<(
         .ok_or("no such contact")?;
     dratchet_app::decline_pending_wipe(&state.db, &contact).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// This device's own registered profile, if self-registration
+/// (`register_own_profile`) has ever run — `None` gates the Settings
+/// "Choose a username" form vs. the normal profile display.
+#[tauri::command]
+fn get_own_profile(state: State<AppState>) -> Result<Option<OwnProfileDto>, String> {
+    state
+        .db
+        .load_own_profile()
+        .map(|opt| opt.as_ref().map(to_own_profile_dto))
+        .map_err(|e| e.to_string())
+}
+
+/// First-run self-registration, `docs/ARCHITECTURE.md` §6.1 — publishes
+/// this device's own prekey bundle under `username`, picking (and
+/// retrying on collision) a random discriminator.
+#[tauri::command]
+async fn register_own_profile(
+    state: State<'_, AppState>,
+    username: String,
+) -> Result<OwnProfileDto, String> {
+    let mut conn = state.conn.lock().await;
+    let mut account = state.account.lock().await;
+    let profile = dratchet_app::publish_own_bundle(&state.db, &mut conn, &mut account, &username)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(to_own_profile_dto(&profile))
+}
+
+/// §6.1's rename — re-publishes under `new_username`.
+#[tauri::command]
+async fn rename_own_profile(
+    state: State<'_, AppState>,
+    new_username: String,
+) -> Result<OwnProfileDto, String> {
+    let mut conn = state.conn.lock().await;
+    let mut account = state.account.lock().await;
+    let profile =
+        dratchet_app::rename_own_profile(&state.db, &mut conn, &mut account, &new_username)
+            .await
+            .map_err(|e| e.to_string())?;
+    Ok(to_own_profile_dto(&profile))
+}
+
+/// §6.4's pairing-code-gated add-contact — generates and displays this
+/// device's live code, to be read out over an already-trusted channel.
+#[tauri::command]
+fn generate_pairing_code(state: State<AppState>) -> Result<PairingCodeDto, String> {
+    let code = dratchet_app::generate_pairing_code(&state.db).map_err(|e| e.to_string())?;
+    Ok(PairingCodeDto {
+        code: code.code,
+        expires_at: code.generated_at + dratchet_store::PAIRING_CODE_TTL_SECS,
+    })
+}
+
+/// §6.4's pairing-code-gated add-contact — the initiator side. Requires
+/// this device to already have its own registered profile (the peer's
+/// client labels the new contact from it).
+#[tauri::command]
+async fn add_contact(
+    state: State<'_, AppState>,
+    username: String,
+    discriminator: u16,
+    pairing_code: String,
+) -> Result<ContactDto, String> {
+    let own_profile = state
+        .db
+        .load_own_profile()
+        .map_err(|e| e.to_string())?
+        .ok_or("choose a username for yourself first")?;
+    let mut conn = state.conn.lock().await;
+    let account = state.account.lock().await;
+    let contact = dratchet_app::add_contact_by_username(
+        &state.db,
+        &mut conn,
+        &account,
+        &own_profile,
+        &username,
+        discriminator,
+        &pairing_code,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(to_contact_dto(&contact))
 }
 
 /// `docs/ARCHITECTURE.md` §11.9's **quick wipe** — the Settings "Danger
@@ -258,9 +382,11 @@ fn full_wipe(state: State<AppState>, app: AppHandle) -> Result<(), String> {
 }
 
 /// Background receive loop, spawned once in `.setup()`: every
-/// `POLL_INTERVAL`, calls `dratchet_app::receive_pending` for every saved
-/// contact (`Pending` ones included — that's the only way a
-/// `RoutingIdAnnounce` ever gets processed) and, on any actual change (a
+/// `POLL_INTERVAL`, scans for new §6.4 pairing-code-gated first-contact
+/// attempts (`dratchet_app::receive_first_contact_attempts`) and calls
+/// `dratchet_app::receive_pending` for every saved contact (`Pending`
+/// ones included — that's the only way a `RoutingIdAnnounce` ever gets
+/// processed) and, on any actual change (a new contact discovered, a
 /// message received, a contact's mailbox transitioning off its bootstrap
 /// address, or `Received::wipe_activity` — a wipe-policy announcement
 /// recorded or a wipe request auto-complied/set pending, §11.9a), emits
@@ -272,6 +398,19 @@ async fn poll_loop(app_handle: AppHandle) {
         ticker.tick().await;
         let state = app_handle.state::<AppState>();
 
+        let mut changed = false;
+        {
+            let mut conn = state.conn.lock().await;
+            let mut account = state.account.lock().await;
+            match dratchet_app::receive_first_contact_attempts(&state.db, &mut conn, &mut account)
+                .await
+            {
+                Ok(new_contacts) if !new_contacts.is_empty() => changed = true,
+                Ok(_) => {}
+                Err(e) => eprintln!("poll: receive_first_contact_attempts failed: {e}"),
+            }
+        }
+
         let contacts = match dratchet_app::list_contacts(&state.db) {
             Ok(contacts) => contacts,
             Err(e) => {
@@ -280,12 +419,12 @@ async fn poll_loop(app_handle: AppHandle) {
             }
         };
 
-        let mut changed = false;
         for contact in contacts {
             let mailbox_before = contact.mailbox_id.clone();
             let received = {
                 let mut conn = state.conn.lock().await;
-                dratchet_app::receive_pending(&state.db, &mut conn, &state.account, &contact).await
+                let account = state.account.lock().await;
+                dratchet_app::receive_pending(&state.db, &mut conn, &account, &contact).await
             };
             match received {
                 Ok(outcome) if !outcome.messages.is_empty() || outcome.wipe_activity => {
@@ -337,6 +476,7 @@ pub fn run() {
         conn
     });
     let conn = Arc::new(Mutex::new(conn));
+    let account = Arc::new(Mutex::new(account));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -354,6 +494,11 @@ pub fn run() {
             request_conversation_wipe,
             confirm_pending_wipe,
             decline_pending_wipe,
+            get_own_profile,
+            register_own_profile,
+            rename_own_profile,
+            generate_pairing_code,
+            add_contact,
             quick_wipe,
             full_wipe
         ])

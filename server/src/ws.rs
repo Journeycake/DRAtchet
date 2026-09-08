@@ -220,7 +220,17 @@ async fn dispatch(
 
         FrameTag::PublishBundle => {
             let req: PublishBundle = decode_body(body)?;
-            publish_bundle(state, req.bundle).await
+            publish_bundle(state, req.bundle).await?;
+            // Explicit success ack (matching `MailboxWrite`/`MailboxDelete`
+            // below) — a real client needs this to detect `UsernameTaken`
+            // (the `Error` frame the outer dispatch loop already sends on
+            // failure) and retry with a fresh discriminator, per §6.1's
+            // "regenerated on collision." Previously fire-and-forget, which
+            // made that undetectable; every existing test either doesn't
+            // check for a response or only checks a later `FetchBundle`, so
+            // this is purely additive.
+            let _ = tx.send(encode(FrameTag::Ack, &Ack { ok: true }));
+            Ok(())
         }
 
         FrameTag::FetchBundle => {
@@ -446,6 +456,21 @@ async fn publish_bundle(state: &Arc<AppState>, wire: PrekeyBundleWire) -> Result
     let mut one_time_prekeys = std::collections::HashMap::new();
     for otp in &wire.one_time_prekeys {
         one_time_prekeys.insert(otp.id, otp.key.clone());
+    }
+
+    // Release this fingerprint's previously-published username, if it had
+    // one and it differs from what's being published now — a rename must
+    // not leave the old `username#NNNN` permanently squatted in the index
+    // (and, worse, resolvable via `FetchBundle` to a bundle whose
+    // `username` field no longer matches what was looked up).
+    if let Some(existing) = inner.directory.get(&fp) {
+        let previous_key = UsernameKey {
+            username: existing.bundle.username.clone(),
+            discriminator: existing.bundle.discriminator,
+        };
+        if previous_key != username_key {
+            inner.username_index.remove(&previous_key);
+        }
     }
 
     inner.username_index.insert(username_key, fp);

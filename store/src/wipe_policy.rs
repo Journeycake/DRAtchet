@@ -115,7 +115,6 @@ mod tests {
             verification_state: VerificationState::Verified,
             mailbox_id: bootstrap_mailbox_id(&[fingerprint; 32]).to_vec(),
             created_at: 0,
-            disappearing_timer_secs: None,
             local_routing_id: vec![0xCD; 32],
             peer_routing_id: None,
             wipe_ask_before_delete,
@@ -207,7 +206,6 @@ mod tests {
             sender_is_local: true,
             content: b"hello".to_vec(),
             timestamp: 100,
-            expires_at: None,
         }
     }
 

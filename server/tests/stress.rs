@@ -60,10 +60,11 @@ async fn many_concurrent_clients_publish_fetch_mailbox_presence_rendezvous_witho
         let end_barrier = end_barrier.clone();
         tasks.spawn(async move {
             let mut client = TestClient::connect(&url).await;
+            client.authenticate(&account).await;
             client
                 .send(FrameTag::PublishBundle, &PublishBundle { bundle })
                 .await;
-            client.authenticate(&account).await;
+            let _ack: Ack = client.recv_skip_pushes(FrameTag::Ack).await;
 
             start_barrier.wait().await;
 

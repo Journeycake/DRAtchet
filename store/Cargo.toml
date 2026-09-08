@@ -21,15 +21,6 @@ zeroize = "1"
 # actually be scanned, not just a placeholder image.
 qrcode = { version = "0.14", features = ["image"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
-# `sweep::spawn_periodic_sweep` — a background driver for
-# `Db::sweep_expired_messages`, the real (previously unwired) counterpart
-# to `dratchet_server::pruning`'s periodic sweep. A real dependency, not
-# dev-only, since the eventual Tauri shell needs this at runtime. `net` is
-# only actually needed by tests/routing_id_exchange.rs's real-server test,
-# but declaring the full feature set once here (rather than a second,
-# dev-only `tokio` entry) avoids Cargo having to reconcile two divergent
-# feature sets for the same dependency.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net"] }
 tracing = "0.1"
 
 [dev-dependencies]
@@ -38,6 +29,7 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 # For tests/routing_id_exchange.rs's real spawned-server end-to-end test
 # only — store/ itself has no transport dependency.
 dratchet-server = { path = "../server" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net"] }
 tokio-tungstenite = "0.21"
 futures-util = "0.3"
 axum = { version = "0.7", features = ["ws"] }

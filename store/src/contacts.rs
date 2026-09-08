@@ -39,12 +39,6 @@ pub struct Contact {
     #[serde(with = "serde_bytes")]
     pub mailbox_id: Vec<u8>,
     pub created_at: u64,
-    /// Disappearing-message timer for this conversation, per §11.5: `None`
-    /// (the default) keeps messages until manually deleted; `Some(secs)`
-    /// makes every *new* message eligible for `Db::sweep_expired_messages`
-    /// `secs` seconds after it's saved. Changing this only affects
-    /// messages saved from then on — never retroactive.
-    pub disappearing_timer_secs: Option<u64>,
     /// This side's own fresh routing id for this conversation — generated
     /// once, at contact creation, and announced to the peer immediately
     /// (`crate::routing`).
@@ -138,7 +132,6 @@ mod tests {
             verification_state: VerificationState::Pending,
             mailbox_id: vec![0xAB; 16],
             created_at: 1_700_000_000,
-            disappearing_timer_secs: None,
             local_routing_id: vec![0xCD; 32],
             peer_routing_id: None,
             wipe_ask_before_delete: false,

@@ -17,6 +17,7 @@ use std::io::Cursor;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 
+use crate::db::{Db, Scope};
 use crate::error::{Error, Result};
 
 /// How long a rendered QR code stays valid before it's considered stale —
@@ -167,9 +168,85 @@ impl PairingCode {
     }
 }
 
+const PAIRING_CODE_KEY: &str = "pairing_code";
+
+impl Db {
+    /// Persist the live pairing code this device just generated —
+    /// `PairingCode` itself is pure data with nowhere to live between
+    /// "generate" and "an attempt arrives," since §6.4's flow (as this
+    /// codebase implements it) has the code generated and shared *before*
+    /// any session exists to carry it over. Singleton: generating a new
+    /// code overwrites whatever was stored, matching §6.4's "generating a
+    /// new one invalidates the previous code."
+    pub fn save_pairing_code(&self, code: &PairingCode) -> Result<()> {
+        let mut bytes = Vec::new();
+        ciborium::into_writer(code, &mut bytes)
+            .expect("CBOR encoding of a well-formed struct cannot fail");
+        self.put_encrypted(Scope::Identity, PAIRING_CODE_KEY, &bytes)
+    }
+
+    pub fn load_pairing_code(&self) -> Result<Option<PairingCode>> {
+        match self.get_encrypted(Scope::Identity, PAIRING_CODE_KEY)? {
+            Some(bytes) => Ok(Some(ciborium::from_reader(bytes.as_slice()).map_err(
+                |_| Error::MalformedRecord("stored pairing code is not valid CBOR for this shape"),
+            )?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Consume the stored code — called once a first-contact attempt
+    /// matches it (single-use) so it can never be used again, per §6.4.
+    pub fn clear_pairing_code(&self) -> Result<()> {
+        self.delete(PAIRING_CODE_KEY)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_db() -> Db {
+        let dir = tempfile::tempdir().unwrap().keep();
+        Db::create(dir.join("test.redb"), "pw").unwrap()
+    }
+
+    #[test]
+    fn no_pairing_code_before_one_is_generated() {
+        let db = temp_db();
+        assert!(db.load_pairing_code().unwrap().is_none());
+    }
+
+    #[test]
+    fn save_then_load_round_trips() {
+        let db = temp_db();
+        let code = PairingCode::generate(vec![], 1_000);
+        let live_code = code.code.clone();
+        db.save_pairing_code(&code).unwrap();
+
+        let loaded = db.load_pairing_code().unwrap().unwrap();
+        assert_eq!(loaded.code, live_code);
+    }
+
+    #[test]
+    fn generating_a_new_code_overwrites_the_previous_one() {
+        let db = temp_db();
+        db.save_pairing_code(&PairingCode::generate(vec![], 1_000))
+            .unwrap();
+        let second = PairingCode::generate(vec![], 2_000);
+        db.save_pairing_code(&second).unwrap();
+
+        let loaded = db.load_pairing_code().unwrap().unwrap();
+        assert_eq!(loaded.code, second.code);
+    }
+
+    #[test]
+    fn clear_pairing_code_removes_it() {
+        let db = temp_db();
+        db.save_pairing_code(&PairingCode::generate(vec![], 1_000))
+            .unwrap();
+        db.clear_pairing_code().unwrap();
+        assert!(db.load_pairing_code().unwrap().is_none());
+    }
 
     #[test]
     fn pairing_codes_debug_output_never_contains_the_live_code() {

@@ -112,6 +112,7 @@ async fn rotating_an_already_owned_bundle_never_requires_proof_of_work() {
             },
         )
         .await;
+    let (_, _ack): (_, Ack) = client.recv().await;
 
     // Republish the *same* signed prekey (so the bundle's own signatures,
     // which cover `signed_prekey_id`/`signed_prekey`, stay valid — this
@@ -124,6 +125,7 @@ async fn rotating_an_already_owned_bundle_never_requires_proof_of_work() {
     client
         .send(FrameTag::PublishBundle, &PublishBundle { bundle })
         .await;
+    let (_, _ack): (_, Ack) = client.recv().await;
 
     // Fetch on the *same* connection, after the two publishes above — this
     // is guaranteed to observe both, since one WebSocket connection's
@@ -265,9 +267,11 @@ async fn fetch_rate_limit_on_one_target_does_not_block_fetching_a_different_targ
     client
         .send(FrameTag::PublishBundle, &PublishBundle { bundle: bundle_a })
         .await;
+    let (_, _ack): (_, Ack) = client.recv().await;
     client
         .send(FrameTag::PublishBundle, &PublishBundle { bundle: bundle_b })
         .await;
+    let (_, _ack): (_, Ack) = client.recv().await;
 
     // Exhaust the budget against target A on this connection...
     let mut got_rate_limited = false;

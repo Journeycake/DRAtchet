@@ -32,6 +32,13 @@ pub const PAYLOAD_CONVERSATION_WIPE_POLICY_ANNOUNCE: u8 = 4;
 /// ratchet/mailbox it arrived on. Ungated like `PAYLOAD_ROUTING_ID_ANNOUNCE`
 /// — protocol machinery, not chat content.
 pub const PAYLOAD_CONVERSATION_WIPE_REQUEST: u8 = 5;
+/// `crate::first_contact::FirstContactWire`'s encrypted content —
+/// `MESSAGE_SCHEMA.md`'s first-contact section. Unlike every other payload
+/// here, this one is never gated by `store::gate` at all (there's no
+/// `Contact` record yet for the gate to check against) and never carried
+/// by a normal `Envelope` — it's the content of `FirstContactWire.envelope`
+/// specifically, tagged and padded the same way as any other payload.
+pub const PAYLOAD_FIRST_CONTACT: u8 = 6;
 
 /// Bucket size messages are padded to (next multiple of this, up to `MAX_PADDED_LEN`).
 pub const PAD_BUCKET: usize = 160;
@@ -143,6 +150,33 @@ impl ConversationWipePolicyAnnounce {
     }
 }
 
+/// `PAYLOAD_FIRST_CONTACT`'s content — the pairing code the recipient
+/// generated and read out over an already-trusted channel (§6.4), plus
+/// the sender's chosen `username#NNNN` so the recipient's client can
+/// label the new contact without a separate directory round-trip. Never
+/// carries anything else identifying the sender beyond what
+/// `FirstContactWire`'s cleartext fields already expose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FirstContactContent {
+    pub pairing_code: String,
+    pub username: String,
+    pub discriminator: u16,
+}
+
+impl FirstContactContent {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        ciborium::into_writer(self, &mut bytes)
+            .expect("CBOR encoding of a well-formed struct cannot fail");
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        ciborium::from_reader(bytes)
+            .map_err(|_| Error::MalformedPayload("not a valid FirstContactContent"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,5 +282,27 @@ mod tests {
     #[test]
     fn conversation_wipe_policy_announce_garbage_bytes_are_rejected_not_panicking() {
         assert!(ConversationWipePolicyAnnounce::decode(&[0xFF, 0x00, 0x01]).is_err());
+    }
+
+    #[test]
+    fn first_contact_content_round_trips_through_encode_and_tag_and_pad() {
+        let content = FirstContactContent {
+            pairing_code: "483920".into(),
+            username: "alice".into(),
+            discriminator: 4821,
+        };
+        let encoded = content.encode();
+        let decoded = FirstContactContent::decode(&encoded).unwrap();
+        assert_eq!(decoded, content);
+
+        let padded = tag_and_pad(PAYLOAD_FIRST_CONTACT, &encoded).unwrap();
+        let (ty, unpacked) = untag_and_unpad(&padded).unwrap();
+        assert_eq!(ty, PAYLOAD_FIRST_CONTACT);
+        assert_eq!(FirstContactContent::decode(&unpacked).unwrap(), content);
+    }
+
+    #[test]
+    fn first_contact_content_garbage_bytes_are_rejected_not_panicking() {
+        assert!(FirstContactContent::decode(&[0xFF, 0x00, 0x01]).is_err());
     }
 }

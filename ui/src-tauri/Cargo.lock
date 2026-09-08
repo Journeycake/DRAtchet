@@ -1153,7 +1153,9 @@ dependencies = [
  "dratchet-core",
  "dratchet-server",
  "dratchet-store",
+ "rand_core",
  "thiserror 1.0.69",
+ "x25519-dalek",
 ]
 
 [[package]]
@@ -1229,7 +1231,6 @@ dependencies = [
  "serde",
  "serde_bytes",
  "thiserror 1.0.69",
- "tokio",
  "tracing",
  "zeroize",
 ]
