@@ -498,6 +498,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "dratchet-app"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "dratchet-client",
+ "dratchet-core",
+ "dratchet-server",
+ "dratchet-store",
+ "rand_core 0.6.4",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "x25519-dalek",
+]
+
+[[package]]
 name = "dratchet-client"
 version = "0.1.0"
 dependencies = [
