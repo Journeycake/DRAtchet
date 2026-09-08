@@ -263,11 +263,11 @@ async fn verified_pair() -> (Peer, Peer, [u8; 16]) {
 
 /// Both sides announce their preferences to each other, in both
 /// directions — the real exchange a UI would trigger once after pairing.
-/// Strictly alternated (send, receive, send, receive) rather than both
-/// sides sending before either receives — matching how every other
-/// exchange in this codebase's real tests is sequenced (see
-/// `verified_pair`'s own routing-id exchange above), since a real
-/// two-party chat is turn-taking by nature.
+/// Both announce before either receives, exercising `receive_pending`'s
+/// fix for its own not-yet-deleted entry showing up in the shared,
+/// post-transition mailbox (`app/tests/receive_pending_own_message.rs`) —
+/// no longer worked around with a strict send/receive/send/receive
+/// alternation now that that's handled correctly.
 async fn exchange_wipe_policies(
     alice: &mut Peer,
     bob: &mut Peer,
@@ -286,15 +286,6 @@ async fn exchange_wipe_policies(
     )
     .await
     .unwrap();
-    receive_pending(&bob.db, &mut bob.conn, &bob.account, &bob.contact)
-        .await
-        .unwrap();
-    bob.contact = bob
-        .db
-        .load_contact(&bob.contact.fingerprint)
-        .unwrap()
-        .unwrap();
-
     bob.contact = announce_wipe_policy(
         &bob.db,
         &mut bob.conn,
@@ -305,6 +296,16 @@ async fn exchange_wipe_policies(
     )
     .await
     .unwrap();
+
+    receive_pending(&bob.db, &mut bob.conn, &bob.account, &bob.contact)
+        .await
+        .unwrap();
+    bob.contact = bob
+        .db
+        .load_contact(&bob.contact.fingerprint)
+        .unwrap()
+        .unwrap();
+
     receive_pending(&alice.db, &mut alice.conn, &alice.account, &alice.contact)
         .await
         .unwrap();

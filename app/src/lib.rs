@@ -119,9 +119,12 @@ pub async fn send_message(
 /// content is released only if `contact` is `Verified` (`store::gate`,
 /// silently skipped otherwise — the message was still consumed off the
 /// wire, just not surfaced, exactly as a Pending contact's chat is
-/// supposed to behave). Every processed entry is deleted from the
-/// mailbox, per `docs/MESSAGE_SCHEMA.md` §7's "after successful decrypt"
-/// convention — the ratchet step already committed for it either way.
+/// supposed to behave). Every entry the ratchet actually decrypted is then
+/// deleted from the mailbox, per `docs/MESSAGE_SCHEMA.md` §7's "after
+/// successful decrypt" convention — the ratchet step already committed for
+/// it either way. An entry the ratchet *couldn't* decrypt at all (most
+/// often our own not-yet-collected outgoing message — see the loop body)
+/// is silently skipped instead, left for its real recipient to delete.
 /// Returns the newly received, released chat messages.
 ///
 /// **Fetch address, and why it's not simply `contact.mailbox_id`:**
@@ -224,6 +227,22 @@ pub async fn receive_pending(
             }
             Ok(_) => {} // other protocol payload types: consumed, nothing to surface yet
             Err(dratchet_store::Error::NotVerified) => {} // chat content, withheld while Pending
+            // The ratchet itself couldn't decrypt this entry — most often
+            // our own not-yet-collected outgoing message, since the
+            // routing-id transition (Phase 1.6.2, this fn's own doc
+            // comment) makes send and fetch addresses the same symmetric
+            // `mailbox_id`: a `MailboxFetch` can return entries the peer
+            // hasn't deleted yet, and our ratchet has no receiving chain
+            // for our own outgoing `dh_pub`. Equally, genuine transit
+            // corruption surfaces the same way. Either way this is
+            // `client/src/main.rs`'s documented behavior for the same
+            // situation (`client/README.md`): skip silently, and —
+            // critically — don't fall through to the `MailboxDelete`
+            // below. We're not the entry's real recipient, so deleting it
+            // would destroy the peer's only copy before they ever fetch
+            // it; `MESSAGE_SCHEMA.md` §7's `MailboxDelete` convention is
+            // "after successful decrypt", which this explicitly is not.
+            Err(dratchet_store::Error::Core(_)) => continue,
             Err(e) => return Err(e.into()),
         }
 
