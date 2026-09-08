@@ -232,6 +232,11 @@ async fn both_sides_exchange_routing_ids_over_the_real_server_and_converge_on_th
         disappearing_timer_secs: None,
         local_routing_id: alice_routing_id.clone(),
         peer_routing_id: None,
+        wipe_ask_before_delete: false,
+        peer_wipe_ask_before_delete: None,
+        wipe_include_session: false,
+        peer_wipe_include_session: None,
+        wipe_request_pending: false,
     };
     db_alice.save_contact(&alice_contact).unwrap();
 
@@ -246,6 +251,11 @@ async fn both_sides_exchange_routing_ids_over_the_real_server_and_converge_on_th
         disappearing_timer_secs: None,
         local_routing_id: bob_routing_id.clone(),
         peer_routing_id: None,
+        wipe_ask_before_delete: false,
+        peer_wipe_ask_before_delete: None,
+        wipe_include_session: false,
+        peer_wipe_include_session: None,
+        wipe_request_pending: false,
     };
     db_bob.save_contact(&bob_contact).unwrap();
 

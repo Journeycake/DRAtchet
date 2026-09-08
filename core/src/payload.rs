@@ -21,6 +21,17 @@ pub const PAYLOAD_RECOVERY_PROFILE_ANNOUNCE: u8 = 2;
 /// Not user-visible chat content, so `docs/ARCHITECTURE.md` §6.5's
 /// mandatory-verification gate doesn't apply to it — see `store::gate`.
 pub const PAYLOAD_ROUTING_ID_ANNOUNCE: u8 = 3;
+/// Announces this side's per-conversation wipe preferences — `MESSAGE_SCHEMA.md`
+/// §10. Same shape as `PAYLOAD_RECOVERY_PROFILE_ANNOUNCE`: sent at session
+/// establishment and again whenever the announcing side's preferences
+/// change, merged independently and identically by both clients, no
+/// response needed.
+pub const PAYLOAD_CONVERSATION_WIPE_POLICY_ANNOUNCE: u8 = 4;
+/// A per-conversation "clear this chat" request — `MESSAGE_SCHEMA.md` §10.
+/// Carries no fields; the conversation is already identified by which
+/// ratchet/mailbox it arrived on. Ungated like `PAYLOAD_ROUTING_ID_ANNOUNCE`
+/// — protocol machinery, not chat content.
+pub const PAYLOAD_CONVERSATION_WIPE_REQUEST: u8 = 5;
 
 /// Bucket size messages are padded to (next multiple of this, up to `MAX_PADDED_LEN`).
 pub const PAD_BUCKET: usize = 160;
@@ -100,6 +111,38 @@ impl RoutingIdAnnounce {
     }
 }
 
+/// `PAYLOAD_CONVERSATION_WIPE_POLICY_ANNOUNCE`'s content — `MESSAGE_SCHEMA.md`
+/// §10. Each side's own preference for how a per-conversation "clear this
+/// chat" request (`PAYLOAD_CONVERSATION_WIPE_REQUEST`) gets handled on
+/// *this* side when the *other* side is the one who requested it. The
+/// effective policy for a conversation is computed independently and
+/// identically by both clients from (own preference, last-announced peer
+/// preference) — see `store::wipe_policy` for the two merge functions;
+/// this struct only carries the raw announced values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationWipePolicyAnnounce {
+    /// Ask locally before complying with an incoming wipe request, rather
+    /// than deleting immediately.
+    pub ask_before_delete: bool,
+    /// Also destroy the conversation's ratchet/session state (not just
+    /// message history) when complying with a wipe request.
+    pub include_session: bool,
+}
+
+impl ConversationWipePolicyAnnounce {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        ciborium::into_writer(self, &mut bytes)
+            .expect("CBOR encoding of a well-formed struct cannot fail");
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        ciborium::from_reader(bytes)
+            .map_err(|_| Error::MalformedPayload("not a valid ConversationWipePolicyAnnounce"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +212,41 @@ mod tests {
     #[test]
     fn garbage_bytes_are_rejected_not_panicking() {
         assert!(RoutingIdAnnounce::decode(&[0xFF, 0x00, 0x01]).is_err());
+    }
+
+    #[test]
+    fn conversation_wipe_policy_announce_round_trips_through_encode_and_tag_and_pad() {
+        for (ask_before_delete, include_session) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let announce = ConversationWipePolicyAnnounce {
+                ask_before_delete,
+                include_session,
+            };
+            let encoded = announce.encode();
+            let decoded = ConversationWipePolicyAnnounce::decode(&encoded).unwrap();
+            assert_eq!(decoded, announce);
+
+            let padded = tag_and_pad(PAYLOAD_CONVERSATION_WIPE_POLICY_ANNOUNCE, &encoded).unwrap();
+            let (ty, content) = untag_and_unpad(&padded).unwrap();
+            assert_eq!(ty, PAYLOAD_CONVERSATION_WIPE_POLICY_ANNOUNCE);
+            assert_eq!(
+                ConversationWipePolicyAnnounce::decode(&content).unwrap(),
+                announce
+            );
+        }
+    }
+
+    #[test]
+    fn conversation_wipe_request_is_empty_content_tagged_and_padded_like_any_other_payload() {
+        let padded = tag_and_pad(PAYLOAD_CONVERSATION_WIPE_REQUEST, &[]).unwrap();
+        let (ty, content) = untag_and_unpad(&padded).unwrap();
+        assert_eq!(ty, PAYLOAD_CONVERSATION_WIPE_REQUEST);
+        assert!(content.is_empty());
+    }
+
+    #[test]
+    fn conversation_wipe_policy_announce_garbage_bytes_are_rejected_not_panicking() {
+        assert!(ConversationWipePolicyAnnounce::decode(&[0xFF, 0x00, 0x01]).is_err());
     }
 }

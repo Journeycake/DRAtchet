@@ -37,7 +37,11 @@ use dratchet_client::net::Connection;
 use dratchet_core::account::Account;
 use dratchet_core::conversation_id;
 use dratchet_core::envelope::Envelope;
-use dratchet_core::payload::{RoutingIdAnnounce, PAYLOAD_CHAT, PAYLOAD_ROUTING_ID_ANNOUNCE};
+use dratchet_core::payload::{
+    ConversationWipePolicyAnnounce, RoutingIdAnnounce, PAYLOAD_CHAT,
+    PAYLOAD_CONVERSATION_WIPE_POLICY_ANNOUNCE, PAYLOAD_CONVERSATION_WIPE_REQUEST,
+    PAYLOAD_ROUTING_ID_ANNOUNCE,
+};
 use dratchet_core::x3dh::bootstrap_mailbox_id;
 use dratchet_server::protocol::{
     Ack, FrameTag, MailboxDelete, MailboxEntries, MailboxFetch, MailboxWrite,
@@ -138,12 +142,18 @@ pub async fn send_message(
 /// pending-contact inbox needs a demultiplexing strategy (e.g. attempting
 /// decrypt against every Pending contact's ratchet) this crate doesn't
 /// implement yet — flagged here rather than silently assumed away.
+///
+/// Returns a [`Received`] rather than just the released chat messages:
+/// a caller (the Tauri poll loop) needs to know whether *anything* about
+/// this conversation changed — a peer-requested wipe that auto-complied,
+/// or one that only set `Contact::wipe_request_pending` — even when no
+/// chat message arrived, so it knows to refetch.
 pub async fn receive_pending(
     db: &Db,
     conn: &mut Connection,
     account: &Account,
     contact: &Contact,
-) -> Result<Vec<Message>> {
+) -> Result<Received> {
     let conv_id = conversation_id_for(account, contact);
     let mut ratchet = db.load_ratchet(conv_id)?.ok_or(Error::NoSession)?;
     // Captured once so every delete in this pass targets the address the
@@ -167,10 +177,18 @@ pub async fn receive_pending(
     let (_, entries): (_, MailboxEntries) = conn.recv().await?;
 
     let mut received = Vec::new();
+    let mut wipe_activity = false;
+    // Set when a `ConversationWipeRequest` this pass auto-complied with
+    // included the session — the on-disk ratchet key is gone at that
+    // point, and the trailing `db.save_ratchet` below (using the
+    // still-live in-memory `ratchet`, needed to keep decrypting the rest
+    // of this batch) must not resurrect it.
+    let mut session_wiped = false;
     // `contact`'s verification state (used by `decrypt_gated`) doesn't
     // change mid-loop — only its `mailbox_id`, tracked separately above —
     // so gating against the caller's original `contact` for every entry
-    // in this batch is correct.
+    // in this batch is correct. Wipe-policy decisions below use this same
+    // stale-within-the-batch snapshot for the same reason.
     for entry in &entries.entries {
         let envelope = Envelope::decode(&entry.envelope)?;
         match decrypt_gated(&mut ratchet, contact, &envelope) {
@@ -180,6 +198,29 @@ pub async fn receive_pending(
             }
             Ok((PAYLOAD_CHAT, content)) => {
                 received.push(db.save_message_now(conv_id, contact, content, false)?);
+            }
+            Ok((PAYLOAD_CONVERSATION_WIPE_POLICY_ANNOUNCE, content)) => {
+                let announce = ConversationWipePolicyAnnounce::decode(&content)?;
+                db.record_peer_wipe_policy(
+                    &contact.fingerprint,
+                    announce.ask_before_delete,
+                    announce.include_session,
+                )?;
+                wipe_activity = true;
+            }
+            Ok((PAYLOAD_CONVERSATION_WIPE_REQUEST, _content)) => {
+                if contact.effective_wipe_ask_before_delete() {
+                    let mut pending = contact.clone();
+                    pending.wipe_request_pending = true;
+                    db.save_contact(&pending)?;
+                } else {
+                    let include_session = contact.effective_wipe_include_session();
+                    db.wipe_conversation(conv_id, include_session)?;
+                    if include_session {
+                        session_wiped = true;
+                    }
+                }
+                wipe_activity = true;
             }
             Ok(_) => {} // other protocol payload types: consumed, nothing to surface yet
             Err(dratchet_store::Error::NotVerified) => {} // chat content, withheld while Pending
@@ -200,8 +241,27 @@ pub async fn receive_pending(
         }
     }
 
-    db.save_ratchet(conv_id, &ratchet)?;
-    Ok(received)
+    if !session_wiped {
+        db.save_ratchet(conv_id, &ratchet)?;
+    }
+    Ok(Received {
+        messages: received,
+        wipe_activity,
+    })
+}
+
+/// What [`receive_pending`] actually did on one call.
+pub struct Received {
+    /// Newly received, released chat messages — what a caller used to get
+    /// directly before this type existed.
+    pub messages: Vec<Message>,
+    /// Something about this conversation changed that isn't reflected in
+    /// `messages` — a wipe-policy announcement was recorded, or a wipe
+    /// request either auto-complied or set `Contact::wipe_request_pending`.
+    /// A caller that refetches UI state only when something changed (the
+    /// Tauri poll loop) needs this, since none of those side effects show
+    /// up as a returned message.
+    pub wipe_activity: bool,
 }
 
 /// Send this side's fresh routing-id announce — the first step of Phase
@@ -251,6 +311,121 @@ pub async fn announce_routing_id(
 
     db.save_ratchet(conv_id, &ratchet)?;
     Ok(())
+}
+
+/// `docs/ARCHITECTURE.md` §11.9a's per-conversation wipe policy: saves
+/// this side's own preferences and announces them to the peer over
+/// `contact.mailbox_id` — unlike `announce_routing_id`, this only ever
+/// runs after a session is already established (called once after
+/// pairing, and again whenever the user changes a preference in
+/// Settings), so no bootstrap-mailbox special-casing is needed. Ungated:
+/// protocol machinery, not chat content.
+pub async fn announce_wipe_policy(
+    db: &Db,
+    conn: &mut Connection,
+    account: &Account,
+    contact: &Contact,
+    ask_before_delete: bool,
+    include_session: bool,
+) -> Result<Contact> {
+    let conv_id = conversation_id_for(account, contact);
+    let mut ratchet = db.load_ratchet(conv_id)?.ok_or(Error::NoSession)?;
+
+    let mut updated = contact.clone();
+    updated.wipe_ask_before_delete = ask_before_delete;
+    updated.wipe_include_session = include_session;
+    db.save_contact(&updated)?;
+
+    let envelope = ratchet.encrypt_payload(
+        PAYLOAD_CONVERSATION_WIPE_POLICY_ANNOUNCE,
+        &ConversationWipePolicyAnnounce {
+            ask_before_delete,
+            include_session,
+        }
+        .encode(),
+    )?;
+    conn.send(
+        FrameTag::MailboxWrite,
+        &MailboxWrite {
+            mailbox_id: updated.mailbox_id.clone(),
+            envelope: envelope.encode(),
+            ttl: 14 * 24 * 60 * 60,
+        },
+    )
+    .await?;
+    let (_, ack): (_, Ack) = conn.recv().await?;
+    if !ack.ok {
+        return Err(Error::NotAcknowledged);
+    }
+
+    db.save_ratchet(conv_id, &ratchet)?;
+    Ok(updated)
+}
+
+/// `docs/ARCHITECTURE.md` §11.9a's per-conversation wipe, the requesting
+/// side: sends a `ConversationWipeRequest` to `contact` — the same shape
+/// as Signal/WhatsApp's "delete for everyone," scoped to this one
+/// conversation, never a general remote-wipe primitive (see the module
+/// doc comparison with `quick_wipe`/`full_wipe`). The request is sent
+/// *before* any local deletion, since it needs the still-live ratchet;
+/// the local wipe only proceeds once the server has acked the write (the
+/// same "acked = proceed" threshold `send_message` already uses — it
+/// doesn't mean the peer has received it yet, just that delivery has been
+/// queued, which is the normal store-and-forward behavior every mailbox
+/// message already has). Returns how many local records were removed.
+pub async fn request_conversation_wipe(
+    db: &Db,
+    conn: &mut Connection,
+    account: &Account,
+    contact: &Contact,
+) -> Result<usize> {
+    let conv_id = conversation_id_for(account, contact);
+    let mut ratchet = db.load_ratchet(conv_id)?.ok_or(Error::NoSession)?;
+
+    let envelope = ratchet.encrypt_payload(PAYLOAD_CONVERSATION_WIPE_REQUEST, &[])?;
+    conn.send(
+        FrameTag::MailboxWrite,
+        &MailboxWrite {
+            mailbox_id: contact.mailbox_id.clone(),
+            envelope: envelope.encode(),
+            ttl: 14 * 24 * 60 * 60,
+        },
+    )
+    .await?;
+    let (_, ack): (_, Ack) = conn.recv().await?;
+    if !ack.ok {
+        return Err(Error::NotAcknowledged);
+    }
+
+    db.save_ratchet(conv_id, &ratchet)?;
+    let include_session = contact.effective_wipe_include_session();
+    Ok(db.wipe_conversation(conv_id, include_session)?)
+}
+
+/// The receiving side of §11.9a's "ask before deleting" path: the peer's
+/// wipe request already set `Contact::wipe_request_pending` (via
+/// `receive_pending`); this actually performs the wipe now and clears the
+/// flag. No network access needed. Returns how many records were removed.
+pub fn confirm_pending_wipe(db: &Db, account: &Account, contact: &Contact) -> Result<usize> {
+    let conv_id = conversation_id_for(account, contact);
+    let include_session = contact.effective_wipe_include_session();
+    let removed = db.wipe_conversation(conv_id, include_session)?;
+
+    let mut updated = contact.clone();
+    updated.wipe_request_pending = false;
+    db.save_contact(&updated)?;
+    Ok(removed)
+}
+
+/// The declining counterpart to [`confirm_pending_wipe`]: clears
+/// `Contact::wipe_request_pending` without deleting anything. There is no
+/// wire message telling the requester this happened — see the module
+/// doc's "no delivery receipt" note.
+pub fn decline_pending_wipe(db: &Db, contact: &Contact) -> Result<Contact> {
+    let mut updated = contact.clone();
+    updated.wipe_request_pending = false;
+    db.save_contact(&updated)?;
+    Ok(updated)
 }
 
 /// Confirm or reject a fingerprint match — §6.3/§6.4's verification

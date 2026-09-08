@@ -15,6 +15,7 @@ mod messages;
 mod routing;
 pub mod sweep;
 mod verification;
+mod wipe_policy;
 
 pub use contacts::{Contact, VerificationState};
 pub use db::Db;

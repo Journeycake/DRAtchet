@@ -76,6 +76,11 @@ mod tests {
             disappearing_timer_secs: None,
             local_routing_id,
             peer_routing_id: None,
+            wipe_ask_before_delete: false,
+            peer_wipe_ask_before_delete: None,
+            wipe_include_session: false,
+            peer_wipe_include_session: None,
+            wipe_request_pending: false,
         }
     }
 

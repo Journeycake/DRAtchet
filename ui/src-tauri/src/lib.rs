@@ -51,6 +51,15 @@ struct ContactDto {
     initials: String,
     verified: bool,
     pending: bool,
+    /// `docs/ARCHITECTURE.md` §11.9a — this side's own per-conversation
+    /// wipe preferences and whether the peer currently has a wipe request
+    /// awaiting local confirmation. Peer-side preferences stay internal
+    /// (the frontend only needs the effective outcome, not the raw
+    /// values) — see `Contact::effective_wipe_ask_before_delete`/
+    /// `effective_wipe_include_session`.
+    wipe_ask_before_delete: bool,
+    wipe_include_session: bool,
+    wipe_request_pending: bool,
 }
 
 #[derive(Serialize)]
@@ -73,6 +82,9 @@ fn to_contact_dto(contact: &Contact) -> ContactDto {
         initials,
         verified: contact.verification_state == VerificationState::Verified,
         pending: contact.verification_state == VerificationState::Pending,
+        wipe_ask_before_delete: contact.wipe_ask_before_delete,
+        wipe_include_session: contact.wipe_include_session,
+        wipe_request_pending: contact.wipe_request_pending,
     }
 }
 
@@ -145,6 +157,81 @@ async fn send_message(
     Ok(to_message_dto(&message))
 }
 
+/// `docs/ARCHITECTURE.md` §11.9a's per-conversation wipe policy: saves
+/// this side's own preferences and announces them to the peer.
+#[tauri::command]
+async fn set_wipe_policy(
+    state: State<'_, AppState>,
+    fingerprint: String,
+    ask_before_delete: bool,
+    include_session: bool,
+) -> Result<(), String> {
+    let fp = hex::decode(&fingerprint)?;
+    let contact = state
+        .db
+        .load_contact(&fp)
+        .map_err(|e| e.to_string())?
+        .ok_or("no such contact")?;
+    let mut conn = state.conn.lock().await;
+    dratchet_app::announce_wipe_policy(
+        &state.db,
+        &mut conn,
+        &state.account,
+        &contact,
+        ask_before_delete,
+        include_session,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// `docs/ARCHITECTURE.md` §11.9a's per-conversation wipe, the requesting
+/// side — the same shape as "delete for everyone." Returns how many local
+/// records were removed, for a confirmation toast.
+#[tauri::command]
+async fn request_conversation_wipe(
+    state: State<'_, AppState>,
+    fingerprint: String,
+) -> Result<usize, String> {
+    let fp = hex::decode(&fingerprint)?;
+    let contact = state
+        .db
+        .load_contact(&fp)
+        .map_err(|e| e.to_string())?
+        .ok_or("no such contact")?;
+    let mut conn = state.conn.lock().await;
+    dratchet_app::request_conversation_wipe(&state.db, &mut conn, &state.account, &contact)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The "Allow" side of an incoming wipe request (`ContactDto::wipe_request_pending`).
+#[tauri::command]
+fn confirm_pending_wipe(state: State<AppState>, fingerprint: String) -> Result<usize, String> {
+    let fp = hex::decode(&fingerprint)?;
+    let contact = state
+        .db
+        .load_contact(&fp)
+        .map_err(|e| e.to_string())?
+        .ok_or("no such contact")?;
+    dratchet_app::confirm_pending_wipe(&state.db, &state.account, &contact)
+        .map_err(|e| e.to_string())
+}
+
+/// The "Decline" side of an incoming wipe request.
+#[tauri::command]
+fn decline_pending_wipe(state: State<AppState>, fingerprint: String) -> Result<(), String> {
+    let fp = hex::decode(&fingerprint)?;
+    let contact = state
+        .db
+        .load_contact(&fp)
+        .map_err(|e| e.to_string())?
+        .ok_or("no such contact")?;
+    dratchet_app::decline_pending_wipe(&state.db, &contact).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// `docs/ARCHITECTURE.md` §11.9's **quick wipe** — the Settings "Danger
 /// Zone" action that crypto-shreds message history and cached ratchet/
 /// session state while leaving the account and contact list untouched.
@@ -173,10 +260,12 @@ fn full_wipe(state: State<AppState>, app: AppHandle) -> Result<(), String> {
 /// Background receive loop, spawned once in `.setup()`: every
 /// `POLL_INTERVAL`, calls `dratchet_app::receive_pending` for every saved
 /// contact (`Pending` ones included — that's the only way a
-/// `RoutingIdAnnounce` ever gets processed) and, on any actual change
-/// (a message received, or a contact's mailbox transitioning off its
-/// bootstrap address), emits one coarse `INBOX_UPDATED_EVENT` — no
-/// fine-grained payload; the frontend just refetches.
+/// `RoutingIdAnnounce` ever gets processed) and, on any actual change (a
+/// message received, a contact's mailbox transitioning off its bootstrap
+/// address, or `Received::wipe_activity` — a wipe-policy announcement
+/// recorded or a wipe request auto-complied/set pending, §11.9a), emits
+/// one coarse `INBOX_UPDATED_EVENT` — no fine-grained payload; the
+/// frontend just refetches.
 async fn poll_loop(app_handle: AppHandle) {
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
     loop {
@@ -199,7 +288,9 @@ async fn poll_loop(app_handle: AppHandle) {
                 dratchet_app::receive_pending(&state.db, &mut conn, &state.account, &contact).await
             };
             match received {
-                Ok(messages) if !messages.is_empty() => changed = true,
+                Ok(outcome) if !outcome.messages.is_empty() || outcome.wipe_activity => {
+                    changed = true;
+                }
                 Ok(_) => {}
                 Err(e) => eprintln!("poll: receive_pending failed for a contact: {e}"),
             }
@@ -259,6 +350,10 @@ pub fn run() {
             list_contacts,
             list_messages,
             send_message,
+            set_wipe_policy,
+            request_conversation_wipe,
+            confirm_pending_wipe,
+            decline_pending_wipe,
             quick_wipe,
             full_wipe
         ])

@@ -53,7 +53,7 @@ fn message_key(conversation_id: [u8; 16], message_id: &[u8]) -> String {
     format!("message:{}:{}", hex(&conversation_id), hex(message_id))
 }
 
-fn message_key_prefix(conversation_id: [u8; 16]) -> String {
+pub(crate) fn message_key_prefix(conversation_id: [u8; 16]) -> String {
     format!("message:{}:", hex(&conversation_id))
 }
 
@@ -281,6 +281,11 @@ mod tests {
             disappearing_timer_secs,
             local_routing_id: vec![0xCD; 32],
             peer_routing_id: None,
+            wipe_ask_before_delete: false,
+            peer_wipe_ask_before_delete: None,
+            wipe_include_session: false,
+            peer_wipe_include_session: None,
+            wipe_request_pending: false,
         }
     }
 

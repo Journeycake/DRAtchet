@@ -1087,8 +1087,9 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
    conversation disappearing-message timers (§11.5), the three-level Tier 2
    recovery profile system (§7) with a self-custodied recovery phrase,
    hosted via storage option 1, the purpose-built server (`SERVERS.md`
-   §3.2), and duress response — quick wipe and a separately-gated full
-   identity wipe, client-only, no protocol change (§11.9).
+   §3.2), duress response — quick wipe and a separately-gated full
+   identity wipe, client-only, no protocol change (§11.9), and a
+   bilateral per-conversation wipe ("delete for everyone," §11.9a).
 3. **v2**: multi-device support (full roadmap, including the per-device
    identity model and how recovery profiles stay consistent across a
    user's own devices, in §14), group chat (MLS/RFC 9420 — full roadmap,
@@ -1572,6 +1573,45 @@ migrate).
   covered: a visible button is adequate for "I want to clear my own device"
   but not for the in-person-coercion threat model the decoy-passphrase form
   specifically addresses.
+
+### 11.9a Per-conversation wipe ("delete for everyone") — **v1 — implemented**
+
+A different feature from the rest of this section, worth distinguishing
+explicitly rather than lumping in with the duress wipe above just because
+both involve deletion. §11.9's quick/full wipe is a strictly local,
+device-seizure response — this is a *bilateral* "clear this one
+conversation" action, the same shape as Signal/WhatsApp's "delete for
+everyone": it asks the *peer's* device to delete its copy of the same
+conversation too, over a new pair of ratchet-encrypted protocol messages
+(`ConversationWipePolicyAnnounce`/`ConversationWipeRequest`,
+`MESSAGE_SCHEMA.md` §10).
+
+- **Why this isn't the "much more dangerous feature" §11.9 explicitly
+  declined to build**: that concern was about a *general* remote-wipe
+  primitive — one party reaching into an unrelated part of another
+  party's device. This can't do that. The request is only decryptable by
+  whoever holds the matching ratchet state for that specific conversation
+  — it never reaches anything outside a conversation the recipient
+  already chose to have with that specific, already-paired peer, and it
+  never touches the recipient's identity, other conversations, or
+  anything §11.9's tiers protect.
+- **Configurable per conversation, per side, on two independent axes** —
+  whether the receiving side asks for local confirmation before complying,
+  and whether the wipe also destroys the conversation's ratchet/session
+  state — each side announces its own preference and both compute the
+  same effective policy independently (`MESSAGE_SCHEMA.md` §10 has the
+  exact merge functions, including why the confirmation axis deliberately
+  uses the *opposite* merge direction from §7.2's recovery-profile
+  precedent: unanimous consent is required for the safer "ask" outcome,
+  not either side unilaterally imposing it).
+- **Plain deletion, not a crypto-shred**: unlike §11.9's tiers (which
+  exist specifically to survive forensic recovery of a seized device),
+  this reuses the same plain-`DELETE` guarantee `delete_message`/
+  `delete_contact` already provide — ordinary housekeeping, not a duress
+  response.
+- **No delivery receipt**: the requester can't tell whether the peer
+  complied, declined, or hasn't seen the request yet — the same fire-and-
+  forget limitation every mailbox message already has.
 
 ## 12. Deployment models: pure peer-to-peer vs. server-based
 

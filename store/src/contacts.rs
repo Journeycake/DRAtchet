@@ -55,6 +55,26 @@ pub struct Contact {
     /// the whole time.
     #[serde(with = "serde_bytes")]
     pub peer_routing_id: Option<Vec<u8>>,
+    /// This side's own preference, per `crate::wipe_policy` /
+    /// `docs/ARCHITECTURE.md` §11.9a: ask for local confirmation before
+    /// complying with an incoming per-conversation wipe request, rather
+    /// than deleting immediately. Default `false` — fail toward the
+    /// calmer outcome.
+    pub wipe_ask_before_delete: bool,
+    /// The peer's last-announced value of the same preference. `None`
+    /// until a `ConversationWipePolicyAnnounce` has arrived.
+    pub peer_wipe_ask_before_delete: Option<bool>,
+    /// This side's own preference: also destroy the conversation's
+    /// ratchet/session state (not just message history) when complying
+    /// with a wipe request. Default `false`.
+    pub wipe_include_session: bool,
+    /// The peer's last-announced value of the same preference.
+    pub peer_wipe_include_session: Option<bool>,
+    /// The peer has requested a wipe of this conversation and the
+    /// effective `wipe_ask_before_delete` policy withheld it pending
+    /// local confirmation (`dratchet_app::confirm_pending_wipe`/
+    /// `decline_pending_wipe`).
+    pub wipe_request_pending: bool,
 }
 
 fn contact_key(fingerprint: &[u8]) -> String {
@@ -121,6 +141,11 @@ mod tests {
             disappearing_timer_secs: None,
             local_routing_id: vec![0xCD; 32],
             peer_routing_id: None,
+            wipe_ask_before_delete: false,
+            peer_wipe_ask_before_delete: None,
+            wipe_include_session: false,
+            peer_wipe_include_session: None,
+            wipe_request_pending: false,
         }
     }
 

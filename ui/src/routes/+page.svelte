@@ -9,6 +9,9 @@
     initials: string;
     verified: boolean;
     pending: boolean;
+    wipe_ask_before_delete: boolean;
+    wipe_include_session: boolean;
+    wipe_request_pending: boolean;
   };
 
   type MessageDto = {
@@ -38,10 +41,26 @@
   let fullWipeBusy = $state(false);
   let fullWipeError = $state("");
 
+  let conversationMenuOpen = $state(false);
+  let clearArmed = $state(false);
+  let clearBusy = $state(false);
+  let clearResult = $state("");
+  let clearError = $state("");
+  let policyBusy = $state(false);
+  let policyError = $state("");
+  let pendingWipeBusy = $state(false);
+  let pendingWipeError = $state("");
+
   async function selectContact(contact: ContactDto) {
     selected = contact;
     messages = [];
     sendError = "";
+    conversationMenuOpen = false;
+    clearArmed = false;
+    clearResult = "";
+    clearError = "";
+    policyError = "";
+    pendingWipeError = "";
     if (!contact.verified) return;
     try {
       messages = await invoke<MessageDto[]>("list_messages", {
@@ -84,6 +103,92 @@
       sendError = String(e);
     } finally {
       sending = false;
+    }
+  }
+
+  function toggleConversationMenu() {
+    conversationMenuOpen = !conversationMenuOpen;
+    clearArmed = false;
+    clearResult = "";
+    clearError = "";
+    policyError = "";
+  }
+
+  // docs/ARCHITECTURE.md §11.9a: this side's own preference for the two
+  // per-conversation wipe axes — announced to the peer immediately so the
+  // effective (merged) policy stays in sync on both sides.
+  async function setWipePolicy(askBeforeDelete: boolean, includeSession: boolean) {
+    if (!selected) return;
+    policyBusy = true;
+    policyError = "";
+    try {
+      await invoke("set_wipe_policy", {
+        fingerprint: selected.fingerprint,
+        askBeforeDelete,
+        includeSession,
+      });
+      selected = {
+        ...selected,
+        wipe_ask_before_delete: askBeforeDelete,
+        wipe_include_session: includeSession,
+      };
+    } catch (e) {
+      policyError = String(e);
+    } finally {
+      policyBusy = false;
+    }
+  }
+
+  // §11.9a's "delete for everyone" — same two-click armed-confirm pattern
+  // as the Danger Zone's quick wipe, for UI consistency.
+  async function clearConversation() {
+    if (!selected) return;
+    if (!clearArmed) {
+      clearArmed = true;
+      return;
+    }
+    clearBusy = true;
+    clearError = "";
+    clearResult = "";
+    try {
+      const removed = await invoke<number>("request_conversation_wipe", {
+        fingerprint: selected.fingerprint,
+      });
+      clearResult = `Cleared ${removed} record${removed === 1 ? "" : "s"}.`;
+      clearArmed = false;
+      await selectContact(selected);
+    } catch (e) {
+      clearError = String(e);
+    } finally {
+      clearBusy = false;
+    }
+  }
+
+  async function allowPendingWipe() {
+    if (!selected) return;
+    pendingWipeBusy = true;
+    pendingWipeError = "";
+    try {
+      await invoke("confirm_pending_wipe", { fingerprint: selected.fingerprint });
+      await refetch();
+    } catch (e) {
+      pendingWipeError = String(e);
+    } finally {
+      pendingWipeBusy = false;
+    }
+  }
+
+  async function declinePendingWipe() {
+    if (!selected) return;
+    pendingWipeBusy = true;
+    pendingWipeError = "";
+    try {
+      await invoke("decline_pending_wipe", { fingerprint: selected.fingerprint });
+      await refetch();
+    } catch (e) {
+      pendingWipeError = String(e);
+    } finally {
+      pendingWipeBusy = false;
     }
   }
 
@@ -200,7 +305,78 @@
         <button class="gate-action" disabled>Verify {selected.handle}</button>
       </div>
     {:else}
-      <div class="conversation-header">{selected.handle}</div>
+      <div class="conversation-header">
+        <span>{selected.handle}</span>
+        <div class="conversation-menu-wrap">
+          <button
+            class="conversation-menu-button"
+            onclick={toggleConversationMenu}
+            aria-label="Conversation settings"
+          >
+            ⋯
+          </button>
+          {#if conversationMenuOpen}
+            <div class="conversation-menu">
+              <label class="menu-toggle">
+                <input
+                  type="checkbox"
+                  checked={selected.wipe_ask_before_delete}
+                  disabled={policyBusy}
+                  onchange={(e) =>
+                    setWipePolicy((e.target as HTMLInputElement).checked, selected!.wipe_include_session)}
+                />
+                Ask before deleting when {selected.handle} clears this chat
+              </label>
+              <label class="menu-toggle">
+                <input
+                  type="checkbox"
+                  checked={selected.wipe_include_session}
+                  disabled={policyBusy}
+                  onchange={(e) =>
+                    setWipePolicy(selected!.wipe_ask_before_delete, (e.target as HTMLInputElement).checked)}
+                />
+                Also end the session when clearing this chat
+              </label>
+              {#if policyError}
+                <div class="menu-error">{policyError}</div>
+              {/if}
+              <div class="menu-divider"></div>
+              <button
+                class="menu-clear-button"
+                class:armed={clearArmed}
+                disabled={clearBusy}
+                onclick={clearConversation}
+              >
+                {#if clearBusy}
+                  Clearing…
+                {:else if clearArmed}
+                  Confirm clear
+                {:else}
+                  Clear conversation
+                {/if}
+              </button>
+              {#if clearResult}
+                <div class="menu-result">{clearResult}</div>
+              {/if}
+              {#if clearError}
+                <div class="menu-error">{clearError}</div>
+              {/if}
+            </div>
+          {/if}
+        </div>
+      </div>
+      {#if selected.wipe_request_pending}
+        <div class="wipe-request-banner">
+          <span>{selected.handle} wants to clear this conversation.</span>
+          <div class="wipe-request-actions">
+            <button disabled={pendingWipeBusy} onclick={allowPendingWipe}>Allow</button>
+            <button disabled={pendingWipeBusy} onclick={declinePendingWipe}>Decline</button>
+          </div>
+          {#if pendingWipeError}
+            <div class="menu-error">{pendingWipeError}</div>
+          {/if}
+        </div>
+      {/if}
       <div class="messages">
         {#each messages as message (message.id)}
           <div class="bubble" class:local={message.sender_is_local}>
@@ -477,9 +653,142 @@
   }
 
   .conversation-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
     padding: 16px 20px;
     border-bottom: 1px solid var(--line);
     font-family: var(--display);
+  }
+
+  .conversation-menu-wrap {
+    position: relative;
+  }
+
+  .conversation-menu-button {
+    background: transparent;
+    border: none;
+    color: var(--ink-faint);
+    font-size: 16px;
+    line-height: 1;
+    padding: 4px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+
+  .conversation-menu-button:hover {
+    background: var(--bg-raised);
+    color: var(--ink);
+  }
+
+  .conversation-menu {
+    position: absolute;
+    top: 100%;
+    right: 0;
+    margin-top: 6px;
+    width: 300px;
+    background: var(--bg-raised);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 14px;
+    z-index: 5;
+    font-family: var(--sans);
+  }
+
+  .menu-toggle {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--ink-soft);
+    line-height: 1.4;
+    margin-bottom: 10px;
+    cursor: pointer;
+  }
+
+  .menu-toggle input {
+    margin-top: 2px;
+  }
+
+  .menu-divider {
+    border-top: 1px solid var(--line-soft);
+    margin: 10px 0;
+  }
+
+  .menu-clear-button {
+    width: 100%;
+    padding: 8px 10px;
+    background: var(--bg-sunken);
+    border: 1px solid var(--red);
+    color: var(--red);
+    border-radius: 6px;
+    font-weight: 600;
+    font-size: 12px;
+    cursor: pointer;
+  }
+
+  .menu-clear-button:hover:not(:disabled) {
+    background: var(--red);
+    color: var(--bg-sunken);
+  }
+
+  .menu-clear-button.armed {
+    background: var(--red);
+    color: var(--bg-sunken);
+  }
+
+  .menu-clear-button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .menu-result {
+    color: var(--teal);
+    font-size: 12px;
+    margin-top: 6px;
+  }
+
+  .menu-error {
+    color: var(--red);
+    font-size: 12px;
+    margin-top: 6px;
+  }
+
+  .wipe-request-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 20px;
+    background: var(--amber-dim);
+    border-bottom: 1px solid var(--amber);
+    color: var(--ink);
+    font-size: 13px;
+  }
+
+  .wipe-request-actions {
+    display: flex;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+
+  .wipe-request-actions button {
+    padding: 6px 12px;
+    background: var(--bg-sunken);
+    border: 1px solid var(--line-soft);
+    color: var(--ink);
+    border-radius: 6px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+
+  .wipe-request-actions button:hover:not(:disabled) {
+    background: var(--bg-raised);
+  }
+
+  .wipe-request-actions button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 
   .messages {

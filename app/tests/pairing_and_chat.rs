@@ -188,6 +188,11 @@ async fn pending_gated_send_fails_then_succeeds_after_verification_over_a_real_s
         disappearing_timer_secs: None,
         local_routing_id: alice_routing_id.clone(),
         peer_routing_id: None,
+        wipe_ask_before_delete: false,
+        peer_wipe_ask_before_delete: None,
+        wipe_include_session: false,
+        peer_wipe_include_session: None,
+        wipe_request_pending: false,
     };
     db_alice.save_contact(&alice_contact).unwrap();
     db_alice.save_ratchet(conv_id, &alice_ratchet).unwrap();
@@ -204,6 +209,11 @@ async fn pending_gated_send_fails_then_succeeds_after_verification_over_a_real_s
         disappearing_timer_secs: None,
         local_routing_id: bob_routing_id.clone(),
         peer_routing_id: None,
+        wipe_ask_before_delete: false,
+        peer_wipe_ask_before_delete: None,
+        wipe_include_session: false,
+        peer_wipe_include_session: None,
+        wipe_request_pending: false,
     };
     db_bob.save_contact(&bob_contact).unwrap();
     db_bob.save_ratchet(conv_id, &bob_ratchet).unwrap();
@@ -230,7 +240,7 @@ async fn pending_gated_send_fails_then_succeeds_after_verification_over_a_real_s
         .await
         .unwrap();
     assert!(
-        received.is_empty(),
+        received.messages.is_empty(),
         "a routing-id announce is not chat content"
     );
     bob_contact = db_bob.load_contact(&alice_fp).unwrap().unwrap();
@@ -247,7 +257,7 @@ async fn pending_gated_send_fails_then_succeeds_after_verification_over_a_real_s
     let received = receive_pending(&db_alice, &mut alice_conn, &alice, &alice_contact)
         .await
         .unwrap();
-    assert!(received.is_empty());
+    assert!(received.messages.is_empty());
     alice_contact = db_alice.load_contact(&bob_fp).unwrap().unwrap();
     assert_eq!(
         alice_contact.mailbox_id, bob_contact.mailbox_id,
@@ -300,8 +310,8 @@ async fn pending_gated_send_fails_then_succeeds_after_verification_over_a_real_s
     let received = receive_pending(&db_bob, &mut bob_conn, &bob, &bob_contact)
         .await
         .unwrap();
-    assert_eq!(received.len(), 1);
-    assert_eq!(received[0].content, b"hi bob");
+    assert_eq!(received.messages.len(), 1);
+    assert_eq!(received.messages[0].content, b"hi bob");
 
     // And it's genuinely persisted on Bob's side, not just returned in
     // memory.

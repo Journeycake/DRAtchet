@@ -77,8 +77,9 @@ encryption) in `ARCHITECTURE.md` §10, rather than solved here.
 **Payload type:** the plaintext (before padding, inside what becomes
 `ciphertext`) starts with a 1-byte `payload_type` tag: `0 = chat message`,
 `1 = DeliveryAck` (§7), `2 = RecoveryProfileAnnounce` (§8),
-`3 = RoutingIdAnnounce` (§7), reserved values for future control payloads
-(e.g. a `ReadReceipt`, `ARCHITECTURE.md` §4.6).
+`3 = RoutingIdAnnounce` (§7), `4 = ConversationWipePolicyAnnounce` (§10),
+`5 = ConversationWipeRequest` (§10), reserved values for future control
+payloads (e.g. a `ReadReceipt`, `ARCHITECTURE.md` §4.6).
 This is what lets a recipient tell a chat message apart from a control
 message like `DeliveryAck` or `RecoveryProfileAnnounce` after decrypting —
 all travel inside the same ratchet envelope and get the same
@@ -267,3 +268,58 @@ weights, and only then does a member propose the `Commit` that actually
 adds the prospect — the attestations are the auditable evidence for that
 Commit, not a request routed through the Group Coordination Service for
 it to act on.
+
+## 10. Per-conversation wipe (CBOR) — `ARCHITECTURE.md` §11.9a
+
+Two messages behind the per-conversation "clear this chat" feature — the
+same shape as Signal/WhatsApp's "delete for everyone," scoped to a single
+conversation both sides already have, never a general remote-wipe
+primitive (`ARCHITECTURE.md` §11.9's device-seizure duress wipe is a
+completely different, strictly local feature — see that section for why
+a *general* remote-wipe capability was deliberately never built).
+
+| Field | Type | Notes |
+|---|---|---|
+| `ask_before_delete` | bool | ask locally before complying with an incoming wipe request, rather than deleting immediately |
+| `include_session` | bool | also destroy the conversation's ratchet/session state (not just message history) when complying |
+
+`ConversationWipePolicyAnnounce`'s two fields are CBOR-encoded and become
+the *content* of a ratchet envelope's plaintext, tagged with
+`payload_type = 4` (§2) — sent at session establishment and again any
+time the announcing side's preferences for that conversation change,
+exactly like `RecoveryProfileAnnounce` (§8). `ConversationWipeRequest`
+carries no fields at all — empty content, tagged `payload_type = 5` — the
+conversation is already identified by which ratchet/mailbox it arrived
+on. Both are ungated by `ARCHITECTURE.md` §6.5's mandatory-verification
+rule, like `RoutingIdAnnounce`: protocol machinery, not chat content.
+
+**Two merge functions, computed independently and identically by both
+clients from (own preference, last-announced peer preference) — no
+response message, no proposal to accept or reject, same shape §8 already
+established.** An unset peer preference (never announced yet) defaults to
+`false` on both axes — fail toward the calmer outcome:
+
+- **Effective `ask_before_delete` = `own AND peer`** — the *opposite* of
+  §7.2's min-merge ("most restrictive wins") for recovery profiles,
+  deliberately: requiring *unanimous* consent for the safer "ask" outcome,
+  rather than letting either side unilaterally impose it and block the
+  other side's ability to actually clear a conversation both parties
+  share. If either side (or an unannounced peer) prefers immediate
+  deletion, the default is delete-on-receipt.
+- **Effective `include_session` = `own OR peer`** — the conventional
+  most-restrictive-wins shape: either side asking for the fuller wipe
+  (messages *and* ratchet/session state, not messages alone) gets the
+  fuller wipe.
+
+**What "wipe" means here, and what it doesn't**: a plain deletion of the
+matching `message:*` (and, if `include_session`, `ratchet:*`) records —
+not the crypto-shred `ARCHITECTURE.md` §11.9's quick/full wipe perform.
+That distinction exists on purpose: §11.9 defends against a device-seizure
+threat model across the *entire* local store; this is ordinary per-
+conversation housekeeping, the same plain-delete guarantee `delete_message`
+and `delete_contact` already provide today.
+
+**No delivery receipt.** The requesting side has no way to know whether
+the peer complied, declined, or hasn't seen the request yet — the same
+fire-and-forget limitation every mailbox message already has (no
+`ReadReceipt` exists either, per `ARCHITECTURE.md` §10's open decisions).
