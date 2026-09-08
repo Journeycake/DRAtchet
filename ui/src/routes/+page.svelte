@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
 
   type ContactDto = {
@@ -17,14 +18,20 @@
     timestamp: number;
   };
 
+  const INBOX_UPDATED_EVENT = "dratchet://inbox-updated";
+
   let contacts = $state<ContactDto[]>([]);
   let selected = $state<ContactDto | null>(null);
   let messages = $state<MessageDto[]>([]);
   let loadError = $state("");
+  let draft = $state("");
+  let sendError = $state("");
+  let sending = $state(false);
 
   async function selectContact(contact: ContactDto) {
     selected = contact;
     messages = [];
+    sendError = "";
     if (!contact.verified) return;
     try {
       messages = await invoke<MessageDto[]>("list_messages", {
@@ -35,15 +42,47 @@
     }
   }
 
-  onMount(async () => {
+  async function refetch() {
+    const previouslySelected = selected?.fingerprint;
     try {
       contacts = await invoke<ContactDto[]>("list_contacts");
-      if (contacts.length > 0) {
-        await selectContact(contacts[0]);
-      }
     } catch (e) {
       loadError = String(e);
+      return;
     }
+    const stillThere = contacts.find((c) => c.fingerprint === previouslySelected);
+    if (stillThere) {
+      await selectContact(stillThere);
+    } else if (contacts.length > 0) {
+      await selectContact(contacts[0]);
+    }
+  }
+
+  async function sendMessage(event: Event) {
+    event.preventDefault();
+    if (!selected || !draft.trim() || sending) return;
+    sending = true;
+    sendError = "";
+    try {
+      const sent = await invoke<MessageDto>("send_message", {
+        fingerprint: selected.fingerprint,
+        content: draft,
+      });
+      messages = [...messages, sent];
+      draft = "";
+    } catch (e) {
+      sendError = String(e);
+    } finally {
+      sending = false;
+    }
+  }
+
+  onMount(() => {
+    refetch();
+    const unlisten = listen(INBOX_UPDATED_EVENT, refetch);
+    return () => {
+      unlisten.then((f) => f());
+    };
   });
 </script>
 
@@ -96,9 +135,17 @@
           </div>
         {/each}
       </div>
-      <div class="composer">
-        <input class="composer-input" placeholder="Message {selected.handle}" disabled />
-      </div>
+      <form class="composer" onsubmit={sendMessage}>
+        {#if sendError}
+          <div class="send-error">{sendError}</div>
+        {/if}
+        <input
+          class="composer-input"
+          placeholder="Message {selected.handle}"
+          bind:value={draft}
+          disabled={sending}
+        />
+      </form>
     {/if}
   </main>
 </div>
@@ -276,6 +323,12 @@
   .composer {
     padding: 16px 20px;
     border-top: 1px solid var(--line);
+  }
+
+  .send-error {
+    color: var(--red);
+    font-size: 12px;
+    margin-bottom: 6px;
   }
 
   .composer-input {

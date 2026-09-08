@@ -3,28 +3,41 @@
 //! `dratchet-app` crate these commands call stays reusable for a native
 //! mobile client later without rewriting it.
 //!
-//! **Dev-only fixture data**: this first pass wires up `list_contacts`/
-//! `list_messages` against a local `Db` seeded with sample contacts on
-//! first run (one `Pending`, one `Verified`, matching the "DRAtchet UI
-//! Mockups" artifact's `alice#4821`/`marcus#0451` scenario) — real
-//! `store`/`gate` code, real persistence, just no live server connection
-//! yet. `send_message`/`receive_pending` aren't wired to a command yet;
-//! that's the next pass, once app startup owns a live
-//! `dratchet_client::net::Connection`.
+//! **Live networking**: `.setup()` opens one real
+//! `dratchet_client::net::Connection` to `SERVER_URL`, authenticated with
+//! the local account, shared (behind a `tokio::sync::Mutex`, since a
+//! single WS connection can't safely be written from two places at once)
+//! between the `send_message` command and a background poll loop that
+//! calls `dratchet_app::receive_pending` for every contact every
+//! `POLL_INTERVAL` — the same 2-second cadence `client/src/main.rs`'s
+//! reference CLI already uses. A real server-address *setting* is future
+//! work; `SERVER_URL` is a hardcoded dev default for now.
+//!
+//! **Dev DB selection**: `DRATCHET_DEV_DB` names which `Db` file to open
+//! (defaults to a fixed dev path) — see `app/examples/seed_dev_pair.rs`
+//! for how to produce two real, mutually-paired ones to point two
+//! instances of this app at.
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use dratchet_app::open_account;
+use dratchet_client::net::Connection;
 use dratchet_core::account::Account;
-use dratchet_core::conversation_id;
-use dratchet_core::x3dh::bootstrap_mailbox_id;
 use dratchet_store::{Contact, Db, VerificationState};
 use serde::Serialize;
-use tauri::State;
+use tauri::{AppHandle, Emitter, Manager, State};
+use tokio::sync::Mutex;
+
+const SERVER_URL: &str = "ws://127.0.0.1:8787/v1/ws";
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
+const INBOX_UPDATED_EVENT: &str = "dratchet://inbox-updated";
 
 struct AppState {
     db: Db,
     account: Account,
+    conn: Arc<Mutex<Connection>>,
 }
 
 /// A `Contact`, reshaped for the frontend: byte fields hex-encoded, a
@@ -62,6 +75,15 @@ fn to_contact_dto(contact: &Contact) -> ContactDto {
     }
 }
 
+fn to_message_dto(message: &dratchet_store::Message) -> MessageDto {
+    MessageDto {
+        id: hex::encode(&message.id),
+        sender_is_local: message.sender_is_local,
+        content: String::from_utf8_lossy(&message.content).into_owned(),
+        timestamp: message.timestamp,
+    }
+}
+
 mod hex {
     pub fn encode(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -94,75 +116,84 @@ fn list_messages(state: State<AppState>, fingerprint: String) -> Result<Vec<Mess
         .ok_or("no such contact")?;
     let messages = dratchet_app::list_messages(&state.db, &state.account, &contact)
         .map_err(|e| e.to_string())?;
-    Ok(messages
-        .iter()
-        .map(|m| MessageDto {
-            id: hex::encode(&m.id),
-            sender_is_local: m.sender_is_local,
-            content: String::from_utf8_lossy(&m.content).into_owned(),
-            timestamp: m.timestamp,
-        })
-        .collect())
+    Ok(messages.iter().map(to_message_dto).collect())
 }
 
-/// Dev-only: a fresh `Db` has no contacts, so first run seeds two fixture
-/// contacts matching the mockups — a `Pending` one (blocked from chat,
-/// exercising `store::gate` for real) and a `Verified` one with a short
-/// message history. Real `Contact`/`Message` records, real
-/// `Db::save_contact`/`save_message_now` calls; just not driven by a live
-/// pairing flow yet.
-fn seed_fixture_data(db: &Db, account: &Account) {
-    if !dratchet_app::list_contacts(db)
-        .unwrap_or_default()
-        .is_empty()
-    {
-        return;
+#[tauri::command]
+async fn send_message(
+    state: State<'_, AppState>,
+    fingerprint: String,
+    content: String,
+) -> Result<MessageDto, String> {
+    let fp = hex::decode(&fingerprint)?;
+    let contact = state
+        .db
+        .load_contact(&fp)
+        .map_err(|e| e.to_string())?
+        .ok_or("no such contact")?;
+    let mut conn = state.conn.lock().await;
+    let message = dratchet_app::send_message(
+        &state.db,
+        &mut conn,
+        &state.account,
+        &contact,
+        content.as_bytes(),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(to_message_dto(&message))
+}
+
+/// Background receive loop, spawned once in `.setup()`: every
+/// `POLL_INTERVAL`, calls `dratchet_app::receive_pending` for every saved
+/// contact (`Pending` ones included — that's the only way a
+/// `RoutingIdAnnounce` ever gets processed) and, on any actual change
+/// (a message received, or a contact's mailbox transitioning off its
+/// bootstrap address), emits one coarse `INBOX_UPDATED_EVENT` — no
+/// fine-grained payload; the frontend just refetches.
+async fn poll_loop(app_handle: AppHandle) {
+    let mut ticker = tokio::time::interval(POLL_INTERVAL);
+    loop {
+        ticker.tick().await;
+        let state = app_handle.state::<AppState>();
+
+        let contacts = match dratchet_app::list_contacts(&state.db) {
+            Ok(contacts) => contacts,
+            Err(e) => {
+                eprintln!("poll: list_contacts failed: {e}");
+                continue;
+            }
+        };
+
+        let mut changed = false;
+        for contact in contacts {
+            let mailbox_before = contact.mailbox_id.clone();
+            let received = {
+                let mut conn = state.conn.lock().await;
+                dratchet_app::receive_pending(&state.db, &mut conn, &state.account, &contact).await
+            };
+            match received {
+                Ok(messages) if !messages.is_empty() => changed = true,
+                Ok(_) => {}
+                Err(e) => eprintln!("poll: receive_pending failed for a contact: {e}"),
+            }
+            if let Ok(Some(updated)) = state.db.load_contact(&contact.fingerprint) {
+                if updated.mailbox_id != mailbox_before {
+                    changed = true;
+                }
+            }
+        }
+
+        if changed {
+            let _ = app_handle.emit(INBOX_UPDATED_EVENT, ());
+        }
     }
-
-    let my_fp = account.identity.fingerprint().as_bytes().to_vec();
-
-    let marcus_fp = vec![0x11u8; 32];
-    let marcus = Contact {
-        fingerprint: marcus_fp.clone(),
-        username: Some("marcus".into()),
-        discriminator: Some(451),
-        verification_state: VerificationState::Pending,
-        mailbox_id: bootstrap_mailbox_id(&marcus_fp).to_vec(),
-        created_at: now_unix(),
-        disappearing_timer_secs: None,
-        local_routing_id: vec![0xAAu8; 32],
-        peer_routing_id: None,
-    };
-    let _ = db.save_contact(&marcus);
-
-    let sable_fp = vec![0x22u8; 32];
-    let sable = Contact {
-        fingerprint: sable_fp.clone(),
-        username: Some("sable".into()),
-        discriminator: Some(9012),
-        verification_state: VerificationState::Verified,
-        mailbox_id: dratchet_store::compute_mailbox_id(&[0xBBu8; 32], &[0xCCu8; 32]).to_vec(),
-        created_at: now_unix(),
-        disappearing_timer_secs: None,
-        local_routing_id: vec![0xBBu8; 32],
-        peer_routing_id: Some(vec![0xCCu8; 32]),
-    };
-    let _ = db.save_contact(&sable);
-
-    let conv_id = conversation_id(&my_fp, &sable_fp);
-    let _ = db.save_message_now(conv_id, &sable, b"hey, you free later?".to_vec(), false);
-    let _ = db.save_message_now(conv_id, &sable, b"yeah, after 6".to_vec(), true);
-}
-
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock is after the Unix epoch")
-        .as_secs()
 }
 
 fn dev_db_path() -> PathBuf {
-    std::env::temp_dir().join("dratchet-dev.redb")
+    std::env::var("DRATCHET_DEV_DB")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("dratchet-dev-a.redb"))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -174,12 +205,35 @@ pub fn run() {
         Db::create(&db_path, "dev").expect("create dev db")
     };
     let account = open_account(&db).expect("open account");
-    seed_fixture_data(&db, &account);
+
+    // Connect + authenticate once, synchronously, before the app is
+    // considered ready — fails loudly if dratchetd isn't reachable,
+    // matching the existing db/account `.expect(...)` posture. A real
+    // server-address setting/retry UI is future work.
+    let conn = tauri::async_runtime::block_on(async {
+        let mut conn = Connection::connect(SERVER_URL)
+            .await
+            .unwrap_or_else(|e| panic!("connect to {SERVER_URL} (is dratchetd running?): {e}"));
+        conn.authenticate(&account)
+            .await
+            .expect("authenticate with dratchetd");
+        conn
+    });
+    let conn = Arc::new(Mutex::new(conn));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .manage(AppState { db, account })
-        .invoke_handler(tauri::generate_handler![list_contacts, list_messages])
+        .manage(AppState { db, account, conn })
+        .invoke_handler(tauri::generate_handler![
+            list_contacts,
+            list_messages,
+            send_message
+        ])
+        .setup(|app| {
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(poll_loop(app_handle));
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

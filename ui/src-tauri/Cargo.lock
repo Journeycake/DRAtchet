@@ -4878,6 +4878,7 @@ name = "ui"
 version = "0.1.0"
 dependencies = [
  "dratchet-app",
+ "dratchet-client",
  "dratchet-core",
  "dratchet-store",
  "serde",
