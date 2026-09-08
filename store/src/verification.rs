@@ -103,13 +103,27 @@ pub const PAIRING_CODE_MAX_ATTEMPTS: u32 = 5;
 /// handshake's key material (`bound_to` — typically the conversation id or
 /// the initiator's identity fingerprint) so it can't be replayed against a
 /// different session.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PairingCode {
     pub code: String,
     pub generated_at: u64,
     #[serde(with = "serde_bytes")]
     pub bound_to: Vec<u8>,
     pub attempts: u32,
+}
+
+/// Hand-written, not `#[derive(Debug)]`: `code` authenticates a pairing
+/// attempt the same way a one-time passcode does — printing it via `{:?}`
+/// would put a live, still-usable secret in a log file.
+impl std::fmt::Debug for PairingCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PairingCode")
+            .field("code", &"<redacted>")
+            .field("generated_at", &self.generated_at)
+            .field("bound_to", &crate::db::hex(&self.bound_to))
+            .field("attempts", &self.attempts)
+            .finish()
+    }
 }
 
 impl PairingCode {
@@ -156,6 +170,16 @@ impl PairingCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pairing_codes_debug_output_never_contains_the_live_code() {
+        let code = PairingCode::generate(vec![1u8; 16], 1_000);
+        let debug_output = format!("{code:?}");
+        assert!(
+            !debug_output.contains(&code.code),
+            "the live pairing code must never appear in Debug output: {debug_output}"
+        );
+    }
 
     #[test]
     fn qr_payload_round_trips_through_encode_and_decode() {

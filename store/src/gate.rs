@@ -54,6 +54,10 @@ impl Contact {
     /// way into the `Verified` state.
     pub fn mark_verified(&mut self) {
         self.verification_state = VerificationState::Verified;
+        tracing::debug!(
+            fingerprint = %crate::db::hex(&self.fingerprint),
+            "contact marked Verified",
+        );
     }
 
     /// Revert to a hard-stop mismatch — §6.3's "mismatch is a hard stop,
@@ -63,6 +67,10 @@ impl Contact {
     /// verification — this method itself never does that.
     pub fn mark_mismatch(&mut self) {
         self.verification_state = VerificationState::Mismatch;
+        tracing::warn!(
+            fingerprint = %crate::db::hex(&self.fingerprint),
+            "contact marked Mismatch — hard stop",
+        );
     }
 }
 

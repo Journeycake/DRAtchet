@@ -5,6 +5,7 @@
 //! `sweep_expired_messages` (for a caller, e.g. the eventual Tauri shell,
 //! to call periodically even when nothing is actively being viewed).
 
+use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -13,7 +14,7 @@ use crate::contacts::Contact;
 use crate::db::{hex, Db};
 use crate::error::{Error, Result};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Message {
     /// Random, not sequential — see `save_message`'s doc for why.
     #[serde(with = "serde_bytes")]
@@ -26,6 +27,24 @@ pub struct Message {
     /// `None` = kept until manually deleted (§11.5's default). `Some(t)` =
     /// purged once `t` has passed.
     pub expires_at: Option<u64>,
+}
+
+/// Hand-written, not `#[derive(Debug)]`: `content` is plaintext message
+/// text — printing it via `{:?}` would put chat content in a log file or
+/// crash report. Every other field is harmless metadata.
+impl fmt::Debug for Message {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Message")
+            .field("id", &hex(&self.id))
+            .field("sender_is_local", &self.sender_is_local)
+            .field(
+                "content",
+                &format!("<{} bytes redacted>", self.content.len()),
+            )
+            .field("timestamp", &self.timestamp)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 const MESSAGE_KEY_GLOBAL_PREFIX: &str = "message:";
@@ -58,6 +77,11 @@ impl Db {
         let mut bytes = Vec::new();
         ciborium::into_writer(message, &mut bytes)
             .expect("CBOR encoding of a well-formed struct cannot fail");
+        tracing::debug!(
+            conversation = %hex(&conversation_id),
+            message_id = %hex(&message.id),
+            "message saved",
+        );
         self.put_encrypted(&message_key(conversation_id, &message.id), &bytes)
     }
 
@@ -168,6 +192,16 @@ mod tests {
             timestamp,
             expires_at: None,
         }
+    }
+
+    #[test]
+    fn messages_debug_output_never_contains_the_plaintext_content() {
+        let message = sample_message(100, "a secret only the recipient should read");
+        let debug_output = format!("{message:?}");
+        assert!(
+            !debug_output.contains("secret"),
+            "plaintext message content must never appear in Debug output: {debug_output}"
+        );
     }
 
     #[test]
