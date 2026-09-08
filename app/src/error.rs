@@ -17,6 +17,9 @@ pub enum Error {
 
     #[error("the server did not acknowledge the request")]
     NotAcknowledged,
+
+    #[error("filesystem error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 impl From<String> for Error {

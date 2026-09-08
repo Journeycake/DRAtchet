@@ -267,3 +267,45 @@ pub fn record_verification_result(db: &Db, mut contact: Contact, matches: bool) 
     db.save_contact(&contact)?;
     Ok(contact)
 }
+
+/// `docs/ARCHITECTURE.md` §11.9's **quick wipe** — a thin wrapper over
+/// `Db::quick_wipe` (the real crypto-shred logic lives there), exposed at
+/// this layer so a Tauri command — or a future `uniffi-rs` mobile binding
+/// — never has to reach into `dratchet_store` directly, matching every
+/// other function in this crate. Returns how many message/ratchet
+/// records were erased, for the caller to show as confirmation.
+///
+/// The account and contact list are untouched, so the caller can just
+/// re-list contacts/messages afterward (both come back empty of history,
+/// contacts still present) rather than needing any special "post-wipe"
+/// UI state.
+pub fn quick_wipe(db: &Db) -> Result<usize> {
+    Ok(db.quick_wipe()?)
+}
+
+/// `docs/ARCHITECTURE.md` §11.9's **full wipe**: destroys everything in
+/// `db` — identity, contacts, message/session content, alike — via
+/// `Db::full_wipe`, then removes the now-empty file at `path` outright.
+///
+/// The file removal is not what makes this a real crypto-shred (`db`'s
+/// own `full_wipe` already destroyed every key that could ever read the
+/// file again, before this function does anything filesystem-related at
+/// all) — it's just hygiene, so a stale-but-empty file doesn't linger.
+/// Still surfaced as a real error rather than swallowed, so a permissions
+/// problem removing it is at least visible to the caller.
+///
+/// **Caller contract**: `db` must not be used for anything else once
+/// this returns (or once this returns an error partway through — treat
+/// either outcome the same way). This function intentionally does not,
+/// and structurally cannot (`db: &Db` never gives it ownership), hand
+/// back a fresh replacement `Db` with a freshly generated identity —
+/// the UI layer is expected to restart the whole application process
+/// afterward. That keeps "no db file at this path yet" meaning exactly
+/// one thing to a startup path: a fresh identity gets generated, whether
+/// this is a genuinely first launch or the launch right after a full
+/// wipe — no separate case to special-case.
+pub fn full_wipe(db: &Db, path: &std::path::Path) -> Result<()> {
+    db.full_wipe()?;
+    std::fs::remove_file(path)?;
+    Ok(())
+}

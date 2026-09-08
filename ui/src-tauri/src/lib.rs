@@ -36,6 +36,7 @@ const INBOX_UPDATED_EVENT: &str = "dratchet://inbox-updated";
 
 struct AppState {
     db: Db,
+    db_path: PathBuf,
     account: Account,
     conn: Arc<Mutex<Connection>>,
 }
@@ -144,6 +145,31 @@ async fn send_message(
     Ok(to_message_dto(&message))
 }
 
+/// `docs/ARCHITECTURE.md` §11.9's **quick wipe** — the Settings "Danger
+/// Zone" action that crypto-shreds message history and cached ratchet/
+/// session state while leaving the account and contact list untouched.
+/// Returns how many records were erased, for the frontend's confirmation
+/// toast. See `dratchet_app::quick_wipe`/`dratchet_store::Db::quick_wipe`
+/// for what "crypto-shred" actually means here — a real key destruction,
+/// not just a `DELETE`.
+#[tauri::command]
+fn quick_wipe(state: State<AppState>) -> Result<usize, String> {
+    dratchet_app::quick_wipe(&state.db).map_err(|e| e.to_string())
+}
+
+/// `docs/ARCHITECTURE.md` §11.9's **full wipe** — additionally destroys
+/// the account's identity and the contact list, then restarts the whole
+/// app process. Restarting (rather than trying to hot-swap `AppState.db`
+/// in place) is what makes `dratchet_app::full_wipe`'s caller contract
+/// trivial to satisfy: `run()`'s existing "no db file at this path yet →
+/// generate a fresh identity" startup path handles the post-wipe launch
+/// with zero special-casing, since `full_wipe` already removed the file.
+#[tauri::command]
+fn full_wipe(state: State<AppState>, app: AppHandle) -> Result<(), String> {
+    dratchet_app::full_wipe(&state.db, &state.db_path).map_err(|e| e.to_string())?;
+    app.restart();
+}
+
 /// Background receive loop, spawned once in `.setup()`: every
 /// `POLL_INTERVAL`, calls `dratchet_app::receive_pending` for every saved
 /// contact (`Pending` ones included — that's the only way a
@@ -223,11 +249,18 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .manage(AppState { db, account, conn })
+        .manage(AppState {
+            db,
+            db_path,
+            account,
+            conn,
+        })
         .invoke_handler(tauri::generate_handler![
             list_contacts,
             list_messages,
-            send_message
+            send_message,
+            quick_wipe,
+            full_wipe
         ])
         .setup(|app| {
             let app_handle = app.handle().clone();

@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::db::{hex, Db};
+use crate::db::{hex, Db, Scope};
 use crate::error::{Error, Result};
 
 /// A contact's progress through `docs/ARCHITECTURE.md` §6.2's mandatory
@@ -68,11 +68,11 @@ impl Db {
         let mut bytes = Vec::new();
         ciborium::into_writer(contact, &mut bytes)
             .expect("CBOR encoding of a well-formed struct cannot fail");
-        self.put_encrypted(&contact_key(&contact.fingerprint), &bytes)
+        self.put_encrypted(Scope::Contacts, &contact_key(&contact.fingerprint), &bytes)
     }
 
     pub fn load_contact(&self, fingerprint: &[u8]) -> Result<Option<Contact>> {
-        match self.get_encrypted(&contact_key(fingerprint))? {
+        match self.get_encrypted(Scope::Contacts, &contact_key(fingerprint))? {
             Some(bytes) => Ok(Some(decode_contact(&bytes)?)),
             None => Ok(None),
         }
@@ -87,7 +87,7 @@ impl Db {
             .into_iter()
             .map(|key| {
                 let bytes = self
-                    .get_encrypted(&key)?
+                    .get_encrypted(Scope::Contacts, &key)?
                     .ok_or(Error::MalformedRecord("contact key listed but not found"))?;
                 decode_contact(&bytes)
             })

@@ -37,6 +37,7 @@ pub fn spawn_periodic_sweep(db: Arc<Db>, interval: Duration) -> JoinHandle<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Scope;
     use crate::messages::Message;
 
     fn temp_db() -> Db {
@@ -67,7 +68,7 @@ mod tests {
             crate::db::hex(&message.id)
         );
         assert!(
-            db.get_encrypted(&key).unwrap().is_some(),
+            db.get_encrypted(Scope::Content, &key).unwrap().is_some(),
             "sanity check: the message should be present immediately after the write"
         );
 
@@ -80,7 +81,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         assert!(
-            db.get_encrypted(&key).unwrap().is_none(),
+            db.get_encrypted(Scope::Content, &key).unwrap().is_none(),
             "a message that's never read must still be pruned by the periodic sweep"
         );
     }

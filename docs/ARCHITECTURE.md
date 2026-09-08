@@ -1087,7 +1087,8 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
    conversation disappearing-message timers (§11.5), the three-level Tier 2
    recovery profile system (§7) with a self-custodied recovery phrase,
    hosted via storage option 1, the purpose-built server (`SERVERS.md`
-   §3.2).
+   §3.2), and duress response — quick wipe and a separately-gated full
+   identity wipe, client-only, no protocol change (§11.9).
 3. **v2**: multi-device support (full roadmap, including the per-device
    identity model and how recovery profiles stay consistent across a
    user's own devices, in §14), group chat (MLS/RFC 9420 — full roadmap,
@@ -1096,10 +1097,10 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
    routing (§11.2), prekey bundle auto-replenishment, push notifications,
    optional managed/server-escrowed passphrase-protected recovery option
    (§7 option b, §4.3), post-quantum hardening — hybrid handshake now,
-   extended to the ratchet itself once that ships (§11.4), duress
-   response — quick wipe and a separately-gated full identity wipe,
-   client-only, no protocol change (§11.9), and the extended in-person
-   pairing ceremony from §6.3a: QR-carried handshake material (removing
+   extended to the ratchet itself once that ships (§11.4), a coercion-
+   resistant duress trigger (decoy passphrase / gesture, §11.9), and the
+   extended in-person pairing ceremony from §6.3a: QR-carried handshake
+   material (removing
    the directory server from the pairing path entirely) plus a mandatory
    SAS liveness/anti-relay confirmation step before a contact can be
    marked Verified.
@@ -1487,7 +1488,7 @@ for the end-to-end tests.
   already owned by a different identity is rejected outright, regardless of
   proof-of-work.
 
-### 11.9 Duress response — inspired by Briar's panic-button integration — **v2, optional**
+### 11.9 Duress response — inspired by Briar's panic-button integration — **v1 — implemented** (both tiers; `store::Db::quick_wipe`/`full_wipe`, wired into the Tauri app's Settings screen)
 
 Lighter-weight than the rest of this section, and deliberately so: a
 client-only feature layered on top of the protocol, not a change to the
@@ -1497,6 +1498,27 @@ protects against being *proven* to have said something after the fact;
 this protects against a device being physically seized, or its unlock
 coerced, while a conversation's history is still readable on it. Same
 threat category (device seizure/coercion) as §11.6, different mechanism.
+
+**"Single-side" by nature, not by name**: like every wipe of a party's own
+local plaintext copy, this reaches only the device it runs on — the other
+party's device, and their own decrypted copy of the same conversation, are
+completely untouched. There is no protocol message that could reach across
+and delete something from a peer's device (nor should there be — that
+would be a remote-wipe primitive, a very different and much more dangerous
+feature). The Settings UI states this explicitly rather than leaving it
+implied, since "wipe" without qualification invites the wrong assumption.
+
+**Implementation note, since it forced a real storage-layer change**: doing
+this crypto-shred honestly (see below) meant the on-device store could no
+longer use one Argon2-derived key for everything — quick wipe needs to
+destroy the key protecting message/ratchet content *without* touching the
+key protecting the account's identity, which requires those to already be
+two separate keys before a wipe is ever triggered. `store::Db` was
+restructured to envelope encryption: the passphrase-derived key wraps three
+independently-generated data-encryption keys (identity, contacts, content),
+and only the relevant one is ever destroyed/regenerated. This is a breaking
+on-disk format change, acceptable pre-release (no deployed databases to
+migrate).
 
 - **Trigger**: a configurable duress action — a distinct PIN/passphrase
   entered at the normal unlock prompt (Briar's model: a second passphrase
@@ -1543,10 +1565,13 @@ threat category (device seizure/coercion) as §11.6, different mechanism.
   but needs live connectivity to the Recovery Store at the exact moment a
   duress trigger fires — not guaranteed, and worth flagging as a follow-on
   rather than assuming the v2 feature covers it by default.
-- **Not designed further here**: exact trigger UX (gesture vs. decoy
-  passphrase vs. both), and whether the full-wipe tier ships in the same
-  v2 pass as the quick wipe or later — left open, consistent with this
-  being a v2-optional feature rather than a v1 blocker.
+- **Trigger UX actually shipped, v1**: a Settings screen "Danger Zone" with
+  two explicit, separately-confirmed buttons — not the gesture/decoy-
+  passphrase form discussed above. That stronger, coercion-resistant
+  trigger is still real future work, tracked here rather than assumed
+  covered: a visible button is adequate for "I want to clear my own device"
+  but not for the in-person-coercion threat model the decoy-passphrase form
+  specifically addresses.
 
 ## 12. Deployment models: pure peer-to-peer vs. server-based
 

@@ -19,6 +19,7 @@
   };
 
   const INBOX_UPDATED_EVENT = "dratchet://inbox-updated";
+  const FULL_WIPE_CONFIRM_PHRASE = "DELETE";
 
   let contacts = $state<ContactDto[]>([]);
   let selected = $state<ContactDto | null>(null);
@@ -27,6 +28,15 @@
   let draft = $state("");
   let sendError = $state("");
   let sending = $state(false);
+
+  let settingsOpen = $state(false);
+  let quickWipeArmed = $state(false);
+  let quickWipeBusy = $state(false);
+  let quickWipeResult = $state("");
+  let quickWipeError = $state("");
+  let fullWipeConfirmText = $state("");
+  let fullWipeBusy = $state(false);
+  let fullWipeError = $state("");
 
   async function selectContact(contact: ContactDto) {
     selected = contact;
@@ -77,6 +87,66 @@
     }
   }
 
+  function openSettings() {
+    settingsOpen = true;
+    quickWipeArmed = false;
+    quickWipeResult = "";
+    quickWipeError = "";
+    fullWipeConfirmText = "";
+    fullWipeError = "";
+  }
+
+  function closeSettings() {
+    settingsOpen = false;
+  }
+
+  // docs/ARCHITECTURE.md §11.9's quick wipe: crypto-shreds message
+  // history and cached ratchet/session state (not just this instance's
+  // view of it — the actual on-disk data), leaving the account and
+  // contact list untouched. A two-click confirm ("Wipe..." then "Confirm
+  // wipe") rather than a native confirm() dialog, so it reads consistently
+  // with the rest of this dark-themed UI.
+  async function quickWipe() {
+    if (!quickWipeArmed) {
+      quickWipeArmed = true;
+      return;
+    }
+    quickWipeBusy = true;
+    quickWipeError = "";
+    quickWipeResult = "";
+    try {
+      const removed = await invoke<number>("quick_wipe");
+      quickWipeResult = `Erased ${removed} record${removed === 1 ? "" : "s"}.`;
+      quickWipeArmed = false;
+      await refetch();
+    } catch (e) {
+      quickWipeError = String(e);
+    } finally {
+      quickWipeBusy = false;
+    }
+  }
+
+  // §11.9's full wipe: additionally destroys the identity itself and
+  // restarts the whole app. Gated behind typing a literal confirmation
+  // phrase — deliberately a stronger, separate confirmation from quick
+  // wipe's two-click pattern, matching the doc's "explicit, separate
+  // confirmation" requirement for the irreversible tier.
+  async function fullWipe() {
+    if (fullWipeConfirmText !== FULL_WIPE_CONFIRM_PHRASE) return;
+    fullWipeBusy = true;
+    fullWipeError = "";
+    try {
+      // The app process restarts as part of this call succeeding — this
+      // invoke may never resolve from the frontend's point of view, which
+      // is fine: fullWipeBusy staying true until the restart lands is the
+      // correct UI state to show.
+      await invoke("full_wipe");
+    } catch (e) {
+      fullWipeError = String(e);
+      fullWipeBusy = false;
+    }
+  }
+
   onMount(() => {
     refetch();
     const unlisten = listen(INBOX_UPDATED_EVENT, refetch);
@@ -88,7 +158,10 @@
 
 <div class="shell">
   <aside class="sidebar">
-    <div class="brand">DRAtchet</div>
+    <div class="brand-row">
+      <div class="brand">DRAtchet</div>
+      <button class="settings-button" onclick={openSettings} aria-label="Settings">⚙</button>
+    </div>
     <div class="search">Search conversations</div>
     <ul class="conversations">
       {#each contacts as contact (contact.fingerprint)}
@@ -150,6 +223,95 @@
   </main>
 </div>
 
+{#if settingsOpen}
+  <div
+    class="modal-backdrop"
+    role="presentation"
+    onclick={(e) => {
+      if (e.target === e.currentTarget) closeSettings();
+    }}
+    onkeydown={(e) => {
+      if (e.key === "Escape") closeSettings();
+    }}
+  >
+    <div class="modal" role="dialog" aria-modal="true" aria-label="Settings">
+      <div class="modal-header">
+        <span>Settings</span>
+        <button class="modal-close" onclick={closeSettings} aria-label="Close">✕</button>
+      </div>
+
+      <div class="danger-zone">
+        <div class="danger-title">Danger Zone</div>
+        <p class="danger-note">
+          Both actions below only affect <strong>this device</strong> — they
+          never reach the other person's copy of any conversation. There is
+          no way to delete something from someone else's device.
+        </p>
+
+        <div class="danger-row">
+          <div class="danger-row-text">
+            <div class="danger-row-title">Quick wipe</div>
+            <p class="danger-row-body">
+              Erases all message history and every conversation's session
+              state on this device. Your identity and contact list are kept
+              — the app keeps working — but each conversation will need to
+              be re-paired before you can send to it again.
+            </p>
+          </div>
+          <button
+            class="danger-button"
+            class:armed={quickWipeArmed}
+            disabled={quickWipeBusy}
+            onclick={quickWipe}
+          >
+            {#if quickWipeBusy}
+              Wiping…
+            {:else if quickWipeArmed}
+              Confirm wipe
+            {:else}
+              Quick wipe
+            {/if}
+          </button>
+        </div>
+        {#if quickWipeResult}
+          <div class="danger-result">{quickWipeResult}</div>
+        {/if}
+        {#if quickWipeError}
+          <div class="danger-error">{quickWipeError}</div>
+        {/if}
+
+        <div class="danger-row">
+          <div class="danger-row-text">
+            <div class="danger-row-title">Full wipe</div>
+            <p class="danger-row-body">
+              Additionally destroys your identity itself and restarts the
+              app. Irreversible — every contact will see your identity as
+              changed the next time you reach them. Type
+              <strong>{FULL_WIPE_CONFIRM_PHRASE}</strong> to confirm.
+            </p>
+            <input
+              class="danger-confirm-input"
+              placeholder={FULL_WIPE_CONFIRM_PHRASE}
+              bind:value={fullWipeConfirmText}
+              disabled={fullWipeBusy}
+            />
+          </div>
+          <button
+            class="danger-button full"
+            disabled={fullWipeBusy || fullWipeConfirmText !== FULL_WIPE_CONFIRM_PHRASE}
+            onclick={fullWipe}
+          >
+            {fullWipeBusy ? "Wiping…" : "Full wipe"}
+          </button>
+        </div>
+        {#if fullWipeError}
+          <div class="danger-error">{fullWipeError}</div>
+        {/if}
+      </div>
+    </div>
+  </div>
+{/if}
+
 <style>
   :root {
     --bg: #14161b;
@@ -192,12 +354,35 @@
     flex-direction: column;
   }
 
+  .brand-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid var(--line);
+    padding-right: 8px;
+  }
+
   .brand {
     font-family: var(--display);
     font-weight: 600;
     color: var(--brass-strong);
     padding: 18px 16px;
-    border-bottom: 1px solid var(--line);
+  }
+
+  .settings-button {
+    background: transparent;
+    border: none;
+    color: var(--ink-faint);
+    font-size: 16px;
+    line-height: 1;
+    padding: 8px;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+
+  .settings-button:hover {
+    background: var(--bg-raised);
+    color: var(--ink);
   }
 
   .search {
@@ -375,5 +560,147 @@
     font-weight: 600;
     cursor: not-allowed;
     opacity: 0.7;
+  }
+
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.55);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 10;
+  }
+
+  .modal {
+    width: 480px;
+    max-width: calc(100vw - 40px);
+    max-height: calc(100vh - 40px);
+    overflow-y: auto;
+    background: var(--bg-raised);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+  }
+
+  .modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--line);
+    font-family: var(--display);
+    font-weight: 600;
+  }
+
+  .modal-close {
+    background: transparent;
+    border: none;
+    color: var(--ink-faint);
+    font-size: 14px;
+    cursor: pointer;
+    padding: 4px 8px;
+  }
+
+  .modal-close:hover {
+    color: var(--ink);
+  }
+
+  .danger-zone {
+    padding: 20px;
+  }
+
+  .danger-title {
+    font-family: var(--display);
+    color: var(--red);
+    font-weight: 600;
+    margin-bottom: 8px;
+  }
+
+  .danger-note {
+    color: var(--ink-soft);
+    font-size: 13px;
+    line-height: 1.5;
+    margin: 0 0 20px;
+  }
+
+  .danger-row {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 14px 0;
+    border-top: 1px solid var(--line-soft);
+  }
+
+  .danger-row-text {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .danger-row-title {
+    font-family: var(--display);
+    font-size: 14px;
+    color: var(--ink);
+    margin-bottom: 4px;
+  }
+
+  .danger-row-body {
+    color: var(--ink-faint);
+    font-size: 12px;
+    line-height: 1.5;
+    margin: 0;
+  }
+
+  .danger-confirm-input {
+    margin-top: 8px;
+    width: 100%;
+    box-sizing: border-box;
+    padding: 6px 10px;
+    background: var(--bg-sunken);
+    border: 1px solid var(--line-soft);
+    border-radius: 6px;
+    color: var(--ink);
+    font: inherit;
+    font-size: 12px;
+  }
+
+  .danger-button {
+    flex-shrink: 0;
+    padding: 8px 14px;
+    background: var(--bg-sunken);
+    border: 1px solid var(--red);
+    color: var(--red);
+    border-radius: 6px;
+    font-weight: 600;
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .danger-button:hover:not(:disabled) {
+    background: var(--red);
+    color: var(--bg-sunken);
+  }
+
+  .danger-button.armed {
+    background: var(--red);
+    color: var(--bg-sunken);
+  }
+
+  .danger-button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .danger-result {
+    color: var(--teal);
+    font-size: 12px;
+    margin-top: 4px;
+  }
+
+  .danger-error {
+    color: var(--red);
+    font-size: 12px;
+    margin-top: 4px;
   }
 </style>

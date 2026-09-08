@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::contacts::Contact;
-use crate::db::{hex, Db};
+use crate::db::{hex, Db, Scope};
 use crate::error::{Error, Result};
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -82,7 +82,11 @@ impl Db {
             message_id = %hex(&message.id),
             "message saved",
         );
-        self.put_encrypted(&message_key(conversation_id, &message.id), &bytes)
+        self.put_encrypted(
+            Scope::Content,
+            &message_key(conversation_id, &message.id),
+            &bytes,
+        )
     }
 
     /// Build and store a new message, applying `contact`'s *current*
@@ -120,7 +124,7 @@ impl Db {
         let mut messages = Vec::new();
         for key in self.keys_with_prefix(&message_key_prefix(conversation_id))? {
             let bytes = self
-                .get_encrypted(&key)?
+                .get_encrypted(Scope::Content, &key)?
                 .ok_or(Error::MalformedRecord("message key listed but not found"))?;
             let message = decode_message(&bytes)?;
             if is_expired(&message, now) {
@@ -142,7 +146,7 @@ impl Db {
         let now = now_unix();
         let mut swept = 0;
         for key in self.keys_with_prefix(MESSAGE_KEY_GLOBAL_PREFIX)? {
-            let Some(bytes) = self.get_encrypted(&key)? else {
+            let Some(bytes) = self.get_encrypted(Scope::Content, &key)? else {
                 continue;
             };
             let message = decode_message(&bytes)?;
@@ -299,7 +303,7 @@ mod tests {
         // And it's really gone, not just filtered — a raw fetch by key
         // finds nothing either.
         assert!(db
-            .get_encrypted(&message_key(conv, &expired.id))
+            .get_encrypted(Scope::Content, &message_key(conv, &expired.id))
             .unwrap()
             .is_none());
     }
