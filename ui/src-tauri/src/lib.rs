@@ -19,10 +19,10 @@
 //! instances of this app at.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use dratchet_app::open_account;
+use dratchet_app::{open_account, ProfileReconciliation};
 use dratchet_client::net::Connection;
 use dratchet_core::account::Account;
 use dratchet_store::{Contact, Db, VerificationState};
@@ -47,6 +47,18 @@ struct AppState {
     // reason `conn` already uses one.
     account: Arc<Mutex<Account>>,
     conn: Arc<Mutex<Connection>>,
+    // Set once at startup if `reconcile_own_profile` finds this device's
+    // stored discriminator was reassigned out from under it (only
+    // realistically possible after the directory server lost its
+    // in-memory state — see `docs/ARCHITECTURE.md` §6.1). A plain
+    // `std::sync::Mutex`, not `tokio::sync::Mutex`: both fields below are
+    // only ever locked for a quick take/push, never held across an
+    // `.await`.
+    own_discriminator_change_notice: StdMutex<Option<OwnDiscriminatorChangeNoticeDto>>,
+    // Appended to by the poll loop whenever `receive_pending` reports a
+    // peer's `username#NNNN` genuinely changed; drained by the frontend
+    // alongside every `INBOX_UPDATED_EVENT`.
+    peer_profile_change_notices: StdMutex<Vec<PeerProfileChangeNoticeDto>>,
 }
 
 /// A `Contact`, reshaped for the frontend: byte fields hex-encoded, a
@@ -102,6 +114,24 @@ fn to_own_profile_dto(profile: &dratchet_store::OwnProfile) -> OwnProfileDto {
 struct PairingCodeDto {
     code: String,
     expires_at: u64,
+}
+
+/// This device's own `username#NNNN` changed without the user asking —
+/// `reconcile_own_profile` found the stored discriminator taken and had
+/// to pick a new one. Surfaced once, on startup.
+#[derive(Serialize, Clone)]
+struct OwnDiscriminatorChangeNoticeDto {
+    old_handle: String,
+    new_handle: String,
+}
+
+/// A contact's `username#NNNN` changed — their device went through the
+/// same reconciliation (or they renamed on purpose) and announced it.
+#[derive(Serialize, Clone)]
+struct PeerProfileChangeNoticeDto {
+    fingerprint: String,
+    old_handle: String,
+    new_handle: String,
 }
 
 fn to_contact_dto(contact: &Contact) -> ContactDto {
@@ -356,6 +386,32 @@ async fn add_contact(
     Ok(to_contact_dto(&contact))
 }
 
+/// One-shot: returns and clears the startup discriminator-change notice,
+/// if `reconcile_own_profile` found one. `None` on every call after the
+/// first (or if nothing changed) — the frontend calls this once on mount.
+#[tauri::command]
+fn take_own_discriminator_change_notice(
+    state: State<AppState>,
+) -> Option<OwnDiscriminatorChangeNoticeDto> {
+    state
+        .own_discriminator_change_notice
+        .lock()
+        .expect("own_discriminator_change_notice mutex poisoned")
+        .take()
+}
+
+/// Drains every peer profile-change notice the poll loop has accumulated
+/// since the last call — called alongside every `INBOX_UPDATED_EVENT`.
+#[tauri::command]
+fn take_peer_profile_change_notices(state: State<AppState>) -> Vec<PeerProfileChangeNoticeDto> {
+    std::mem::take(
+        &mut *state
+            .peer_profile_change_notices
+            .lock()
+            .expect("peer_profile_change_notices mutex poisoned"),
+    )
+}
+
 /// `docs/ARCHITECTURE.md` §11.9's **quick wipe** — the Settings "Danger
 /// Zone" action that crypto-shreds message history and cached ratchet/
 /// session state while leaving the account and contact list untouched.
@@ -427,10 +483,27 @@ async fn poll_loop(app_handle: AppHandle) {
                 dratchet_app::receive_pending(&state.db, &mut conn, &account, &contact).await
             };
             match received {
-                Ok(outcome) if !outcome.messages.is_empty() || outcome.wipe_activity => {
-                    changed = true;
+                Ok(outcome) => {
+                    if !outcome.messages.is_empty()
+                        || outcome.wipe_activity
+                        || !outcome.profile_changes.is_empty()
+                    {
+                        changed = true;
+                    }
+                    if !outcome.profile_changes.is_empty() {
+                        let mut notices = state
+                            .peer_profile_change_notices
+                            .lock()
+                            .expect("peer_profile_change_notices mutex poisoned");
+                        notices.extend(outcome.profile_changes.into_iter().map(|n| {
+                            PeerProfileChangeNoticeDto {
+                                fingerprint: hex::encode(&n.fingerprint),
+                                old_handle: n.old_handle,
+                                new_handle: n.new_handle,
+                            }
+                        }));
+                    }
                 }
-                Ok(_) => {}
                 Err(e) => eprintln!("poll: receive_pending failed for a contact: {e}"),
             }
             if let Ok(Some(updated)) = state.db.load_contact(&contact.fingerprint) {
@@ -460,20 +533,57 @@ pub fn run() {
     } else {
         Db::create(&db_path, "dev").expect("create dev db")
     };
-    let account = open_account(&db).expect("open account");
+    let mut account = open_account(&db).expect("open account");
 
     // Connect + authenticate once, synchronously, before the app is
     // considered ready — fails loudly if dratchetd isn't reachable,
     // matching the existing db/account `.expect(...)` posture. A real
-    // server-address setting/retry UI is future work.
-    let conn = tauri::async_runtime::block_on(async {
+    // server-address setting/retry UI is future work. Also reconciles
+    // this device's own registration (`dratchet_app::reconcile_own_profile`)
+    // and, if the directory forgot it owned its discriminator, broadcasts
+    // the new one to every already-Verified contact right away — closing
+    // the window between "this device reconnects" and "someone notices
+    // their handle changed" as tightly as possible.
+    let (conn, own_discriminator_change_notice) = tauri::async_runtime::block_on(async {
         let mut conn = Connection::connect(SERVER_URL)
             .await
             .unwrap_or_else(|e| panic!("connect to {SERVER_URL} (is dratchetd running?): {e}"));
         conn.authenticate(&account)
             .await
             .expect("authenticate with dratchetd");
-        conn
+
+        let mut notice = None;
+        match dratchet_app::reconcile_own_profile(&db, &mut conn, &mut account).await {
+            Ok(ProfileReconciliation::DiscriminatorChanged { old, new }) => {
+                let old_handle = format!("{}#{:04}", old.username, old.discriminator);
+                let new_handle = format!("{}#{:04}", new.username, new.discriminator);
+                eprintln!(
+                    "startup: reclaiming {old_handle} failed (taken by someone else since \
+                         the directory last saw this device) — now {new_handle}"
+                );
+                if let Ok(contacts) = dratchet_app::list_contacts(&db) {
+                    for contact in contacts {
+                        if contact.verification_state != VerificationState::Verified {
+                            continue;
+                        }
+                        if let Err(e) =
+                            dratchet_app::announce_profile(&db, &mut conn, &account, &contact, &new)
+                                .await
+                        {
+                            eprintln!("startup: failed to announce new handle to a contact: {e}");
+                        }
+                    }
+                }
+                notice = Some(OwnDiscriminatorChangeNoticeDto {
+                    old_handle,
+                    new_handle,
+                });
+            }
+            Ok(ProfileReconciliation::Unchanged(_) | ProfileReconciliation::Unregistered) => {}
+            Err(e) => eprintln!("startup: reconcile_own_profile failed: {e}"),
+        }
+
+        (conn, notice)
     });
     let conn = Arc::new(Mutex::new(conn));
     let account = Arc::new(Mutex::new(account));
@@ -485,6 +595,8 @@ pub fn run() {
             db_path,
             account,
             conn,
+            own_discriminator_change_notice: StdMutex::new(own_discriminator_change_notice),
+            peer_profile_change_notices: StdMutex::new(Vec::new()),
         })
         .invoke_handler(tauri::generate_handler![
             list_contacts,
@@ -499,6 +611,8 @@ pub fn run() {
             rename_own_profile,
             generate_pairing_code,
             add_contact,
+            take_own_discriminator_change_notice,
+            take_peer_profile_change_notices,
             quick_wipe,
             full_wipe
         ])

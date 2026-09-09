@@ -549,6 +549,58 @@ independently-found gap in the original implementation where a stale
 handle would stay permanently resolvable, fixed as part of building
 rename rather than left for later.
 
+**The restart/reclaim race, and how it's closed (`dratchet_app::
+reconcile_own_profile`/`announce_profile`).** The directory
+(`server/src/state.rs`'s `Inner`) is deliberately in-memory only
+(§4.2/§11.8) — nothing is written to disk, matching this project's "no
+durable message storage" posture applied to the directory as well as
+mailboxes. A server restart therefore forgets every registration at once,
+which opens a window: a device that registered `alice#4821` still
+believes it owns that handle, but the directory no longer does, so anyone
+else who requests `alice#4821` gets it. This is a genuinely different
+failure from the live collision `Error::UsernameTaken`/§6.1 above already
+handles atomically (a single write-lock spans the whole check-then-insert
+in `publish_bundle`, so two clients racing for the same handle *right
+now* can never both win it) — the restart case is temporal, not
+concurrent: the original owner simply isn't connected yet to defend its
+claim.
+
+Closed by reconciling on every connect, before anything else runs:
+
+- `reconcile_own_profile` is called once at startup, immediately after
+  `authenticate` and before any other use of the connection. It re-
+  publishes this device's stored `OwnProfile`, trying the *exact*
+  username **and** discriminator already on record first — a genuine
+  reclaim attempt, not a fresh registration — and only falls back to
+  `publish_own_bundle`'s usual random-discriminator retry if that specific
+  reclaim is rejected with `Error::UsernameTaken` (i.e. someone else
+  already claimed it since the directory forgot this device owned it).
+  Returns `ProfileReconciliation::Unchanged` in the common case (nothing
+  to tell anyone), or `DiscriminatorChanged { old, new }` when the reclaim
+  failed and a different discriminator had to be picked — the one case a
+  caller needs to act on.
+- On `DiscriminatorChanged`, the Tauri app surfaces an in-app notice to
+  the profile owner directly (a toast: "your handle changed from
+  `alice#4821` to `alice#7290`") and calls `announce_profile` for every
+  already-`Verified` contact, sending a `ProfileAnnounce` control message
+  (`core/src/payload.rs`, `docs/MESSAGE_SCHEMA.md`) over each
+  conversation's *existing* ratchet. This is a purely cosmetic,
+  display-label update — `conversation_id`, X3DH, and all ratchet state
+  are derived from the long-term identity fingerprint (§3.1/§3.2), never
+  from `username#NNNN`, so a handle change requires no session
+  re-establishment and no key rotation of any kind. A receiving client
+  records the new handle (`Db::record_peer_profile`) and, if it genuinely
+  differs from what it already knew (first-time-learning a handle — e.g.
+  right after pairing — is deliberately not treated as a "change"),
+  surfaces its own toast: "`alice#4821` is now `alice#7290`."
+- This narrows the squatting window to "however long the original device
+  stays disconnected after a restart," rather than "until the user
+  happens to notice and manually re-registers." It does not eliminate the
+  window — a squatter who is *already connected* at the instant the
+  server restarts can still win the race — nor does it add any
+  persistence to the directory; that remains the larger, deliberately
+  deferred architectural change §9 already flags.
+
 ### 6.2 Trust levels
 
 **Verification is mandatory, not opt-in.** DRAtchet does not use
@@ -1139,7 +1191,10 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
    full identity wipe, client-only, no protocol change (§11.9), a
    bilateral per-conversation wipe ("delete for everyone," §11.9a), and
    self-registration/rename under `username#NNNN` (§6.1) with the
-   pairing-code-gated add-contact flow (§6.4) built end to end.
+   pairing-code-gated add-contact flow (§6.4) built end to end, plus
+   restart/reclaim reconciliation and cross-device-change notification
+   (§6.1) closing the directory-restart squatting window as tightly as a
+   client-only fix can.
 3. **v2**: multi-device support (full roadmap, including the per-device
    identity model and how recovery profiles stay consistent across a
    user's own devices, in §14), group chat (MLS/RFC 9420 — full roadmap,

@@ -32,6 +32,24 @@
     expires_at: number;
   };
 
+  // §6.1: surfaced once at startup when `reconcile_own_profile` had to
+  // fall back to a new discriminator because the directory forgot this
+  // device owned its old one (a server restart) and someone else claimed
+  // it first.
+  type OwnDiscriminatorChangeNoticeDto = {
+    old_handle: string;
+    new_handle: string;
+  };
+
+  // §6.1: a verified contact's handle changed, learned via a
+  // `ProfileAnnounce` control message over the existing ratchet — no
+  // key/ratchet impact, purely a display-label update.
+  type PeerProfileChangeNoticeDto = {
+    fingerprint: string;
+    old_handle: string;
+    new_handle: string;
+  };
+
   const INBOX_UPDATED_EVENT = "dratchet://inbox-updated";
   const FULL_WIPE_CONFIRM_PHRASE = "DELETE";
 
@@ -77,6 +95,22 @@
   let addBusy = $state(false);
   let addError = $state("");
   let addResult = $state("");
+
+  // Transient, auto-dismissing notices — own-handle-changed and
+  // peer-handle-changed both surface here (§6.1). Not persisted; a missed
+  // toast is recoverable by re-reading the contact's current handle, which
+  // is why these don't block on user acknowledgement.
+  type Toast = { id: number; text: string };
+  let toasts = $state<Toast[]>([]);
+  let nextToastId = 0;
+
+  function pushToast(text: string) {
+    const id = nextToastId++;
+    toasts = [...toasts, { id, text }];
+    setTimeout(() => {
+      toasts = toasts.filter((t) => t.id !== id);
+    }, 10000);
+  }
 
   let conversationMenuOpen = $state(false);
   let clearArmed = $state(false);
@@ -237,6 +271,42 @@
     }
   }
 
+  // §6.1: checked once at startup — `reconcile_own_profile` only runs
+  // once, during connect, before the UI is up at all, so this just drains
+  // whatever it left behind.
+  async function checkOwnDiscriminatorChangeNotice() {
+    try {
+      const notice = await invoke<OwnDiscriminatorChangeNoticeDto | null>(
+        "take_own_discriminator_change_notice",
+      );
+      if (notice) {
+        pushToast(
+          `Your handle changed from ${notice.old_handle} to ${notice.new_handle} — ` +
+            `someone else claimed your old handle after a server restart.`,
+        );
+      }
+    } catch (e) {
+      void e;
+    }
+  }
+
+  // §6.1: checked alongside every `refetch` — the poll loop only emits
+  // `INBOX_UPDATED_EVENT` when it actually queued a notice, so this never
+  // runs against an empty queue in practice, but draining unconditionally
+  // is simpler than threading a second signal through the event payload.
+  async function checkPeerProfileChangeNotices() {
+    let notices: PeerProfileChangeNoticeDto[] = [];
+    try {
+      notices = await invoke<PeerProfileChangeNoticeDto[]>("take_peer_profile_change_notices");
+    } catch (e) {
+      void e;
+      return;
+    }
+    for (const notice of notices) {
+      pushToast(`${notice.old_handle} is now ${notice.new_handle}.`);
+    }
+  }
+
   // §6.1: first-run self-registration, or a rename — both are the same
   // call (`register_own_profile` republishes under a new username exactly
   // like a fresh registration does).
@@ -384,7 +454,11 @@
   onMount(() => {
     refetch();
     loadOwnProfile();
-    const unlisten = listen(INBOX_UPDATED_EVENT, refetch);
+    checkOwnDiscriminatorChangeNotice();
+    const unlisten = listen(INBOX_UPDATED_EVENT, () => {
+      refetch();
+      checkPeerProfileChangeNotices();
+    });
     const tickInterval = setInterval(() => {
       nowTick = Date.now();
     }, 1000);
@@ -394,6 +468,14 @@
     };
   });
 </script>
+
+{#if toasts.length > 0}
+  <div class="toast-stack">
+    {#each toasts as toast (toast.id)}
+      <div class="toast">{toast.text}</div>
+    {/each}
+  </div>
+{/if}
 
 <div class="shell">
   <aside class="sidebar">
@@ -1017,6 +1099,27 @@
     color: var(--red);
     font-size: 12px;
     margin-top: 6px;
+  }
+
+  .toast-stack {
+    position: fixed;
+    top: 16px;
+    right: 16px;
+    z-index: 100;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-width: 360px;
+  }
+
+  .toast {
+    padding: 12px 14px;
+    background: var(--bg-raised);
+    border: 1px solid var(--amber);
+    border-radius: 8px;
+    color: var(--ink);
+    font-size: 13px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
   }
 
   .wipe-request-banner {

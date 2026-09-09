@@ -35,9 +35,9 @@ use dratchet_core::envelope::Envelope;
 use dratchet_core::first_contact::FirstContactWire;
 use dratchet_core::identity::fingerprint_of_public_key;
 use dratchet_core::payload::{
-    ConversationWipePolicyAnnounce, FirstContactContent, RoutingIdAnnounce, PAYLOAD_CHAT,
-    PAYLOAD_CONVERSATION_WIPE_POLICY_ANNOUNCE, PAYLOAD_CONVERSATION_WIPE_REQUEST,
-    PAYLOAD_FIRST_CONTACT, PAYLOAD_ROUTING_ID_ANNOUNCE,
+    ConversationWipePolicyAnnounce, FirstContactContent, ProfileAnnounce, RoutingIdAnnounce,
+    PAYLOAD_CHAT, PAYLOAD_CONVERSATION_WIPE_POLICY_ANNOUNCE, PAYLOAD_CONVERSATION_WIPE_REQUEST,
+    PAYLOAD_FIRST_CONTACT, PAYLOAD_PROFILE_ANNOUNCE, PAYLOAD_ROUTING_ID_ANNOUNCE,
 };
 use dratchet_core::prekey::{OneTimePrekeyPublic, PrekeyBundle, SignedPrekeyPublic};
 use dratchet_core::ratchet::{RatchetState, DEFAULT_MAX_SKIP};
@@ -174,17 +174,17 @@ fn random_discriminator() -> u16 {
     (OsRng.next_u32() % 10_000) as u16
 }
 
-/// Self-registration, `docs/ARCHITECTURE.md` §6.1: publish this device's
-/// own prekey bundle under `desired_username`, picking a random 4-digit
-/// discriminator and retrying with a fresh one on `Error::UsernameTaken`.
-/// Persists both `account` (the freshly generated one-time prekeys' secret
-/// halves need to survive for [`receive_first_contact_attempts`] to spend
-/// later) and the resulting [`OwnProfile`].
-pub async fn publish_own_bundle(
+/// Shared publish loop behind [`publish_own_bundle`] and
+/// [`reconcile_own_profile`]: generates a fresh one-time-prekey batch
+/// once, then tries `username` under each discriminator `candidates`
+/// yields in order, stopping at the first one the server accepts.
+/// Whichever candidate wins is persisted as the new [`OwnProfile`].
+async fn publish_under_candidates(
     db: &Db,
     conn: &mut Connection,
     account: &mut Account,
-    desired_username: &str,
+    username: &str,
+    candidates: impl Iterator<Item = u16>,
 ) -> Result<OwnProfile> {
     let otp_publics = account.generate_one_time_prekeys(ONE_TIME_PREKEY_BATCH);
     let bundle = account.publish_bundle(false)?;
@@ -197,10 +197,9 @@ pub async fn publish_own_bundle(
         .collect();
 
     let mut last_err = Error::UsernameTaken;
-    for _ in 0..DISCRIMINATOR_RETRY_ATTEMPTS {
-        let discriminator = random_discriminator();
+    for discriminator in candidates {
         let wire = PrekeyBundleWire {
-            username: desired_username.to_string(),
+            username: username.to_string(),
             discriminator,
             identity_key: bundle.identity_public_key.clone(),
             identity_dh_public: bundle.identity_dh_public.as_bytes().to_vec(),
@@ -211,7 +210,7 @@ pub async fn publish_own_bundle(
             signed_prekey_expires_at: 0,
             one_time_prekeys: one_time_prekeys.clone(),
             registration_pow: Some(dratchet_server::abuse::solve_registration_pow(
-                desired_username,
+                username,
                 discriminator,
                 &bundle.identity_public_key,
             )),
@@ -220,7 +219,7 @@ pub async fn publish_own_bundle(
             Ok(()) => {
                 db.save_account(account)?;
                 let profile = OwnProfile {
-                    username: desired_username.to_string(),
+                    username: username.to_string(),
                     discriminator,
                     signed_prekey_id: bundle.signed_prekey.id,
                 };
@@ -237,6 +236,23 @@ pub async fn publish_own_bundle(
     Err(last_err)
 }
 
+/// Self-registration, `docs/ARCHITECTURE.md` §6.1: publish this device's
+/// own prekey bundle under `desired_username`, picking a random 4-digit
+/// discriminator and retrying with a fresh one on `Error::UsernameTaken`.
+/// Persists both `account` (the freshly generated one-time prekeys' secret
+/// halves need to survive for [`receive_first_contact_attempts`] to spend
+/// later) and the resulting [`OwnProfile`].
+pub async fn publish_own_bundle(
+    db: &Db,
+    conn: &mut Connection,
+    account: &mut Account,
+    desired_username: &str,
+) -> Result<OwnProfile> {
+    let candidates =
+        std::iter::repeat_with(random_discriminator).take(DISCRIMINATOR_RETRY_ATTEMPTS as usize);
+    publish_under_candidates(db, conn, account, desired_username, candidates).await
+}
+
 /// A rename is nothing more than re-publishing under a new username —
 /// [`publish_own_bundle`] already handles the collision-retry and
 /// persistence either way.
@@ -247,6 +263,106 @@ pub async fn rename_own_profile(
     new_username: &str,
 ) -> Result<OwnProfile> {
     publish_own_bundle(db, conn, account, new_username).await
+}
+
+/// What [`reconcile_own_profile`] found.
+#[derive(Debug, Clone)]
+pub enum ProfileReconciliation {
+    /// No local [`OwnProfile`] exists yet — nothing to reconcile (a
+    /// genuinely first-ever launch, before the user has registered).
+    Unregistered,
+    /// Reclaimed exactly the username *and* discriminator this device
+    /// already believed it owned. The common case — nothing for a caller
+    /// to surface.
+    Unchanged(OwnProfile),
+    /// The stored discriminator was no longer available under this
+    /// username (someone else claimed it — realistically only possible
+    /// after the directory server lost its in-memory state and forgot
+    /// this device owned it) — a *different* discriminator was picked
+    /// instead. A caller should tell the user, since their handle just
+    /// changed without them asking, and should announce the new one to
+    /// every already-Verified contact (`announce_profile`) so their
+    /// existing conversations' peers find out too.
+    DiscriminatorChanged { old: OwnProfile, new: OwnProfile },
+}
+
+/// Called once at startup (after authenticating, before any other use of
+/// `account`/`conn`): if this device has ever registered, re-publish its
+/// bundle — first trying to reclaim the *exact* username+discriminator
+/// already stored locally, falling back to [`publish_under_candidates`]'s
+/// usual random-discriminator retry only if that specific reclaim fails.
+/// A plain [`publish_own_bundle`] call would skip straight to a random
+/// discriminator and could silently "succeed" onto a different number
+/// without anyone noticing — this exists specifically to detect that
+/// case instead of hiding it.
+///
+/// The directory (`server/src/state.rs`'s `Inner`) is deliberately
+/// in-memory only (`docs/SERVERS.md` §1.3/1.4) — a server restart forgets
+/// every registration. Nothing here changes that; this only closes the
+/// window during which a forgotten handle sits open for anyone else to
+/// claim, by reclaiming it the moment this device reconnects rather than
+/// waiting for the user to notice and manually re-register.
+pub async fn reconcile_own_profile(
+    db: &Db,
+    conn: &mut Connection,
+    account: &mut Account,
+) -> Result<ProfileReconciliation> {
+    let Some(existing) = db.load_own_profile()? else {
+        return Ok(ProfileReconciliation::Unregistered);
+    };
+
+    let candidates = std::iter::once(existing.discriminator).chain(
+        std::iter::repeat_with(random_discriminator).take(DISCRIMINATOR_RETRY_ATTEMPTS as usize),
+    );
+    let new = publish_under_candidates(db, conn, account, &existing.username, candidates).await?;
+
+    if new.discriminator == existing.discriminator {
+        Ok(ProfileReconciliation::Unchanged(new))
+    } else {
+        Ok(ProfileReconciliation::DiscriminatorChanged { old: existing, new })
+    }
+}
+
+/// Send this side's current `username#NNNN` (§6.1's `ProfileAnnounce`,
+/// `MESSAGE_SCHEMA.md`) to one already-Verified contact. Purely a
+/// display-label update — see `ProfileAnnounce`'s doc for why this never
+/// touches the conversation's ratchet. Callers broadcast this to every
+/// Verified contact after [`reconcile_own_profile`] reports
+/// `DiscriminatorChanged`, and after an ordinary user-initiated rename.
+pub async fn announce_profile(
+    db: &Db,
+    conn: &mut Connection,
+    account: &Account,
+    contact: &Contact,
+    own_profile: &OwnProfile,
+) -> Result<()> {
+    let conv_id = conversation_id_for(account, contact);
+    let mut ratchet = db.load_ratchet(conv_id)?.ok_or(Error::NoSession)?;
+
+    let envelope = ratchet.encrypt_payload(
+        PAYLOAD_PROFILE_ANNOUNCE,
+        &ProfileAnnounce {
+            username: own_profile.username.clone(),
+            discriminator: own_profile.discriminator,
+        }
+        .encode(),
+    )?;
+    conn.send(
+        FrameTag::MailboxWrite,
+        &MailboxWrite {
+            mailbox_id: contact.mailbox_id.clone(),
+            envelope: envelope.encode(),
+            ttl: 14 * 24 * 60 * 60,
+        },
+    )
+    .await?;
+    let (_, ack): (_, Ack) = conn.recv().await?;
+    if !ack.ok {
+        return Err(Error::NotAcknowledged);
+    }
+
+    db.save_ratchet(conv_id, &ratchet)?;
+    Ok(())
 }
 
 /// Generate and persist a fresh pairing code for `docs/ARCHITECTURE.md`
@@ -636,6 +752,7 @@ pub async fn receive_pending(
 
     let mut received = Vec::new();
     let mut wipe_activity = false;
+    let mut profile_changes = Vec::new();
     // Set when a `ConversationWipeRequest` this pass auto-complied with
     // included the session — the on-disk ratchet key is gone at that
     // point, and the trailing `db.save_ratchet` below (using the
@@ -680,6 +797,25 @@ pub async fn receive_pending(
                 }
                 wipe_activity = true;
             }
+            Ok((PAYLOAD_PROFILE_ANNOUNCE, content)) => {
+                let announce = ProfileAnnounce::decode(&content)?;
+                let old_handle = contact
+                    .username
+                    .as_deref()
+                    .map(|u| format!("{u}#{:04}", contact.discriminator.unwrap_or(0)));
+                let (_, changed) = db.record_peer_profile(
+                    &contact.fingerprint,
+                    announce.username.clone(),
+                    announce.discriminator,
+                )?;
+                if changed {
+                    profile_changes.push(ProfileChangeNotice {
+                        fingerprint: contact.fingerprint.clone(),
+                        old_handle: old_handle.unwrap_or_default(),
+                        new_handle: format!("{}#{:04}", announce.username, announce.discriminator),
+                    });
+                }
+            }
             Ok(_) => {} // other protocol payload types: consumed, nothing to surface yet
             Err(dratchet_store::Error::NotVerified) => {} // chat content, withheld while Pending
             Err(e) => return Err(e.into()),
@@ -705,7 +841,17 @@ pub async fn receive_pending(
     Ok(Received {
         messages: received,
         wipe_activity,
+        profile_changes,
     })
+}
+
+/// One contact's `username#NNNN` changing, surfaced by [`receive_pending`]
+/// so a caller (the Tauri poll loop) can show the user something happened
+/// rather than silently updating the sidebar handle underneath them.
+pub struct ProfileChangeNotice {
+    pub fingerprint: Vec<u8>,
+    pub old_handle: String,
+    pub new_handle: String,
 }
 
 /// What [`receive_pending`] actually did on one call.
@@ -720,6 +866,12 @@ pub struct Received {
     /// Tauri poll loop) needs this, since none of those side effects show
     /// up as a returned message.
     pub wipe_activity: bool,
+    /// A `ProfileAnnounce` this pass processed that genuinely changed a
+    /// contact's `username#NNNN` (never fires on first learning it, or on
+    /// a re-announce of an unchanged value — see
+    /// `Db::record_peer_profile`). Empty in the overwhelmingly common
+    /// case; a caller surfaces each entry as a notice to the user.
+    pub profile_changes: Vec<ProfileChangeNotice>,
 }
 
 /// Send this side's fresh routing-id announce — the first step of Phase

@@ -39,6 +39,16 @@ pub const PAYLOAD_CONVERSATION_WIPE_REQUEST: u8 = 5;
 /// by a normal `Envelope` — it's the content of `FirstContactWire.envelope`
 /// specifically, tagged and padded the same way as any other payload.
 pub const PAYLOAD_FIRST_CONTACT: u8 = 6;
+/// Announces this side's current `username#NNNN` to an already-Verified
+/// contact — `MESSAGE_SCHEMA.md`'s profile-announce section. Sent both on
+/// an ordinary user-initiated rename and when a device reconciles its
+/// registration after finding its previous handle reassigned (e.g. a
+/// directory-server restart let someone else claim it in the meantime —
+/// see `dratchet_app::reconcile_own_profile`). Purely a display-label
+/// update: it never touches `conversation_id`, X3DH, or ratchet state,
+/// all of which are keyed by the long-term identity fingerprint, never by
+/// username.
+pub const PAYLOAD_PROFILE_ANNOUNCE: u8 = 7;
 
 /// Bucket size messages are padded to (next multiple of this, up to `MAX_PADDED_LEN`).
 pub const PAD_BUCKET: usize = 160;
@@ -177,6 +187,30 @@ impl FirstContactContent {
     }
 }
 
+/// `PAYLOAD_PROFILE_ANNOUNCE`'s content — the announcing side's current
+/// `username#NNNN`. Deliberately as small as `RoutingIdAnnounce`: nothing
+/// about *why* it changed travels over the wire, since the recipient
+/// doesn't need that to update its own `Contact` record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileAnnounce {
+    pub username: String,
+    pub discriminator: u16,
+}
+
+impl ProfileAnnounce {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        ciborium::into_writer(self, &mut bytes)
+            .expect("CBOR encoding of a well-formed struct cannot fail");
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        ciborium::from_reader(bytes)
+            .map_err(|_| Error::MalformedPayload("not a valid ProfileAnnounce"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,5 +338,26 @@ mod tests {
     #[test]
     fn first_contact_content_garbage_bytes_are_rejected_not_panicking() {
         assert!(FirstContactContent::decode(&[0xFF, 0x00, 0x01]).is_err());
+    }
+
+    #[test]
+    fn profile_announce_round_trips_through_encode_and_tag_and_pad() {
+        let announce = ProfileAnnounce {
+            username: "alice".into(),
+            discriminator: 4731,
+        };
+        let encoded = announce.encode();
+        let decoded = ProfileAnnounce::decode(&encoded).unwrap();
+        assert_eq!(decoded, announce);
+
+        let padded = tag_and_pad(PAYLOAD_PROFILE_ANNOUNCE, &encoded).unwrap();
+        let (ty, content) = untag_and_unpad(&padded).unwrap();
+        assert_eq!(ty, PAYLOAD_PROFILE_ANNOUNCE);
+        assert_eq!(ProfileAnnounce::decode(&content).unwrap(), announce);
+    }
+
+    #[test]
+    fn profile_announce_garbage_bytes_are_rejected_not_panicking() {
+        assert!(ProfileAnnounce::decode(&[0xFF, 0x00, 0x01]).is_err());
     }
 }

@@ -82,8 +82,9 @@ encryption) in `ARCHITECTURE.md` §10, rather than solved here.
 one exception to "every payload here travels inside an ordinary envelope
 already backed by a session": this one is the content of a
 `FirstContactWire.envelope` specifically, encrypted under a root key just
-derived, not an existing ratchet's chain key), reserved values for future
-control payloads (e.g. a `ReadReceipt`, `ARCHITECTURE.md` §4.6).
+derived, not an existing ratchet's chain key), `7 = ProfileAnnounce`
+(§11), reserved values for future control payloads (e.g. a `ReadReceipt`,
+`ARCHITECTURE.md` §4.6).
 This is what lets a recipient tell a chat message apart from a control
 message like `DeliveryAck` or `RecoveryProfileAnnounce` after decrypting —
 all travel inside the same ratchet envelope and get the same
@@ -363,3 +364,41 @@ and `delete_contact` already provide today.
 the peer complied, declined, or hasn't seen the request yet — the same
 fire-and-forget limitation every mailbox message already has (no
 `ReadReceipt` exists either, per `ARCHITECTURE.md` §10's open decisions).
+
+## 11. Profile announce (CBOR) — `ARCHITECTURE.md` §6.1
+
+A single message behind the restart/reclaim notification mechanism: when
+`dratchet_app::reconcile_own_profile` finds its stored `username#NNNN`
+was claimed by someone else while the directory forgot this device owned
+it (a server restart, §6.1), and has to pick a new discriminator, it
+broadcasts the new handle to every already-`Verified` contact so their
+clients stay in sync rather than silently going stale.
+
+| Field | Type | Notes |
+|---|---|---|
+| `username` | string | the sender's current registered username |
+| `discriminator` | uint16 | the sender's current registered discriminator |
+
+`ProfileAnnounce`'s two fields are CBOR-encoded and become the *content*
+of a ratchet envelope's plaintext, tagged `payload_type = 7` (§2), sent
+over the recipient's existing conversation exactly like
+`RoutingIdAnnounce` (§7) or `ConversationWipePolicyAnnounce` (§10) — an
+ordinary control message, not a new session or a new payload channel.
+This is deliberate: `conversation_id` and all ratchet/session state are
+derived from the long-term identity fingerprint (`ARCHITECTURE.md`
+§3.1/§3.2), never from `username#NNNN`, so a handle change is purely a
+display-label update and needs no key or ratchet change of any kind to
+propagate.
+
+**On receipt**, the recipient compares the announced handle against
+whatever it already has stored for that contact (`Db::record_peer_profile`)
+and updates it if different. Learning a handle for the first time (e.g.
+immediately after §6.4 pairing, before any announce has arrived) is not
+treated as a "change" worth surfacing — only a genuine reassignment *from*
+an already-known handle triggers a UI notice. Like `RoutingIdAnnounce`,
+this is ungated by `ARCHITECTURE.md` §6.5's mandatory-verification rule:
+protocol machinery, not chat content, and it can only ever arrive over a
+conversation that already exists.
+
+**No delivery receipt**, the same fire-and-forget limitation as every
+other control message in this document.
