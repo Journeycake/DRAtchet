@@ -6,8 +6,7 @@ identity and session establishment. Cross-platform desktop app for Windows,
 macOS, and Linux.
 
 Every message is encrypted with a single-use symmetric key that is deleted
-immediately after use. Key rotation is driven by the Double Ratchet
-algorithm rather than a naive "new PGP keypair per message" scheme, so the
+immediately after use. Key rotation is driven by the Double Ratchet so the
 protocol tolerates real-world conditions: offline recipients, bursts of
 queued messages, out-of-order delivery, and retries.
 
