@@ -27,6 +27,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 ciborium = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
+redb = "2"
 sha2 = "0.10"
 futures-util = "0.3"
 thiserror = "1"
@@ -49,3 +50,4 @@ wizard = ["dep:dialoguer", "dep:serde_json"]
 [dev-dependencies]
 tokio-tungstenite = "0.21"
 proptest = "1"
+tempfile = "3"

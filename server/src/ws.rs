@@ -474,13 +474,14 @@ async fn publish_bundle(state: &Arc<AppState>, wire: PrekeyBundleWire) -> Result
     }
 
     inner.username_index.insert(username_key, fp);
-    inner.directory.insert(
-        fp,
-        StoredBundle {
-            bundle: wire,
-            one_time_prekeys,
-        },
-    );
+    let stored = StoredBundle {
+        bundle: wire,
+        one_time_prekeys,
+    };
+    inner.directory.insert(fp, stored);
+    if let Some(persistence) = &state.persistence {
+        persistence.save(&fp, inner.directory.get(&fp).expect("just inserted"));
+    }
     Ok(())
 }
 
@@ -527,6 +528,17 @@ async fn fetch_bundle(
                 .map(|key| OneTimePrekeyWire { id, key })
         });
 
+    // Persist the shrunk one-time-prekey pool immediately — a restart
+    // must never "un-consume" one already handed out (`persistence`'s
+    // doc explains why that would violate X3DH's single-use assumption
+    // for it). Nothing else about this record changed, so only worth
+    // writing when a prekey was actually taken.
+    if one_time_prekey.is_some() {
+        if let Some(persistence) = &state.persistence {
+            persistence.save(&target_fp, stored);
+        }
+    }
+
     let b = &stored.bundle;
     let fetched = FetchedBundleWire {
         username: b.username.clone(),
@@ -568,7 +580,7 @@ async fn fetch_bundle(
     })
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 

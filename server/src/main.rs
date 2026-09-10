@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Parser;
@@ -11,6 +12,21 @@ struct Args {
     /// Address to bind the HTTP/WebSocket listener to.
     #[arg(long, default_value = "127.0.0.1:8787", env = "DRATCHETD_BIND")]
     bind: String,
+
+    /// Where the directory (username#NNNN -> bundle) is persisted, so a
+    /// restart doesn't forget every registration (ARCHITECTURE.md §6.1).
+    /// Mailboxes/presence/subscriptions are never persisted here or
+    /// anywhere else — see server/src/persistence.rs's module doc.
+    /// Point this at a path on a volume that survives a restart/reschedule
+    /// (a container's own ephemeral filesystem does not); the chart's own
+    /// values.yaml does not mount one yet, so a Helm-deployed instance
+    /// still loses its directory across a pod reschedule until it does.
+    #[arg(
+        long,
+        default_value = "dratchetd-directory.redb",
+        env = "DRATCHETD_DIRECTORY_DB"
+    )]
+    directory_db: PathBuf,
 }
 
 /// How often the background pruning sweep (`dratchet_server::pruning`)
@@ -38,7 +54,13 @@ async fn main() {
         .init();
 
     let args = Args::parse();
-    let (router, state) = dratchet_server::app();
+    let (router, state) = dratchet_server::app_with_directory_db(&args.directory_db)
+        .unwrap_or_else(|e| {
+            panic!(
+                "failed to open the directory database at {}: {e}",
+                args.directory_db.display()
+            )
+        });
     dratchet_server::pruning::spawn_pruning_sweep(
         state,
         PRUNING_SWEEP_INTERVAL,

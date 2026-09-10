@@ -1,15 +1,18 @@
 //! In-memory state for the Signaling & Presence Service, per `docs/SERVERS.md`
-//! §1.4: "no database migrations, no durable message storage... a
-//! single-process in-memory presence table plus prekey-bundle store is
-//! sufficient." A restart loses only current-connection state and undelivered
-//! mailbox entries — never anything durable, since nothing here is meant to
-//! be durable (§1.3).
+//! §1.4: "no database migrations, no durable message storage." A restart
+//! loses only current-connection state and undelivered mailbox entries —
+//! never anything durable, since nothing here is meant to be durable (§1.3).
+//! One exception: `directory`/`username_index` are additionally written
+//! through to an on-disk store when `AppState::with_persistence` built this
+//! state — see `crate::persistence`'s module doc for why, and
+//! `docs/SERVERS.md` §1.4's update for the scope of that exception.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rand_core::{OsRng, RngCore};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, RwLock};
 
 use crate::protocol::PrekeyBundleWire;
@@ -24,6 +27,7 @@ pub struct UsernameKey {
     pub discriminator: u16,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct StoredBundle {
     pub bundle: PrekeyBundleWire,
     /// One-time prekeys not yet consumed, keyed by id — the batch shrinks
@@ -75,12 +79,42 @@ pub struct Inner {
 
 pub struct AppState {
     pub inner: RwLock<Inner>,
+    /// `None` for every existing test and dev-default run: the directory
+    /// stays exactly as in-memory-only as before. `Some` only when
+    /// `crate::app_with_directory_db` built this state — see
+    /// `crate::persistence` for what that closes.
+    pub persistence: Option<crate::persistence::Persistence>,
 }
 
 impl AppState {
     pub fn new() -> Arc<Self> {
         Arc::new(AppState {
             inner: RwLock::new(Inner::default()),
+            persistence: None,
+        })
+    }
+
+    /// Like [`AppState::new`], but the directory is seeded from — and
+    /// every subsequent mutation to it written through to —
+    /// `persistence`. See `crate::app_with_directory_db`, the only
+    /// caller.
+    pub fn with_persistence(persistence: crate::persistence::Persistence) -> Arc<Self> {
+        let mut inner = Inner::default();
+        for (fp, stored) in persistence.load_all() {
+            let username_key = UsernameKey {
+                username: stored.bundle.username.clone(),
+                discriminator: stored.bundle.discriminator,
+            };
+            inner.username_index.insert(username_key, fp);
+            inner.directory.insert(fp, stored);
+        }
+        tracing::info!(
+            recovered = inner.directory.len(),
+            "directory persistence: loaded from disk"
+        );
+        Arc::new(AppState {
+            inner: RwLock::new(inner),
+            persistence: Some(persistence),
         })
     }
 }

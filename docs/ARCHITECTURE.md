@@ -549,23 +549,37 @@ independently-found gap in the original implementation where a stale
 handle would stay permanently resolvable, fixed as part of building
 rename rather than left for later.
 
-**The restart/reclaim race, and how it's closed (`dratchet_app::
-reconcile_own_profile`/`announce_profile`).** The directory
-(`server/src/state.rs`'s `Inner`) is deliberately in-memory only
-(§4.2/§11.8) — nothing is written to disk, matching this project's "no
-durable message storage" posture applied to the directory as well as
-mailboxes. A server restart therefore forgets every registration at once,
-which opens a window: a device that registered `alice#4821` still
-believes it owns that handle, but the directory no longer does, so anyone
-else who requests `alice#4821` gets it. This is a genuinely different
-failure from the live collision `Error::UsernameTaken`/§6.1 above already
-handles atomically (a single write-lock spans the whole check-then-insert
-in `publish_bundle`, so two clients racing for the same handle *right
-now* can never both win it) — the restart case is temporal, not
-concurrent: the original owner simply isn't connected yet to defend its
-claim.
+**The restart/reclaim race, and how it's closed — at the root
+(`server/src/persistence.rs`) and again defensively on the client
+(`dratchet_app::reconcile_own_profile`/`announce_profile`).** The
+directory (`server/src/state.rs`'s `Inner`) used to be in-memory only,
+matching this project's "no durable message storage" posture applied to
+the directory as well as mailboxes — but that posture had a real cost
+here a restart forgot every registration at once, opening a window: a
+device that registered `alice#4821` still believed it owned that handle,
+but the directory no longer did, so anyone else who requested
+`alice#4821` got it. This is a genuinely different failure from the live
+collision `Error::UsernameTaken`/§6.1 above, which is already handled
+atomically (a single write-lock spans the whole check-then-insert in
+`publish_bundle`, so two clients racing for the same handle *right now*
+can never both win it) — the restart case is temporal, not concurrent:
+the original owner simply isn't connected yet to defend its claim.
 
-Closed by reconciling on every connect, before anything else runs:
+**Root fix**: the directory is now persisted (`server/src/persistence.rs`,
+`docs/SERVERS.md` §1.4) — every registration, rename, and rotation, plus
+each one-time prekey `FetchBundle` consumes, is written through to an
+embedded single-file store, and reloaded at startup. A restart with the
+directory's file on durable storage no longer forgets anything, which is
+the actual fix; everything below is defense-in-depth for what that alone
+still doesn't cover: an operator who hasn't pointed `--directory-db` at
+storage that survives a restart (the default path is the working
+directory, which a container's own ephemeral filesystem does not
+survive — the shipped Helm chart doesn't mount a persistent volume for it
+yet), and a squatter who is *already connected* at the exact instant a
+restart happens, racing the original owner's reconnect either way.
+
+Narrowed further by reconciling on every connect, before anything else
+runs:
 
 - `reconcile_own_profile` is called once at startup, immediately after
   `authenticate` and before any other use of the connection. It re-
@@ -593,13 +607,12 @@ Closed by reconciling on every connect, before anything else runs:
   differs from what it already knew (first-time-learning a handle — e.g.
   right after pairing — is deliberately not treated as a "change"),
   surfaces its own toast: "`alice#4821` is now `alice#7290`."
-- This narrows the squatting window to "however long the original device
-  stays disconnected after a restart," rather than "until the user
-  happens to notice and manually re-registers." It does not eliminate the
-  window — a squatter who is *already connected* at the instant the
-  server restarts can still win the race — nor does it add any
-  persistence to the directory; that remains the larger, deliberately
-  deferred architectural change §9 already flags.
+- On a properly durable directory (the common case now), this rarely has
+  anything to do — `reconcile_own_profile` just reclaims the same
+  discriminator and returns `Unchanged`. It earns its keep in exactly the
+  two remaining cases above: an operator whose directory storage isn't
+  actually durable, and the already-connected-squatter race a persisted
+  directory can't fully close by itself either.
 
 ### 6.2 Trust levels
 
@@ -1191,10 +1204,20 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
    full identity wipe, client-only, no protocol change (§11.9), a
    bilateral per-conversation wipe ("delete for everyone," §11.9a), and
    self-registration/rename under `username#NNNN` (§6.1) with the
-   pairing-code-gated add-contact flow (§6.4) built end to end, plus
-   restart/reclaim reconciliation and cross-device-change notification
-   (§6.1) closing the directory-restart squatting window as tightly as a
-   client-only fix can.
+   pairing-code-gated add-contact flow (§6.4) built end to end, plus a
+   persisted directory (`SERVERS.md` §1.4) and client-side restart/reclaim
+   reconciliation with cross-device-change notification (§6.1) together
+   closing the directory-restart squatting window.
+
+   **Scope freeze**: as of this writing, v1 (desktop, 1:1 chat, Tier 1
+   delivery) is feature-complete against everything above — every item in
+   this bullet is implemented and tested. No v2 item below should be
+   started until this note is explicitly revisited; the intent is to let
+   real usage (even by a single second person) surface what actually
+   needs building next, rather than continuing to plan ahead of what
+   exists. Bug fixes and hardening within what's already shipped
+   (correctness fixes, test coverage, documentation) are not blocked by
+   this freeze — only new v2-roadmap work is.
 3. **v2**: multi-device support (full roadmap, including the per-device
    identity model and how recovery profiles stay consistent across a
    user's own devices, in §14), group chat (MLS/RFC 9420 — full roadmap,
@@ -1266,6 +1289,12 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
   leaning toward shipping it, but off-by-default is the part that isn't
   negotiable given the Signal/WhatsApp/iMessage precedent of treating it as
   more sensitive than delivery confirmation.
+- `ProfileAnnounce` (§6.1) has no rate limit: an already-`Verified`
+  contact could send an unbounded stream of them, each triggering a
+  `Db::record_peer_profile` write and a UI toast. Low severity (requires
+  an existing verified relationship to exploit; worst case is toast/DB
+  churn, not data loss or a security bypass), deferred rather than fixed
+  pending real usage — same posture as the other low-stakes items above.
 - Tier 0 connection budget and Tier 1 TTL (§4.5): 10s and 14 days are
   reasonable starting defaults, not measured — tune once there's real
   network/usage data, especially the TTL if a server-based deployment (§12)

@@ -753,6 +753,7 @@ pub async fn receive_pending(
     let mut received = Vec::new();
     let mut wipe_activity = false;
     let mut profile_changes = Vec::new();
+    let mut skipped = 0usize;
     // Set when a `ConversationWipeRequest` this pass auto-complied with
     // included the session — the on-disk ratchet key is gone at that
     // point, and the trailing `db.save_ratchet` below (using the
@@ -765,60 +766,35 @@ pub async fn receive_pending(
     // in this batch is correct. Wipe-policy decisions below use this same
     // stale-within-the-batch snapshot for the same reason.
     for entry in &entries.entries {
-        let envelope = Envelope::decode(&entry.envelope)?;
-        match decrypt_gated(&mut ratchet, contact, &envelope) {
-            Ok((PAYLOAD_ROUTING_ID_ANNOUNCE, content)) => {
-                let announce = RoutingIdAnnounce::decode(&content)?;
-                db.record_peer_routing_id(&contact.fingerprint, announce.routing_id)?;
-            }
-            Ok((PAYLOAD_CHAT, content)) => {
-                received.push(db.save_message_now(conv_id, content, false)?);
-            }
-            Ok((PAYLOAD_CONVERSATION_WIPE_POLICY_ANNOUNCE, content)) => {
-                let announce = ConversationWipePolicyAnnounce::decode(&content)?;
-                db.record_peer_wipe_policy(
-                    &contact.fingerprint,
-                    announce.ask_before_delete,
-                    announce.include_session,
-                )?;
+        match apply_entry(db, &mut ratchet, contact, conv_id, &entry.envelope) {
+            Ok(EntryEffect::None) => {}
+            Ok(EntryEffect::Message(message)) => received.push(message),
+            Ok(EntryEffect::WipeActivity { session_wiped: sw }) => {
                 wipe_activity = true;
-            }
-            Ok((PAYLOAD_CONVERSATION_WIPE_REQUEST, _content)) => {
-                if contact.effective_wipe_ask_before_delete() {
-                    let mut pending = contact.clone();
-                    pending.wipe_request_pending = true;
-                    db.save_contact(&pending)?;
-                } else {
-                    let include_session = contact.effective_wipe_include_session();
-                    db.wipe_conversation(conv_id, include_session)?;
-                    if include_session {
-                        session_wiped = true;
-                    }
-                }
-                wipe_activity = true;
-            }
-            Ok((PAYLOAD_PROFILE_ANNOUNCE, content)) => {
-                let announce = ProfileAnnounce::decode(&content)?;
-                let old_handle = contact
-                    .username
-                    .as_deref()
-                    .map(|u| format!("{u}#{:04}", contact.discriminator.unwrap_or(0)));
-                let (_, changed) = db.record_peer_profile(
-                    &contact.fingerprint,
-                    announce.username.clone(),
-                    announce.discriminator,
-                )?;
-                if changed {
-                    profile_changes.push(ProfileChangeNotice {
-                        fingerprint: contact.fingerprint.clone(),
-                        old_handle: old_handle.unwrap_or_default(),
-                        new_handle: format!("{}#{:04}", announce.username, announce.discriminator),
-                    });
+                if sw {
+                    session_wiped = true;
                 }
             }
-            Ok(_) => {} // other protocol payload types: consumed, nothing to surface yet
-            Err(dratchet_store::Error::NotVerified) => {} // chat content, withheld while Pending
-            Err(e) => return Err(e.into()),
+            Ok(EntryEffect::ProfileChange(notice)) => profile_changes.push(notice),
+            Err(e) if is_per_entry_content_error(&e) => {
+                // A property of *this one entry* — a corrupted/tampered
+                // envelope, a message too far out of order for the
+                // skipped-key cache, or (the case that motivated this)
+                // this client's own not-yet-fetched message landing in
+                // the shared pre-transition bootstrap mailbox, which is
+                // never decryptable from the receiving side. Deleted like
+                // any other processed entry below so it never wedges this
+                // mailbox for every poll thereafter; everything else in
+                // the batch still gets a chance.
+                eprintln!(
+                    "receive_pending: skipping an undecryptable/malformed mailbox entry: {e}"
+                );
+                skipped += 1;
+            }
+            // A local storage failure or invariant violation, not a
+            // property of the incoming entry — abort rather than risk
+            // silently losing or misprocessing whatever comes after it.
+            Err(e) => return Err(e),
         }
 
         conn.send(
@@ -842,7 +818,107 @@ pub async fn receive_pending(
         messages: received,
         wipe_activity,
         profile_changes,
+        skipped,
     })
+}
+
+/// What processing one decrypted mailbox entry produced — [`receive_pending`]
+/// folds this into its running accumulators, or (on `Err`) decides whether
+/// to skip just this entry or abort the whole batch.
+enum EntryEffect {
+    None,
+    Message(Message),
+    WipeActivity { session_wiped: bool },
+    ProfileChange(ProfileChangeNotice),
+}
+
+/// True for an error that's a property of *this one mailbox entry* —
+/// corrupted/tampered ciphertext, a malformed envelope or decoded control
+/// payload, a message too far out of order for the skipped-key cache, a
+/// bad signature — as opposed to a local storage failure or an
+/// inconsistent local invariant (`MalformedRecord`), which still aborts
+/// the whole batch: continuing past *those* risks compounding a real
+/// local problem rather than just dropping one bad piece of mail.
+fn is_per_entry_content_error(e: &Error) -> bool {
+    matches!(
+        e,
+        Error::Core(_) | Error::Store(dratchet_store::Error::Core(_))
+    )
+}
+
+/// Decode + decrypt + dispatch one mailbox entry. Split out of
+/// [`receive_pending`] so its caller can classify a failure (skip just
+/// this entry vs. abort the batch) instead of the whole loop body living
+/// inside a `match` arm's error path.
+fn apply_entry(
+    db: &Db,
+    ratchet: &mut RatchetState,
+    contact: &Contact,
+    conv_id: [u8; 16],
+    entry_envelope: &[u8],
+) -> Result<EntryEffect> {
+    let envelope = Envelope::decode(entry_envelope)?;
+    match decrypt_gated(ratchet, contact, &envelope) {
+        Ok((PAYLOAD_ROUTING_ID_ANNOUNCE, content)) => {
+            let announce = RoutingIdAnnounce::decode(&content)?;
+            db.record_peer_routing_id(&contact.fingerprint, announce.routing_id)?;
+            Ok(EntryEffect::None)
+        }
+        Ok((PAYLOAD_CHAT, content)) => Ok(EntryEffect::Message(
+            db.save_message_now(conv_id, content, false)?,
+        )),
+        Ok((PAYLOAD_CONVERSATION_WIPE_POLICY_ANNOUNCE, content)) => {
+            let announce = ConversationWipePolicyAnnounce::decode(&content)?;
+            db.record_peer_wipe_policy(
+                &contact.fingerprint,
+                announce.ask_before_delete,
+                announce.include_session,
+            )?;
+            Ok(EntryEffect::WipeActivity {
+                session_wiped: false,
+            })
+        }
+        Ok((PAYLOAD_CONVERSATION_WIPE_REQUEST, _content)) => {
+            if contact.effective_wipe_ask_before_delete() {
+                let mut pending = contact.clone();
+                pending.wipe_request_pending = true;
+                db.save_contact(&pending)?;
+                Ok(EntryEffect::WipeActivity {
+                    session_wiped: false,
+                })
+            } else {
+                let include_session = contact.effective_wipe_include_session();
+                db.wipe_conversation(conv_id, include_session)?;
+                Ok(EntryEffect::WipeActivity {
+                    session_wiped: include_session,
+                })
+            }
+        }
+        Ok((PAYLOAD_PROFILE_ANNOUNCE, content)) => {
+            let announce = ProfileAnnounce::decode(&content)?;
+            let old_handle = contact
+                .username
+                .as_deref()
+                .map(|u| format!("{u}#{:04}", contact.discriminator.unwrap_or(0)));
+            let (_, changed) = db.record_peer_profile(
+                &contact.fingerprint,
+                announce.username.clone(),
+                announce.discriminator,
+            )?;
+            if changed {
+                Ok(EntryEffect::ProfileChange(ProfileChangeNotice {
+                    fingerprint: contact.fingerprint.clone(),
+                    old_handle: old_handle.unwrap_or_default(),
+                    new_handle: format!("{}#{:04}", announce.username, announce.discriminator),
+                }))
+            } else {
+                Ok(EntryEffect::None)
+            }
+        }
+        Ok(_) => Ok(EntryEffect::None), // other protocol payload types: consumed, nothing to surface yet
+        Err(dratchet_store::Error::NotVerified) => Ok(EntryEffect::None), // chat content, withheld while Pending
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// One contact's `username#NNNN` changing, surfaced by [`receive_pending`]
@@ -872,6 +948,15 @@ pub struct Received {
     /// `Db::record_peer_profile`). Empty in the overwhelmingly common
     /// case; a caller surfaces each entry as a notice to the user.
     pub profile_changes: Vec<ProfileChangeNotice>,
+    /// Mailbox entries this pass deleted without being able to process —
+    /// a corrupted/tampered envelope, a message too far out of order for
+    /// the skipped-key cache, or this client's own not-yet-fetched
+    /// message landing in the shared pre-transition bootstrap mailbox
+    /// (never decryptable from the receiving side). Not an error: the
+    /// entry is gone either way, this just says how many were silently
+    /// dropped rather than delivered, for a caller that wants to log or
+    /// surface it.
+    pub skipped: usize,
 }
 
 /// Send this side's fresh routing-id announce — the first step of Phase

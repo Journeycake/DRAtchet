@@ -94,13 +94,15 @@ mid-frame.
 
 ### Configuration
 
-The service takes exactly one setting, since it has no database and no
-secrets to configure — everything else about its behavior (auth, TTLs,
-frame limits) is fixed by the protocol itself, not tunable at deploy time.
+The service takes two settings — it still has no secrets to configure,
+and no schema/migrations, but the directory (below) does need a path.
+Everything else about its behavior (auth, TTLs, frame limits) is fixed by
+the protocol itself, not tunable at deploy time.
 
 | Setting | Flag | Environment variable | Default |
 |---|---|---|---|
 | Bind address | `--bind <addr>` | `DRATCHETD_BIND` | `127.0.0.1:8787` |
+| Directory database path | `--directory-db <path>` | `DRATCHETD_DIRECTORY_DB` | `dratchetd-directory.redb` |
 
 ```sh
 # Listen on all interfaces, a non-default port, via the flag:
@@ -109,6 +111,16 @@ frame limits) is fixed by the protocol itself, not tunable at deploy time.
 # ...or equivalently via the environment:
 DRATCHETD_BIND=0.0.0.0:8787 ./target/release/dratchetd
 ```
+
+The directory database (`username#NNNN` → prekey bundle) is the one piece
+of durable state this service keeps — everything else (presence, Tier 1
+mailboxes, rate-limit buckets) stays in-memory-only by design (§1.3/§1.4
+of `docs/SERVERS.md`). Point `--directory-db` at a path on storage that
+actually survives a restart; the default (a file in the working
+directory) does not survive a container recreate. Without durable
+storage behind it, a restart forgets every registration and reopens the
+squatting window `docs/ARCHITECTURE.md` §6.1 describes — the client-side
+mitigation there narrows that window but doesn't close it on its own.
 
 Run `./target/release/dratchetd --help` for the auto-generated usage text.
 
@@ -218,6 +230,20 @@ routing consistency yourself (e.g. consistent-hashing per identity
 fingerprint at the ingress/load-balancer layer), which this chart does not
 set up for you. The rendered `NOTES.txt` repeats this warning if
 `replicaCount` is set above `1`.
+
+### Before you deploy: this chart doesn't yet persist the directory across a pod restart
+
+The binary itself now persists the directory (`username#NNNN` → prekey
+bundle) to `--directory-db`'s path — see
+[Configuration](#configuration) above and `docs/ARCHITECTURE.md` §6.1 for
+why. This chart does not yet mount a `PersistentVolumeClaim` at that
+path, so on Kubernetes specifically, a pod restart, reschedule, or rolling
+update still writes the directory to the pod's own ephemeral filesystem
+and loses it exactly as if persistence weren't built at all. Until a PVC
+is added here, running on this chart gets the in-process crash-recovery
+benefit (a process restart within the same pod keeps its directory) but
+not the pod-lifecycle one. Mount a volume at `--directory-db`'s path
+yourself in the meantime if that matters for your deployment.
 
 ### Install
 

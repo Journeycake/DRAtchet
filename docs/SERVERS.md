@@ -110,12 +110,29 @@ including account-registration abuse (username squatting).
 
 ### 1.4 Minimal deployment shape
 
-- No database migrations, no durable message storage. A single-process
-  in-memory presence table plus prekey-bundle store is sufficient for
-  small/self-hosted deployments; a Redis-backed table is a reasonable
-  upgrade path if horizontal scaling matters later. Either way, restarting
-  the service loses only current-connection state, not anything users would
+- No database migrations, no durable message storage. Presence and every
+  Tier 1 mailbox stay exactly as in-memory-only as originally described
+  here — a single-process table is sufficient for small/self-hosted
+  deployments, a Redis-backed one a reasonable upgrade path if horizontal
+  scaling matters later. Restarting the service still loses only
+  current-connection state and undelivered mail, not anything users would
   consider data loss.
+- **One exception, added after the fact**: the directory itself
+  (`username#NNNN` → prekey bundle, job 1 above) *is* now persisted to an
+  embedded, single-file store (`server/src/persistence.rs`) — a purely
+  in-memory directory turned out to have a real cost this document didn't
+  originally account for: a restart forgot every registration, opening a
+  window for someone else to claim a `username#NNNN` a device still
+  believed it owned (`ARCHITECTURE.md` §6.1). Scoped deliberately narrowly
+  — only which handle maps to which identity's current bundle, never
+  mailbox contents or presence — so the "no durable message storage"
+  posture above still holds for everything that isn't the directory
+  itself. On by default (`dratchetd --directory-db <path>`/
+  `DRATCHETD_DIRECTORY_DB`, defaulting to a file in the working
+  directory); the path needs to sit on storage that survives a restart or
+  pod reschedule (the shipped Helm chart doesn't mount one yet, so a
+  Helm-deployed instance still loses its directory across a reschedule
+  until it does — a known, not-yet-closed gap).
 - The Tier 1 mailbox (job 3 above) does need slightly more durability than
   presence — entries must survive a brief service restart to honor their
   TTL — but stays far short of a database: a KV store with per-key TTL
