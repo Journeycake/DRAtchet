@@ -1,0 +1,50 @@
+{{- if .Values.ingress.enabled -}}
+{{/*
+Note: this is a WebSocket service (one long-lived connection per client,
+docs/SERVERS.md §1.2). Whatever ingress controller you point this at (e.g.
+nginx-ingress on RKE2) must have WebSocket upgrade support enabled and
+timeouts long enough for a persistent connection — nginx-ingress does this
+by default, but a custom `proxy-read-timeout`/`proxy-send-timeout`
+annotation is worth setting explicitly if your controller's default is
+short.
+
+TLS / wss:// — see the detailed comment on `ingress.tls` in values.yaml for
+how to populate it (cert-manager vs. a pre-existing Secret) and why leaving
+it empty means this Ingress serves plain, unencrypted ws:// externally.
+Once `tls` is set here, the same WebSocket upgrade automatically becomes
+wss:// — nothing else in this template changes.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "dratchet-server.fullname" . }}
+  labels:
+    {{- include "dratchet-server.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- end }}
+  {{- with .Values.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range .Values.ingress.hosts }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path }}
+            pathType: {{ .pathType }}
+            backend:
+              service:
+                name: {{ include "dratchet-server.fullname" $ }}
+                port:
+                  number: {{ $.Values.service.port }}
+          {{- end }}
+    {{- end }}
+{{- end }}

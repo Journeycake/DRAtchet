@@ -1,0 +1,34 @@
+[package]
+name = "dratchet-client"
+version = "0.1.0"
+edition = "2021"
+description = "DRAtchet reference CLI client — server-independent X3DH handshake (Option B / docs/ARCHITECTURE.md §6.3a) plus Double Ratchet chat over the Signaling & Presence Service's Tier 1 mailbox. A reference/test client for exercising the real protocol end to end, not the production Tauri app."
+license = "GPL-3.0-only"
+
+[[bin]]
+name = "dratchet-cli"
+path = "src/main.rs"
+
+[dependencies]
+dratchet-core = { path = "../core" }
+# Reused here for its wire protocol types (FrameTag, AuthChallenge/Response,
+# MailboxWrite/Fetch/Delete, Ack, ErrorFrame) — see pairing.rs's module doc
+# for why this coupling exists and what it's a stand-in for.
+dratchet-server = { path = "../server" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-std", "io-util", "time", "signal"] }
+tokio-tungstenite = "0.21"
+futures-util = "0.3"
+ciborium = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+clap = { version = "4", features = ["derive"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+base64 = "0.22"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+[dev-dependencies]
+# For tests/integration.rs's own spawn_server() helper only, mirroring
+# server/tests/common/mod.rs::spawn_server() — see that test's doc comment.
+axum = { version = "0.7", features = ["ws"] }

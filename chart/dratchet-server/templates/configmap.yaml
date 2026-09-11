@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "dratchet-server.fullname" . }}
+  labels:
+    {{- include "dratchet-server.labels" . | nindent 4 }}
+data:
+  DRATCHETD_BIND: "0.0.0.0:{{ .Values.service.port }}"
+  RUST_LOG: {{ .Values.config.logLevel | quote }}

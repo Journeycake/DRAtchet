@@ -1,0 +1,269 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: fmt, clippy, build, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Clippy & test dratchetd-config-wizard (feature = "wizard", off by default)
+        run: |
+          cargo clippy -p dratchet-server --all-targets --features wizard -- -D warnings
+          cargo test -p dratchet-server --features wizard
+
+  fuzz-smoke:
+    name: fuzz smoke test (decode_envelope, unpad_payload)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo registry and fuzz build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            core/fuzz/target
+          key: ${{ runner.os }}-cargo-fuzz-${{ hashFiles('core/fuzz/Cargo.lock') }}
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Fuzz decode_envelope (60s)
+        working-directory: core
+        run: cargo fuzz run decode_envelope -- -max_total_time=60
+
+      - name: Fuzz unpad_payload (60s)
+        working-directory: core
+        run: cargo fuzz run unpad_payload -- -max_total_time=60
+
+  ui:
+    name: fmt, clippy, build (ui/ Tauri + Svelte)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ui/src-tauri links against webkit2gtk/gtk3 at build time (Tauri's
+      # Linux webview backend) — these aren't needed anywhere else in the
+      # repo, which is why they're only installed in this job, not the
+      # root "test" job.
+      - name: Install Tauri Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and build artifacts (ui/src-tauri)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ui/src-tauri/target
+          key: ${{ runner.os }}-cargo-ui-${{ hashFiles('ui/src-tauri/Cargo.lock') }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: npm ci
+        working-directory: ui
+        run: npm ci
+
+      - name: svelte-check
+        working-directory: ui
+        run: npm run check
+
+      # ui/src-tauri is a standalone Cargo workspace (its own [workspace]
+      # table), deliberately separate from the root dratchet-* workspace
+      # (see its Cargo.toml) — so these run with --manifest-path rather
+      # than joining the root "test" job's `--workspace` commands.
+      - name: Format check
+        working-directory: ui/src-tauri
+        run: cargo fmt --check
+
+      - name: Clippy (deny warnings)
+        working-directory: ui/src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build
+        working-directory: ui/src-tauri
+        run: cargo build --all-targets
+
+      - name: Test
+        working-directory: ui/src-tauri
+        run: cargo test
+
+  docker:
+    name: build container image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (not pushed)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: dratchet-server:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  helm:
+    name: lint and validate Helm chart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+
+      - name: helm lint
+        run: helm lint chart/dratchet-server
+
+      - name: helm template (default values)
+        run: helm template test chart/dratchet-server > /tmp/rendered-default.yaml
+
+      - name: helm template (ingress/PDB/multi-replica/pull-secret enabled)
+        run: |
+          helm template test chart/dratchet-server \
+            --set ingress.enabled=true \
+            --set podDisruptionBudget.enabled=true \
+            --set replicaCount=3 \
+            --set imagePullSecrets[0].name=my-registry-secret \
+            --set serviceAccount.create=false \
+            --set serviceAccount.name=existing-sa \
+            > /tmp/rendered-full.yaml
+
+      - name: helm template (ingress with TLS)
+        run: |
+          helm template test chart/dratchet-server \
+            --set ingress.enabled=true \
+            --set ingress.tls[0].secretName=dratchet-tls \
+            --set ingress.tls[0].hosts[0]=dratchet.example.com \
+            > /tmp/rendered-tls.yaml
+          grep -q 'secretName: dratchet-tls' /tmp/rendered-tls.yaml
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build dratchetd-config-wizard
+        run: cargo build --release --features wizard --bin dratchetd-config-wizard -p dratchet-server
+
+      - name: Generate values overrides with the wizard, then helm template each
+        run: |
+          WIZARD=target/release/dratchetd-config-wizard
+
+          cat > /tmp/wizard-answers-default.json <<'EOF'
+          {
+            "service_port": 8787,
+            "log_level": "info",
+            "image_repository": "dratchet-server",
+            "image_tag": "latest",
+            "replica_count": 1,
+            "resource_tier": "Dev",
+            "ingress": null,
+            "pod_disruption_budget": false
+          }
+          EOF
+
+          cat > /tmp/wizard-answers-full.json <<'EOF'
+          {
+            "service_port": 8787,
+            "log_level": "info",
+            "image_repository": "registry.example.com/dratchet-server",
+            "image_tag": "v1.0.0",
+            "replica_count": 3,
+            "resource_tier": "SmallProd",
+            "ingress": {
+              "host": "dratchet.example.com",
+              "tls": {
+                "CertManager": {
+                  "cluster_issuer": "letsencrypt-prod",
+                  "secret_name": "dratchet-tls"
+                }
+              }
+            },
+            "pod_disruption_budget": true
+          }
+          EOF
+
+          "$WIZARD" --non-interactive /tmp/wizard-answers-default.json -o /tmp/wizard-values-default.yaml
+          "$WIZARD" --non-interactive /tmp/wizard-answers-full.json -o /tmp/wizard-values-full.yaml
+
+          helm template test chart/dratchet-server -f /tmp/wizard-values-default.yaml \
+            > /tmp/rendered-wizard-default.yaml
+
+          helm template test chart/dratchet-server -f /tmp/wizard-values-full.yaml \
+            > /tmp/rendered-wizard-full.yaml
+          grep -q 'replicas: 3' /tmp/rendered-wizard-full.yaml
+          grep -q 'secretName: dratchet-tls' /tmp/rendered-wizard-full.yaml
+          grep -q 'cert-manager.io/cluster-issuer: letsencrypt-prod' /tmp/rendered-wizard-full.yaml
+
+      - name: Validate rendered manifests against the Kubernetes API schema
+        run: |
+          go install github.com/yannh/kubeconform/cmd/kubeconform@latest
+          "$(go env GOPATH)/bin/kubeconform" -summary -strict /tmp/rendered-default.yaml
+          "$(go env GOPATH)/bin/kubeconform" -summary -strict /tmp/rendered-full.yaml
+          "$(go env GOPATH)/bin/kubeconform" -summary -strict /tmp/rendered-tls.yaml
+          "$(go env GOPATH)/bin/kubeconform" -summary -strict /tmp/rendered-wizard-default.yaml
+          "$(go env GOPATH)/bin/kubeconform" -summary -strict /tmp/rendered-wizard-full.yaml

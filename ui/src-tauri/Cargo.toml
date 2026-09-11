@@ -1,0 +1,48 @@
+# Deliberately its own standalone workspace, not a member of the root
+# dratchet-* Cargo workspace: this crate's dependency tree (wry, tao,
+# webkit2gtk bindings) is a GUI-framework surface unrelated to the pure-
+# Rust, minimal-dependency discipline the core/server/client/store/app
+# workspace has kept throughout the project. `dratchet-app` (this crate's
+# one real dependency on that workspace) is still just a normal path
+# dependency below — Cargo doesn't require the two workspaces to be the
+# same one for that to work.
+[workspace]
+
+[package]
+name = "ui"
+version = "0.1.0"
+description = "A Tauri App"
+authors = ["you"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "ui_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dratchet-app = { path = "../../app" }
+dratchet-store = { path = "../../store" }
+dratchet-core = { path = "../../core" }
+dratchet-client = { path = "../../client" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

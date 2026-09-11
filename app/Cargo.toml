@@ -1,0 +1,29 @@
+[package]
+name = "dratchet-app"
+version = "0.1.0"
+edition = "2021"
+description = "DRAtchet portable app core — account/contact/message operations wrapping core+store+the wire protocol, UI-agnostic so a Tauri command layer today (and a uniffi-rs binding layer for native mobile later) can both wrap it unchanged"
+license = "GPL-3.0-only"
+
+[dependencies]
+dratchet-core = { path = "../core" }
+dratchet-store = { path = "../store" }
+# Reused as-is, not duplicated: `net::Connection` (the WS wrapper over
+# `dratchet_server::protocol`). `client/`'s `handshake`/`pairing` modules
+# are the out-of-band (§6.3a) pairing flow, not used here — this crate
+# talks to the directory-based flow instead (see lib.rs's module doc).
+dratchet-client = { path = "../client" }
+dratchet-server = { path = "../server" }
+thiserror = "1"
+# `publish_own_bundle`'s random discriminator (§6.1) — real, not dev-only,
+# since a shipped client needs it too.
+rand_core = { version = "0.6", features = ["getrandom"] }
+# `add_contact_by_username` converts a fetched `FetchedBundleWire` into a
+# real `core::prekey::PrekeyBundle` to run X3DH against — needs the same
+# `PublicKey` type every other X3DH caller in this workspace uses.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+axum = { version = "0.7", features = ["ws"] }
+tempfile = "3"
