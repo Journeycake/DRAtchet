@@ -316,9 +316,15 @@ lid closing.
   directly proving the reconnect scenario end to end, a second call after
   the first connection is dropped produces a working replacement.
 
-**Deferred**: a UI connection-state indicator (option 3) — the backend is
-now self-healing, but there's still no visible signal to the user while
-a reconnect is in progress. Tracked as follow-up work, not blocking.
+**Option 3, also done**: a small "Reconnecting…" badge in the sidebar
+header (`ui/src/routes/+page.svelte`), driven by a new
+`get_connection_status` command plus a `CONNECTION_STATUS_EVENT` the
+backend emits only on an actual state change. Live-verified under Xvfb
+against a real `dratchetd`: no badge in normal operation, the badge
+appears the moment the server is killed, the log shows the real 2s → 4s
+backoff from `RECONNECT_INITIAL_BACKOFF` doubling, and the badge clears
+the instant the reconnect succeeds after the server comes back. All
+three remediation options for scenario 23 are now shipped.
 
 ---
 

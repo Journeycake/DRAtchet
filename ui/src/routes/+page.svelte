@@ -51,7 +51,15 @@
   };
 
   const INBOX_UPDATED_EVENT = "dratchet://inbox-updated";
+  const CONNECTION_STATUS_EVENT = "dratchet://connection-status";
   const FULL_WIPE_CONFIRM_PHRASE = "DELETE";
+
+  // Live connection health (`docs/DELIVERY_FAILURE_FINDINGS.md` scenario
+  // 23): `poll_loop` now reconnects on its own after a transport failure,
+  // but silently — this is the only signal the user gets that it's
+  // happening, rather than wondering why messages stopped arriving.
+  type ConnectionStatusDto = "connected" | "reconnecting";
+  let connectionStatus = $state<ConnectionStatusDto>("connected");
 
   let contacts = $state<ContactDto[]>([]);
   let selected = $state<ContactDto | null>(null);
@@ -451,19 +459,32 @@
     }
   }
 
+  async function loadConnectionStatus() {
+    try {
+      connectionStatus = await invoke<ConnectionStatusDto>("get_connection_status");
+    } catch (e) {
+      void e;
+    }
+  }
+
   onMount(() => {
     refetch();
     loadOwnProfile();
     checkOwnDiscriminatorChangeNotice();
+    loadConnectionStatus();
     const unlisten = listen(INBOX_UPDATED_EVENT, () => {
       refetch();
       checkPeerProfileChangeNotices();
+    });
+    const unlistenConnection = listen<ConnectionStatusDto>(CONNECTION_STATUS_EVENT, (event) => {
+      connectionStatus = event.payload;
     });
     const tickInterval = setInterval(() => {
       nowTick = Date.now();
     }, 1000);
     return () => {
       unlisten.then((f) => f());
+      unlistenConnection.then((f) => f());
       clearInterval(tickInterval);
     };
   });
@@ -480,7 +501,14 @@
 <div class="shell">
   <aside class="sidebar">
     <div class="brand-row">
-      <div class="brand">DRAtchet</div>
+      <div class="brand-with-status">
+        <div class="brand">DRAtchet</div>
+        {#if connectionStatus === "reconnecting"}
+          <span class="connection-badge" title="The connection to the server dropped — retrying automatically.">
+            <span class="connection-dot"></span>Reconnecting…
+          </span>
+        {/if}
+      </div>
       <button class="settings-button" onclick={openSettings} aria-label="Settings">⚙</button>
     </div>
     <div class="search">Search conversations</div>
@@ -885,11 +913,54 @@
     padding-right: 8px;
   }
 
+  .brand-with-status {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+  }
+
   .brand {
     font-family: var(--display);
     font-weight: 600;
     color: var(--brass-strong);
     padding: 18px 16px;
+  }
+
+  .connection-badge {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 9px;
+    border: 1px solid var(--amber);
+    border-radius: 999px;
+    color: var(--amber);
+    font-size: 11px;
+    white-space: nowrap;
+  }
+
+  .connection-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--amber);
+    animation: connection-pulse 1.4s ease-in-out infinite;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .connection-dot {
+      animation: none;
+    }
+  }
+
+  @keyframes connection-pulse {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.35;
+    }
   }
 
   .settings-button {

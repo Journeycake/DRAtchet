@@ -33,6 +33,7 @@ use tokio::sync::Mutex;
 const SERVER_URL: &str = "ws://127.0.0.1:8787/v1/ws";
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const INBOX_UPDATED_EVENT: &str = "dratchet://inbox-updated";
+const CONNECTION_STATUS_EVENT: &str = "dratchet://connection-status";
 // `replenish_prekeys_if_low` (`ARCHITECTURE.md` §3.4) is cheap but there's no
 // reason to query/republish every 2-second tick — once a minute is plenty
 // given the batch-of-10/threshold-of-3 sizing, so it only runs on every Nth
@@ -71,6 +72,21 @@ struct AppState {
     // peer's `username#NNNN` genuinely changed; drained by the frontend
     // alongside every `INBOX_UPDATED_EVENT`.
     peer_profile_change_notices: StdMutex<Vec<PeerProfileChangeNoticeDto>>,
+    // Live connection health, updated by `poll_loop` as it detects a
+    // transport failure and later reconnects (`docs/DELIVERY_FAILURE_FINDINGS.md`
+    // scenario 23) — read once via `get_connection_status` and kept live
+    // after that via `CONNECTION_STATUS_EVENT`, so the UI has an honest
+    // signal instead of silence while a reconnect is in progress.
+    connection_status: StdMutex<ConnectionStatusDto>,
+}
+
+/// `poll_loop`'s live connection health, as the frontend sees it — see
+/// `AppState::connection_status`.
+#[derive(Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ConnectionStatusDto {
+    Connected,
+    Reconnecting,
 }
 
 /// A `Contact`, reshaped for the frontend: byte fields hex-encoded, a
@@ -313,6 +329,17 @@ fn decline_pending_wipe(state: State<AppState>, fingerprint: String) -> Result<(
     Ok(())
 }
 
+/// This device's current live connection health — called once on
+/// startup so the UI has an accurate value before the first
+/// `CONNECTION_STATUS_EVENT` (which only fires on a *change*).
+#[tauri::command]
+fn get_connection_status(state: State<AppState>) -> ConnectionStatusDto {
+    *state
+        .connection_status
+        .lock()
+        .expect("connection_status mutex poisoned")
+}
+
 /// This device's own registered profile, if self-registration
 /// (`register_own_profile`) has ever run — `None` gates the Settings
 /// "Choose a username" form vs. the normal profile display.
@@ -503,6 +530,27 @@ async fn connect_authenticate_and_reconcile(
     Ok((conn, notice))
 }
 
+/// Update `state.connection_status` and, only if it actually changed,
+/// emit `CONNECTION_STATUS_EVENT` — repeatedly re-setting `Reconnecting`
+/// on every backoff-gated retry attempt would be a harmless but noisy
+/// no-op for the frontend, so this stays quiet unless there's something
+/// new to say.
+fn set_connection_status(
+    app_handle: &AppHandle,
+    state: &AppState,
+    new_status: ConnectionStatusDto,
+) {
+    let mut status = state
+        .connection_status
+        .lock()
+        .expect("connection_status mutex poisoned");
+    if *status != new_status {
+        *status = new_status;
+        drop(status);
+        let _ = app_handle.emit(CONNECTION_STATUS_EVENT, new_status);
+    }
+}
+
 /// Whether `e` indicates the underlying transport actually failed (the
 /// WebSocket send/recv itself), as opposed to an application-level error
 /// (`NotAcknowledged`, a decode failure, etc.) that says nothing about
@@ -568,6 +616,7 @@ async fn poll_loop(app_handle: AppHandle) {
                     }
                     next_reconnect_attempt = None;
                     reconnect_backoff = RECONNECT_INITIAL_BACKOFF;
+                    set_connection_status(&app_handle, &state, ConnectionStatusDto::Connected);
                 }
                 Err(e) => {
                     eprintln!("poll: reconnect failed, retrying in {reconnect_backoff:?}: {e}");
@@ -659,6 +708,7 @@ async fn poll_loop(app_handle: AppHandle) {
         if connection_died {
             eprintln!("poll: connection lost, will attempt to reconnect next tick");
             next_reconnect_attempt = Some(std::time::Instant::now());
+            set_connection_status(&app_handle, &state, ConnectionStatusDto::Reconnecting);
         }
 
         if changed {
@@ -709,6 +759,10 @@ pub fn run() {
             conn,
             own_discriminator_change_notice: StdMutex::new(own_discriminator_change_notice),
             peer_profile_change_notices: StdMutex::new(Vec::new()),
+            // `run()` only reaches here after a successful connect+authenticate
+            // above (a failure panics), so `Connected` is the honest starting
+            // value — never `Reconnecting` before `poll_loop` has even run once.
+            connection_status: StdMutex::new(ConnectionStatusDto::Connected),
         })
         .invoke_handler(tauri::generate_handler![
             list_contacts,
@@ -726,7 +780,8 @@ pub fn run() {
             take_own_discriminator_change_notice,
             take_peer_profile_change_notices,
             quick_wipe,
-            full_wipe
+            full_wipe,
+            get_connection_status
         ])
         .setup(|app| {
             let app_handle = app.handle().clone();
