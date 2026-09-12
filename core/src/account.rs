@@ -48,7 +48,23 @@ impl Account {
 
     /// Generate and store `count` fresh one-time prekeys, returning their public
     /// halves as they'd be uploaded to a directory (`docs/MESSAGE_SCHEMA.md` §1).
+    ///
+    /// Replaces whatever batch was stored before, rather than adding to it: a
+    /// directory's `publish_bundle` (`server/src/ws.rs`) always overwrites the
+    /// previously-published one-time-prekey set wholesale, never merges, so any
+    /// still-unconsumed secret from an earlier batch becomes permanently
+    /// unreachable the moment a new batch is published — no future `FetchBundle`
+    /// will ever name its id again. Every real caller (`app::publish_under_candidates`,
+    /// covering both first registration and later republish/replenish) already
+    /// generates a batch immediately before publishing it, so there's no
+    /// legitimate case where an old, not-yet-superseded batch needs to survive
+    /// a call here. Without this, those orphaned secrets — and the disk space
+    /// for `Account::to_bytes`'s CBOR encoding of them — would accumulate
+    /// forever, since nothing else in `Account` ever prunes `one_time_prekeys`
+    /// except [`Self::take_one_time_prekey_secret`] consuming one that's
+    /// actually still reachable.
     pub fn generate_one_time_prekeys(&mut self, count: u32) -> Vec<OneTimePrekeyPublic> {
+        self.one_time_prekeys.clear();
         let mut out = Vec::with_capacity(count as usize);
         for _ in 0..count {
             let id = self.next_otp_id;
@@ -58,6 +74,19 @@ impl Account {
             self.one_time_prekeys.insert(id, otp);
         }
         out
+    }
+
+    /// How many locally-held one-time-prekey secrets are still in the
+    /// current batch — i.e. still reachable by some future `FetchBundle`
+    /// against whatever was last published. Test/introspection support for
+    /// the cleanup [`Self::generate_one_time_prekeys`] now does; not needed
+    /// by any real caller, which never has a reason to inspect its own
+    /// count directly (`FetchOwnPrekeyCount` asks the *directory's* count,
+    /// a different, server-side number that can be lower than this one
+    /// between publishing and the server actually recording it).
+    #[cfg(test)]
+    pub fn one_time_prekey_count(&self) -> usize {
+        self.one_time_prekeys.len()
     }
 
     /// Publish a prekey bundle as an initiator would fetch it. If `include_one_time_prekey`
@@ -303,5 +332,90 @@ mod tests {
             &init.message,
         );
         assert_eq!(bob_root_key, init.root_key);
+    }
+
+    /// The orphaned-prekey-secret gap this test guards against: a directory's
+    /// `publish_bundle` always replaces the previously-published one-time-prekey
+    /// batch wholesale (`server/src/ws.rs`), so once a second batch is published,
+    /// no `FetchBundle` will ever name an id from the first batch again — that
+    /// id is permanently unreachable. Before this fix, `generate_one_time_prekeys`
+    /// only ever inserted, so those now-unreachable secrets stayed in
+    /// `Account.one_time_prekeys` forever, growing by a full batch on every
+    /// republish/replenish cycle with nothing to ever remove them.
+    #[test]
+    fn republishing_drops_the_old_batchs_now_unreachable_secrets() {
+        let mut account = Account::generate().unwrap();
+
+        account.generate_one_time_prekeys(10);
+        assert_eq!(account.one_time_prekey_count(), 10);
+
+        // A real republish (`app::publish_under_candidates` always calls this
+        // immediately before publishing) generates a brand-new batch — the old
+        // one is no longer being published, so its secrets must not linger.
+        let second_batch = account.generate_one_time_prekeys(10);
+        assert_eq!(
+            account.one_time_prekey_count(),
+            10,
+            "a republish must replace the local batch, not accumulate on top of it"
+        );
+
+        // None of the *old* batch's ids (0..10) are consumable any more —
+        // they can never be named by a real handshake again.
+        for old_id in 0..10 {
+            assert!(
+                account.take_one_time_prekey_secret(old_id).is_none(),
+                "id {old_id} was dropped by the old batch and must not still be consumable"
+            );
+        }
+
+        // The *new* batch is fully intact and independently consumable —
+        // the fix must not have thrown away what it just generated.
+        for public in &second_batch {
+            assert!(
+                account.take_one_time_prekey_secret(public.id).is_some(),
+                "id {} is from the batch just published and must still be consumable",
+                public.id
+            );
+        }
+        assert_eq!(account.one_time_prekey_count(), 0);
+    }
+
+    /// Repeated replenish cycles (the real shape of
+    /// `dratchet_app::replenish_prekeys_if_low`, called roughly once a minute
+    /// whenever the published pool is running low) must never let local
+    /// storage grow past one batch, no matter how many cycles run.
+    #[test]
+    fn many_replenish_cycles_never_grow_storage_past_one_batch() {
+        let mut account = Account::generate().unwrap();
+        for _ in 0..25 {
+            account.generate_one_time_prekeys(10);
+        }
+        assert_eq!(
+            account.one_time_prekey_count(),
+            10,
+            "25 republish cycles must still leave exactly one batch's worth stored, \
+             not 250"
+        );
+    }
+
+    /// A secret consumed by a real, in-flight handshake response — the same
+    /// call `try_accept_first_contact`/`x3dh::respond` make while processing
+    /// a mailbox entry — must not be affected by a republish that happens to
+    /// land in between generating the batch and something consuming from it,
+    /// since both calls are made under the same `&mut Account` lock and never
+    /// interleave in practice; this pins that assumption down as a real test
+    /// rather than leaving it as only a doc-comment claim.
+    #[test]
+    fn a_consumed_secret_from_the_current_batch_is_gone_even_before_the_next_republish() {
+        let mut account = Account::generate().unwrap();
+        let batch = account.generate_one_time_prekeys(3);
+        let consumed_id = batch[0].id;
+
+        assert!(account.take_one_time_prekey_secret(consumed_id).is_some());
+        assert!(
+            account.take_one_time_prekey_secret(consumed_id).is_none(),
+            "single-use: consuming the same id twice must fail the second time"
+        );
+        assert_eq!(account.one_time_prekey_count(), 2);
     }
 }

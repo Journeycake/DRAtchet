@@ -191,6 +191,20 @@ proof-of-work for a rotation/republish of an already-owned identity, only
 for a brand-new registration, so periodic replenishment is free to call
 often.
 
+**Local cleanup on republish.** Because a directory's `publish_bundle`
+replaces the previously-published one-time-prekey batch wholesale rather
+than merging into it, every id from a superseded batch becomes permanently
+unreachable — no future `FetchBundle` will ever name it again. Early
+versions of `generate_one_time_prekeys` (`core/src/account.rs`) didn't
+account for this: it only ever inserted, so those now-unreachable secrets
+stayed in `Account.one_time_prekeys` forever, growing by a full batch on
+every replenish cycle with nothing to evict them — unlike the ratchet's
+skipped-message-key cache (below), which has an explicit bound. Fixed:
+`generate_one_time_prekeys` now clears the map before inserting the new
+batch, matching the directory's own replace-not-merge semantics; covered
+by `core/src/account.rs`'s `republishing_drops_the_old_batchs_now_unreachable_secrets`
+and `many_replenish_cycles_never_grow_storage_past_one_batch` tests.
+
 ### 3.5 Message wire format: why a minimal custom format, not a general-purpose one
 
 Both **key material** (identity keys, prekeys, §3.1/3.2) and **message
