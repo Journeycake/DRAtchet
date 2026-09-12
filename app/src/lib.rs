@@ -43,8 +43,9 @@ use dratchet_core::prekey::{OneTimePrekeyPublic, PrekeyBundle, SignedPrekeyPubli
 use dratchet_core::ratchet::{RatchetState, DEFAULT_MAX_SKIP};
 use dratchet_core::x3dh::{self, bootstrap_mailbox_id};
 use dratchet_server::protocol::{
-    Ack, BundleResult, ErrorFrame, FetchBundle, FetchedBundleWire, FrameTag, MailboxDelete,
-    MailboxEntries, MailboxFetch, MailboxWrite, OneTimePrekeyWire, PrekeyBundleWire, PublishBundle,
+    Ack, BundleResult, ErrorFrame, FetchBundle, FetchOwnPrekeyCount, FetchedBundleWire, FrameTag,
+    MailboxDelete, MailboxEntries, MailboxFetch, MailboxWrite, OneTimePrekeyWire, OwnPrekeyCount,
+    PrekeyBundleWire, PublishBundle,
 };
 use dratchet_store::{
     decrypt_gated, encrypt_gated, Contact, Db, Message, OwnProfile, PairingCode, VerificationState,
@@ -321,6 +322,57 @@ pub async fn reconcile_own_profile(
     } else {
         Ok(ProfileReconciliation::DiscriminatorChanged { old: existing, new })
     }
+}
+
+/// How many of this device's own one-time prekeys the directory still
+/// has unconsumed, per `FetchOwnPrekeyCount` (`ARCHITECTURE.md` §3.4).
+async fn own_prekey_count(conn: &mut Connection) -> Result<u32> {
+    conn.send(FrameTag::FetchOwnPrekeyCount, &FetchOwnPrekeyCount {})
+        .await?;
+    let (_, count): (_, OwnPrekeyCount) = conn.recv().await?;
+    Ok(count.remaining)
+}
+
+/// A fresh batch is this many prekeys (`publish_under_candidates`);
+/// replenish once the published pool has drained to this fraction of
+/// that, leaving a buffer before a `FetchBundle` ever actually finds it
+/// empty (which degrades that handshake's forward secrecy by one DH term
+/// rather than merely being a wasted round trip).
+const PREKEY_REPLENISH_THRESHOLD: u32 = 3;
+
+/// Call periodically (the Tauri poll loop does this on a slower cadence
+/// than its normal message poll — querying and, when due, republishing
+/// are both cheap, but there's no reason to do either every tick):
+/// checks this device's remaining one-time-prekey pool via
+/// [`own_prekey_count`] and, if it has drained to
+/// [`PREKEY_REPLENISH_THRESHOLD`] or below, republishes a fresh full
+/// batch under the exact username/discriminator already on record — the
+/// same mechanism [`reconcile_own_profile`] uses to reclaim after a
+/// restart, reused here to top up instead (and just as free of protocol
+/// cost: `server/src/ws.rs`'s `publish_bundle` never requires proof-of-
+/// work for a rotation/republish of an already-owned identity, only for
+/// a brand-new registration). A no-op if this device has never
+/// registered (`db.load_own_profile` returns `None`) or the pool isn't
+/// low yet. Returns whether it actually republished — nothing here is
+/// user-visible by itself, unlike `reconcile_own_profile`'s
+/// `DiscriminatorChanged`, so a caller only needs this for logging.
+pub async fn replenish_prekeys_if_low(
+    db: &Db,
+    conn: &mut Connection,
+    account: &mut Account,
+) -> Result<bool> {
+    let Some(existing) = db.load_own_profile()? else {
+        return Ok(false);
+    };
+    if own_prekey_count(conn).await? > PREKEY_REPLENISH_THRESHOLD {
+        return Ok(false);
+    }
+
+    let candidates = std::iter::once(existing.discriminator).chain(
+        std::iter::repeat_with(random_discriminator).take(DISCRIMINATOR_RETRY_ATTEMPTS as usize),
+    );
+    publish_under_candidates(db, conn, account, &existing.username, candidates).await?;
+    Ok(true)
 }
 
 /// Send this side's current `username#NNNN` (§6.1's `ProfileAnnounce`,

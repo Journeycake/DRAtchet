@@ -55,6 +55,8 @@ frame_tags! {
     0x0E => MailboxDelete,
     0x0F => Ack,
     0x10 => Error,
+    0x11 => FetchOwnPrekeyCount,
+    0x12 => OwnPrekeyCount,
 }
 
 /// Encode a typed frame body as `[tag][CBOR]`.
@@ -265,6 +267,23 @@ pub struct MailboxDelete {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Ack {
     pub ok: bool,
+}
+
+/// Ask how many of *this connection's own* one-time prekeys the directory
+/// still has unconsumed — `ARCHITECTURE.md` §3.4's replenishment gap: an
+/// account that only ever registers once slowly degrades every
+/// subsequent handshake's forward secrecy as `FetchBundle` calls consume
+/// its batch, with nothing telling the client it happened. No fields:
+/// the target is always the caller's own authenticated identity (never
+/// another account's — that would turn "prekey pool size" into a new
+/// enumeration/timing oracle `ARCHITECTURE.md` §11.8 already works to
+/// close for the directory), so there's nothing to name.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FetchOwnPrekeyCount {}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OwnPrekeyCount {
+    pub remaining: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

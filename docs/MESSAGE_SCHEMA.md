@@ -402,3 +402,26 @@ conversation that already exists.
 
 **No delivery receipt**, the same fire-and-forget limitation as every
 other control message in this document.
+
+## 12. Own prekey count query (CBOR) — `ARCHITECTURE.md` §3.4
+
+Not a ratchet-envelope payload — a plain request/response pair over the
+authenticated connection, following the same shape as `MailboxFetch` (§7)
+rather than anything routed through a mailbox.
+
+`FetchOwnPrekeyCount` (client → server): no fields at all. The target is
+always the caller's own authenticated identity; there is deliberately no
+way to name a different one, so this can never become a new enumeration/
+timing oracle for another account's prekey pool size (`ARCHITECTURE.md`
+§11.8).
+
+`OwnPrekeyCount` (server → client), in reply:
+
+| Field | Type | Notes |
+|---|---|---|
+| `remaining` | uint32 | how many one-time prekeys the directory still has stored for the caller's currently-published bundle; `0` if the caller has never published one |
+
+Used by `dratchet_app::replenish_prekeys_if_low`: once `remaining` has
+drained to a small threshold, the client republishes a full fresh batch
+under its existing `username#NNNN` — an ordinary `PublishBundle` (§1),
+nothing new on the write side.

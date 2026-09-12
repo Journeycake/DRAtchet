@@ -169,6 +169,28 @@ keys are wrapped in `zeroize::Zeroizing`, and DH secrets (`StaticSecret`,
 both overwrite their storage on drop rather than leaving key material
 sitting in freed memory for a debugger or core dump to find.
 
+**Replenishment.** A published bundle's one-time prekeys (`PublishBundle`,
+`ONE_TIME_PREKEY_BATCH = 10`, `app/src/lib.rs`) are consumed one per
+`FetchBundle` and never replaced by the server on its own — a long-lived
+account that only ever registers once will eventually exhaust its pool,
+after which every subsequent X3DH handshake against it silently drops the
+one-time-prekey DH term, weakening that session's forward secrecy with
+nothing telling either side it happened. `FetchOwnPrekeyCount` (a small,
+authenticated, field-less query — deliberately carrying no target-identity
+parameter, so it can never become a new enumeration/timing oracle for
+*other* accounts' pool sizes, per §11.8) lets a client check its own
+remaining count; `dratchet_app::replenish_prekeys_if_low` polls it on a
+slow cadence (the Tauri client checks once a minute, §"Live networking" in
+`ui/src-tauri/src/lib.rs`) and, once the pool has drained to
+`PREKEY_REPLENISH_THRESHOLD = 3`, republishes a fresh full batch under the
+exact `username#NNNN` already on record — the same
+`publish_under_candidates` path `reconcile_own_profile` (§6.1) uses to
+reclaim a handle after a restart, reused here to top up instead. This
+costs nothing extra: `server/src/ws.rs`'s `publish_bundle` never requires
+proof-of-work for a rotation/republish of an already-owned identity, only
+for a brand-new registration, so periodic replenishment is free to call
+often.
+
 ### 3.5 Message wire format: why a minimal custom format, not a general-purpose one
 
 Both **key material** (identity keys, prekeys, §3.1/3.2) and **message
@@ -1223,7 +1245,7 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
    user's own devices, in §14), group chat (MLS/RFC 9420 — full roadmap,
    including why a coordinating server becomes mandatory and how recovery
    extends to N members, in §13), SimpleX-style two-hop private message
-   routing (§11.2), prekey bundle auto-replenishment, push notifications,
+   routing (§11.2), push notifications,
    optional managed/server-escrowed passphrase-protected recovery option
    (§7 option b, §4.3), post-quantum hardening — hybrid handshake now,
    extended to the ratchet itself once that ships (§11.4), a coercion-

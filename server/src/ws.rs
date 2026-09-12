@@ -394,11 +394,29 @@ async fn dispatch(
             Ok(())
         }
 
+        FrameTag::FetchOwnPrekeyCount => {
+            let fp = authenticated.ok_or(Error::AuthRequired)?;
+            let _req: FetchOwnPrekeyCount = decode_body(body)?;
+            let inner = state.inner.read().await;
+            let remaining = inner
+                .directory
+                .get(&fp)
+                .map(|stored| stored.one_time_prekeys.len() as u32)
+                .unwrap_or(0);
+            drop(inner);
+            let _ = tx.send(encode(
+                FrameTag::OwnPrekeyCount,
+                &OwnPrekeyCount { remaining },
+            ));
+            Ok(())
+        }
+
         // Server-to-client-only tags received from a client: not part of the protocol.
         FrameTag::AuthChallenge
         | FrameTag::BundleResult
         | FrameTag::PresenceUpdate
         | FrameTag::MailboxEntries
+        | FrameTag::OwnPrekeyCount
         | FrameTag::Ack
         | FrameTag::Error => Err(Error::MalformedFrame(
             "this frame type is server-to-client only",

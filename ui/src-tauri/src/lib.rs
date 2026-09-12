@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use dratchet_app::{open_account, ProfileReconciliation};
+use dratchet_app::{open_account, replenish_prekeys_if_low, ProfileReconciliation};
 use dratchet_client::net::Connection;
 use dratchet_core::account::Account;
 use dratchet_store::{Contact, Db, VerificationState};
@@ -33,6 +33,11 @@ use tokio::sync::Mutex;
 const SERVER_URL: &str = "ws://127.0.0.1:8787/v1/ws";
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const INBOX_UPDATED_EVENT: &str = "dratchet://inbox-updated";
+// `replenish_prekeys_if_low` (`ARCHITECTURE.md` §3.4) is cheap but there's no
+// reason to query/republish every 2-second tick — once a minute is plenty
+// given the batch-of-10/threshold-of-3 sizing, so it only runs on every Nth
+// poll tick.
+const PREKEY_REPLENISH_CHECK_EVERY_N_TICKS: u32 = 30;
 
 struct AppState {
     db: Db,
@@ -447,11 +452,16 @@ fn full_wipe(state: State<AppState>, app: AppHandle) -> Result<(), String> {
 /// address, or `Received::wipe_activity` — a wipe-policy announcement
 /// recorded or a wipe request auto-complied/set pending, §11.9a), emits
 /// one coarse `INBOX_UPDATED_EVENT` — no fine-grained payload; the
-/// frontend just refetches.
+/// frontend just refetches. Every `PREKEY_REPLENISH_CHECK_EVERY_N_TICKS`th
+/// tick it also checks `dratchet_app::replenish_prekeys_if_low` (§3.4) —
+/// silent either way, since a republished prekey batch isn't something the
+/// frontend needs to know about.
 async fn poll_loop(app_handle: AppHandle) {
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
+    let mut tick_count: u32 = 0;
     loop {
         ticker.tick().await;
+        tick_count = tick_count.wrapping_add(1);
         let state = app_handle.state::<AppState>();
 
         let mut changed = false;
@@ -464,6 +474,12 @@ async fn poll_loop(app_handle: AppHandle) {
                 Ok(new_contacts) if !new_contacts.is_empty() => changed = true,
                 Ok(_) => {}
                 Err(e) => eprintln!("poll: receive_first_contact_attempts failed: {e}"),
+            }
+
+            if tick_count.is_multiple_of(PREKEY_REPLENISH_CHECK_EVERY_N_TICKS) {
+                if let Err(e) = replenish_prekeys_if_low(&state.db, &mut conn, &mut account).await {
+                    eprintln!("poll: replenish_prekeys_if_low failed: {e}");
+                }
             }
         }
 

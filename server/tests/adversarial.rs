@@ -64,6 +64,12 @@ async fn mailbox_and_rendezvous_and_presence_subscribe_require_auth_first() {
         .await;
     let (tag, _err): (_, ErrorFrame) = client.recv().await;
     assert_eq!(tag, FrameTag::Error);
+
+    client
+        .send(FrameTag::FetchOwnPrekeyCount, &FetchOwnPrekeyCount {})
+        .await;
+    let (tag, _err): (_, ErrorFrame) = client.recv().await;
+    assert_eq!(tag, FrameTag::Error);
 }
 
 #[tokio::test]
