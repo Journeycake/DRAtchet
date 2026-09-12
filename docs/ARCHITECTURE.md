@@ -1217,14 +1217,20 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
    needs building next, rather than continuing to plan ahead of what
    exists. Bug fixes and hardening within what's already shipped
    (correctness fixes, test coverage, documentation) are not blocked by
-   this freeze — only new v2-roadmap work is.
+   this freeze — only new v2-roadmap work is. **Revisited once so far**:
+   new-message notifications, scoped to what a desktop-only app can
+   actually do (§11.10) — see that section for why this isn't the
+   mobile-style "push" the v2 list below still names, which remains a
+   genuine future item distinct from what shipped.
 3. **v2**: multi-device support (full roadmap, including the per-device
    identity model and how recovery profiles stay consistent across a
    user's own devices, in §14), group chat (MLS/RFC 9420 — full roadmap,
    including why a coordinating server becomes mandatory and how recovery
    extends to N members, in §13), SimpleX-style two-hop private message
-   routing (§11.2), prekey bundle auto-replenishment, push notifications,
-   optional managed/server-escrowed passphrase-protected recovery option
+   routing (§11.2), prekey bundle auto-replenishment, mobile-style push
+   notifications for a future mobile client (distinct from the desktop
+   notifications already shipped, §11.10), optional managed/server-escrowed
+   passphrase-protected recovery option
    (§7 option b, §4.3), post-quantum hardening — hybrid handshake now,
    extended to the ratchet itself once that ships (§11.4), a coercion-
    resistant duress trigger (decoy passphrase / gesture, §11.9), and the
@@ -1749,6 +1755,50 @@ conversation too, over a new pair of ratchet-encrypted protocol messages
 - **No delivery receipt**: the requester can't tell whether the peer
   complied, declined, or hasn't seen the request yet — the same fire-and-
   forget limitation every mailbox message already has.
+
+### 11.10 New-message notifications — **v1, desktop-scoped — implemented**
+
+§9's roadmap listed "push notifications" for v2 without specifying what
+that means for a desktop-only app with no mobile target
+(`ui/src-tauri/tauri.conf.json` configures no mobile platform). A real
+mobile-style push — waking the app from fully quit via a third-party
+push service (APNs/FCM) — doesn't apply here and would introduce exactly
+the kind of third-party metadata exposure (a push provider learning that
+*a* message arrived, and for whom) this project has otherwise avoided
+elsewhere. What shipped instead, deliberately narrower:
+
+- **Scope**: a native OS notification (`tauri-plugin-notification`) fires
+  from the existing background poll loop (`ui/src-tauri/src/lib.rs`)
+  when a contact's `receive_pending` call returns new messages, but only
+  while the app's window doesn't have focus. The app must already be
+  running — there is no tray/background-run mode, so quitting the app
+  stops notifications exactly as it already stops the poll loop itself.
+  Extending this to survive a fully-closed app is tracked as a distinct,
+  not-yet-decided follow-up (would need a system-tray/close-to-tray mode
+  first).
+- **Content is a user-chosen, three-level setting**
+  (`store::NotificationPreviewLevel`), not a fixed behavior — modeled on
+  a native Messages app's own "Show Previews" setting, minus the
+  lock-state-aware "when unlocked" tier (Tauri has no portable way to
+  observe OS lock state across Windows/macOS/Linux): `None` ("New
+  message", no sender or content — the default), `HandleOnly`
+  (`alice#4821 sent a message`), or `HandleAndMessage`
+  (`alice#4821: <content>`, or a count rather than concatenated content
+  for more than one new message from the same sender in one tick).
+  Defaulting to the least revealing tier, requiring an explicit opt-in
+  for more, matches this project's general posture of not surfacing
+  metadata by default (e.g. no read receipts by default, §4.6).
+  Deliberately a plain setting rather than a negotiated protocol —
+  it only governs what *this* device's own notification tray shows, so
+  there's nothing to announce to a peer.
+- **Persisted locally** (`Db::save_notification_preview_level`/
+  `load_notification_preview_level`), never transmitted.
+- **Real, not merely wired up**: verified against the actual notification
+  daemon path (D-Bus + a real `org.freedesktop.Notifications`
+  implementation on Linux) with two live app instances under Xvfb — all
+  three preview levels produced the correct real, visible OS notification
+  text while the receiving window was unfocused, and none fired while it
+  was focused.
 
 ## 12. Deployment models: pure peer-to-peer vs. server-based
 

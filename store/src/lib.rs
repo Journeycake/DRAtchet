@@ -12,6 +12,7 @@ mod contacts;
 mod db;
 mod gate;
 mod messages;
+mod notification_prefs;
 mod profile;
 mod routing;
 mod verification;
@@ -22,6 +23,7 @@ pub use db::Db;
 pub use error::{Error, Result};
 pub use gate::{decrypt_gated, encrypt_gated};
 pub use messages::Message;
+pub use notification_prefs::NotificationPreviewLevel;
 pub use profile::OwnProfile;
 pub use routing::compute_mailbox_id;
 pub use verification::{

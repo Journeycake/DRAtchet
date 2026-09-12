@@ -32,6 +32,11 @@
     expires_at: number;
   };
 
+  // §11.10: how much a new-message OS notification is allowed to reveal
+  // — matches dratchet_store::NotificationPreviewLevel's exact variant
+  // names, since Tauri passes it through as a plain serde string.
+  type NotificationPreviewLevel = "None" | "HandleOnly" | "HandleAndMessage";
+
   // §6.1: surfaced once at startup when `reconcile_own_profile` had to
   // fall back to a new discriminator because the directory forgot this
   // device owned its old one (a server restart) and someone else claimed
@@ -95,6 +100,25 @@
   let addBusy = $state(false);
   let addError = $state("");
   let addResult = $state("");
+
+  // §11.10: defaults to "None" (the most private option) until loaded
+  // from the backend, matching the store's own default.
+  let notificationPreviewLevel = $state<NotificationPreviewLevel>("None");
+  let notificationLevelBusy = $state(false);
+  let notificationLevelError = $state("");
+  const notificationLevelOptions: {
+    value: NotificationPreviewLevel;
+    label: string;
+    example: string;
+  }[] = [
+    { value: "None", label: "None", example: '"New message"' },
+    { value: "HandleOnly", label: "Name only", example: '"alice#4821 sent a message"' },
+    {
+      value: "HandleAndMessage",
+      label: "Name & message",
+      example: '"alice#4821: hey, you around?"',
+    },
+  ];
 
   // Transient, auto-dismissing notices — own-handle-changed and
   // peer-handle-changed both surface here (§6.1). Not persisted; a missed
@@ -271,6 +295,30 @@
     }
   }
 
+  async function loadNotificationPreviewLevel() {
+    try {
+      notificationPreviewLevel = await invoke<NotificationPreviewLevel>(
+        "get_notification_preview_level",
+      );
+    } catch (e) {
+      notificationLevelError = String(e);
+    }
+  }
+
+  async function setNotificationPreviewLevel(level: NotificationPreviewLevel) {
+    if (level === notificationPreviewLevel || notificationLevelBusy) return;
+    notificationLevelBusy = true;
+    notificationLevelError = "";
+    try {
+      await invoke("set_notification_preview_level", { level });
+      notificationPreviewLevel = level;
+    } catch (e) {
+      notificationLevelError = String(e);
+    } finally {
+      notificationLevelBusy = false;
+    }
+  }
+
   // §6.1: checked once at startup — `reconcile_own_profile` only runs
   // once, during connect, before the UI is up at all, so this just drains
   // whatever it left behind.
@@ -397,7 +445,9 @@
     pairingCodeError = "";
     addError = "";
     addResult = "";
+    notificationLevelError = "";
     loadOwnProfile();
+    loadNotificationPreviewLevel();
   }
 
   function closeSettings() {
@@ -760,6 +810,36 @@
         {/if}
         {#if addError}
           <div class="danger-error">{addError}</div>
+        {/if}
+      </div>
+
+      <div class="profile-section">
+        <div class="section-title">Notifications</div>
+        <p class="section-note">
+          How much a new-message notification shows on this device while
+          the window isn't focused. Defaults to the most private option.
+        </p>
+        <div class="notification-level-options">
+          {#each notificationLevelOptions as option (option.value)}
+            <label
+              class="notification-level-option"
+              class:active={notificationPreviewLevel === option.value}
+            >
+              <input
+                type="radio"
+                name="notification-preview-level"
+                value={option.value}
+                checked={notificationPreviewLevel === option.value}
+                disabled={notificationLevelBusy}
+                onchange={() => setNotificationPreviewLevel(option.value)}
+              />
+              <span class="notification-level-label">{option.label}</span>
+              <span class="notification-level-example">{option.example}</span>
+            </label>
+          {/each}
+        </div>
+        {#if notificationLevelError}
+          <div class="danger-error">{notificationLevelError}</div>
         {/if}
       </div>
 
@@ -1333,6 +1413,39 @@
     color: var(--ink);
     font: inherit;
     font-size: 13px;
+  }
+
+  .notification-level-options {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .notification-level-option {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 8px 10px;
+    background: var(--bg-sunken);
+    border: 1px solid var(--line-soft);
+    border-radius: 6px;
+    cursor: pointer;
+  }
+
+  .notification-level-option.active {
+    border-color: var(--brass-strong);
+  }
+
+  .notification-level-label {
+    color: var(--ink);
+    font-size: 13px;
+    flex-shrink: 0;
+  }
+
+  .notification-level-example {
+    color: var(--ink-faint);
+    font-size: 12px;
+    font-style: italic;
   }
 
   .profile-row {

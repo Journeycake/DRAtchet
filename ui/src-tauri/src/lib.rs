@@ -25,9 +25,10 @@ use std::time::Duration;
 use dratchet_app::{open_account, ProfileReconciliation};
 use dratchet_client::net::Connection;
 use dratchet_core::account::Account;
-use dratchet_store::{Contact, Db, VerificationState};
+use dratchet_store::{Contact, Db, NotificationPreviewLevel, VerificationState};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_notification::NotificationExt;
 use tokio::sync::Mutex;
 
 const SERVER_URL: &str = "ws://127.0.0.1:8787/v1/ws";
@@ -412,6 +413,31 @@ fn take_peer_profile_change_notices(state: State<AppState>) -> Vec<PeerProfileCh
     )
 }
 
+/// `docs/ARCHITECTURE.md` §11.10's notification preview setting — how
+/// much a new-message OS notification is allowed to reveal. Defaults to
+/// `NotificationPreviewLevel::None` (see that type's own doc) until the
+/// user opts into more.
+#[tauri::command]
+fn get_notification_preview_level(
+    state: State<AppState>,
+) -> Result<NotificationPreviewLevel, String> {
+    state
+        .db
+        .load_notification_preview_level()
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_notification_preview_level(
+    state: State<AppState>,
+    level: NotificationPreviewLevel,
+) -> Result<(), String> {
+    state
+        .db
+        .save_notification_preview_level(level)
+        .map_err(|e| e.to_string())
+}
+
 /// `docs/ARCHITECTURE.md` §11.9's **quick wipe** — the Settings "Danger
 /// Zone" action that crypto-shreds message history and cached ratchet/
 /// session state while leaving the account and contact list untouched.
@@ -437,6 +463,56 @@ fn full_wipe(state: State<AppState>, app: AppHandle) -> Result<(), String> {
     app.restart();
 }
 
+/// Fires one native OS notification for `contact_handle`'s newly arrived
+/// `messages`, worded according to `level` — `docs/ARCHITECTURE.md`
+/// §11.10. `poll_loop` only calls this while the app's window doesn't
+/// have focus and `messages` is non-empty. More than one new message
+/// from the same contact in a single poll tick is summarized as a count
+/// rather than concatenated or arbitrarily picking one to preview.
+fn notify_new_messages(
+    app_handle: &AppHandle,
+    contact_handle: &str,
+    messages: &[dratchet_store::Message],
+    level: NotificationPreviewLevel,
+) {
+    const MAX_PREVIEW_CHARS: usize = 120;
+
+    let body = match level {
+        NotificationPreviewLevel::None => "New message".to_string(),
+        NotificationPreviewLevel::HandleOnly => {
+            if messages.len() == 1 {
+                format!("{contact_handle} sent a message")
+            } else {
+                format!("{contact_handle} sent {} messages", messages.len())
+            }
+        }
+        NotificationPreviewLevel::HandleAndMessage => {
+            if let [only] = messages {
+                let content = String::from_utf8_lossy(&only.content);
+                let truncated = content.chars().count() > MAX_PREVIEW_CHARS;
+                let preview: String = content.chars().take(MAX_PREVIEW_CHARS).collect();
+                if truncated {
+                    format!("{contact_handle}: {preview}…")
+                } else {
+                    format!("{contact_handle}: {preview}")
+                }
+            } else {
+                format!("{contact_handle}: {} new messages", messages.len())
+            }
+        }
+    };
+
+    if let Err(e) = app_handle
+        .notification()
+        .builder()
+        .title("DRAtchet")
+        .body(body)
+        .show()
+    {
+        eprintln!("poll: failed to show a notification: {e}");
+    }
+}
+
 /// Background receive loop, spawned once in `.setup()`: every
 /// `POLL_INTERVAL`, scans for new §6.4 pairing-code-gated first-contact
 /// attempts (`dratchet_app::receive_first_contact_attempts`) and calls
@@ -453,6 +529,23 @@ async fn poll_loop(app_handle: AppHandle) {
     loop {
         ticker.tick().await;
         let state = app_handle.state::<AppState>();
+
+        // `docs/ARCHITECTURE.md` §11.10: only notify while the app is
+        // running but not the focused window — a deliberately narrower
+        // scope than a mobile-style "wake from fully quit" push (this is
+        // a desktop-only app with no background/tray mode yet), and
+        // never while the user is already looking at the app. `Ok(false)`
+        // on any lookup failure (window gone, platform quirk) — silently
+        // skipping a notification is the safe failure mode, not crashing
+        // the poll loop over it.
+        let window_focused = app_handle
+            .get_webview_window("main")
+            .and_then(|w| w.is_focused().ok())
+            .unwrap_or(false);
+        let preview_level = state
+            .db
+            .load_notification_preview_level()
+            .unwrap_or_default();
 
         let mut changed = false;
         {
@@ -489,6 +582,14 @@ async fn poll_loop(app_handle: AppHandle) {
                         || !outcome.profile_changes.is_empty()
                     {
                         changed = true;
+                    }
+                    if !outcome.messages.is_empty() && !window_focused {
+                        notify_new_messages(
+                            &app_handle,
+                            &to_contact_dto(&contact).handle,
+                            &outcome.messages,
+                            preview_level,
+                        );
                     }
                     if !outcome.profile_changes.is_empty() {
                         let mut notices = state
@@ -590,6 +691,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(AppState {
             db,
             db_path,
@@ -613,10 +715,22 @@ pub fn run() {
             add_contact,
             take_own_discriminator_change_notice,
             take_peer_profile_change_notices,
+            get_notification_preview_level,
+            set_notification_preview_level,
             quick_wipe,
             full_wipe
         ])
         .setup(|app| {
+            // Request OS notification permission once, up front, rather
+            // than lazily on the first new message — a permission prompt
+            // firing from inside the background poll loop the first time
+            // a message happens to arrive would be a confusing surprise.
+            // A denial just means `notify_new_messages`'s `.show()` calls
+            // silently no-op from then on; nothing here depends on the
+            // result.
+            if let Err(e) = app.notification().request_permission() {
+                eprintln!("startup: failed to request notification permission: {e}");
+            }
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(poll_loop(app_handle));
             Ok(())
