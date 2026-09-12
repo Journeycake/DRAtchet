@@ -920,6 +920,78 @@ mod tests {
         ));
     }
 
+    /// Delivery-failure scenario: within one real burst, the last-arriving
+    /// message is impossibly far ahead (exactly the case above) — but does
+    /// rejecting it leave the conversation usable for whichever *other*
+    /// messages in the same burst are actually within reach? The doc
+    /// comment on `decrypt_raw` promises the rejection is "transactional"
+    /// with no side effects; this pins that promise down as a behavioral
+    /// test, not just a doc claim — the practical answer to "did one
+    /// undeliverable message wedge the whole conversation."
+    #[test]
+    fn a_maxskipexceeded_rejection_does_not_wedge_the_conversation_for_reachable_messages() {
+        let conversation_id = [1u8; 16];
+        let root_key = [7u8; 32];
+        let responder_secret = StaticSecret::random_from_rng(OsRng);
+        let responder_public = PublicKey::from(&responder_secret);
+        let small_max_skip = MIN_MAX_SKIP;
+
+        let mut alice = RatchetState::init_as_initiator(
+            conversation_id,
+            root_key,
+            responder_public,
+            small_max_skip,
+        )
+        .unwrap();
+        let mut bob = RatchetState::init_as_responder(
+            conversation_id,
+            root_key,
+            responder_secret,
+            small_max_skip,
+        )
+        .unwrap();
+
+        // Wide enough that the last message stays unreachable even *after*
+        // Bob catches up to the reachable one below — a tighter burst (e.g.
+        // `small_max_skip + 10`) turned out, in an earlier version of this
+        // test, to let the "unreachable" message become reachable once
+        // Bob's position advanced close enough — a real, useful finding in
+        // its own right (reachability is relative to *current* position,
+        // not fixed at arrival time), but not the thing this test is
+        // proving, so the gap here is widened to keep the two effects
+        // separate.
+        let burst_size = small_max_skip * 4;
+        let envelopes: Vec<_> = (0..burst_size)
+            .map(|i| alice.encrypt(&chat(&format!("msg {i}"))).unwrap())
+            .collect();
+
+        // The far-ahead message is rejected, exactly as the sibling test
+        // above already proves.
+        assert!(matches!(
+            bob.decrypt_raw(&envelopes[(burst_size - 1) as usize]),
+            Err(Error::MaxSkipExceeded(_))
+        ));
+
+        // A message from earlier in the *same* burst, still within reach of
+        // Bob's (untouched) starting position, must still decrypt — the
+        // failed attempt above left no trace to interfere with it.
+        let reachable_index = (small_max_skip / 2) as usize;
+        let recovered = bob
+            .decrypt_raw(&envelopes[reachable_index])
+            .expect("an in-range message must decrypt fine after a prior rejection");
+        assert_eq!(read_chat(&recovered), format!("msg {reachable_index}"));
+
+        // The specific far-ahead message is still out of reach even from
+        // Bob's now-advanced position (burst_size - reachable_index still
+        // exceeds max_skip) — genuinely unrecoverable, not a bug, just the
+        // inherent limit: it never arrives again once nothing will ever
+        // bring the gap back within max_skip.
+        assert!(matches!(
+            bob.decrypt_raw(&envelopes[(burst_size - 1) as usize]),
+            Err(Error::MaxSkipExceeded(_))
+        ));
+    }
+
     #[test]
     fn max_skip_outside_the_configurable_range_is_rejected() {
         let conversation_id = [1u8; 16];
