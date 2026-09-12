@@ -38,6 +38,15 @@ dratchet-core = { path = "../../core" }
 dratchet-client = { path = "../../client" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 
+[dev-dependencies]
+# Real, no-mocks tests spawn an actual `dratchet_server::app()` — the
+# same pattern every other crate in the main workspace uses. `server` is
+# only ever a *transitive* dependency of this crate's real code (through
+# `dratchet-app`), so it has to be named directly here for tests to be
+# able to call `dratchet_server::app()` themselves.
+dratchet-server = { path = "../../server" }
+tempfile = "3"
+axum = { version = "0.7", features = ["ws"] }
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

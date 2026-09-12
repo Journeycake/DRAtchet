@@ -38,6 +38,13 @@ const INBOX_UPDATED_EVENT: &str = "dratchet://inbox-updated";
 // given the batch-of-10/threshold-of-3 sizing, so it only runs on every Nth
 // poll tick.
 const PREKEY_REPLENISH_CHECK_EVERY_N_TICKS: u32 = 30;
+// `poll_loop`'s reconnect backoff after a transport failure
+// (`docs/DELIVERY_FAILURE_FINDINGS.md` scenario 23): the first attempt is
+// prompt (next tick), and only repeated *reconnect* failures — not the
+// original disconnect — push the wait out further, capped so a genuinely
+// down server is retried every minute rather than abandoned.
+const RECONNECT_INITIAL_BACKOFF: Duration = POLL_INTERVAL;
+const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 struct AppState {
     db: Db,
@@ -442,6 +449,71 @@ fn full_wipe(state: State<AppState>, app: AppHandle) -> Result<(), String> {
     app.restart();
 }
 
+/// Connect, authenticate, and reconcile this device's own registration —
+/// the full sequence `run()` performs once at startup, factored out so
+/// `poll_loop`'s reconnect-on-failure path (`docs/DELIVERY_FAILURE_FINDINGS.md`
+/// scenario 23) can produce a connection exactly as complete as the
+/// original one, including reclaiming a squatted handle if the directory
+/// forgot this device owned it — the same server-restart scenario a
+/// dropped WebSocket often coincides with, so skipping reconciliation on
+/// reconnect would silently reopen the exact gap `reconcile_own_profile`
+/// exists to close. Returns the discriminator-change notice, if
+/// reconciliation produced one, so the caller can decide where to put it.
+///
+/// Takes `url` rather than reading `SERVER_URL` itself so tests can point
+/// it at a real ephemeral test server instead of the hardcoded default.
+async fn connect_authenticate_and_reconcile(
+    url: &str,
+    db: &Db,
+    account: &mut Account,
+) -> Result<(Connection, Option<OwnDiscriminatorChangeNoticeDto>), String> {
+    let mut conn = Connection::connect(url).await?;
+    conn.authenticate(account).await?;
+
+    let mut notice = None;
+    match dratchet_app::reconcile_own_profile(db, &mut conn, account).await {
+        Ok(ProfileReconciliation::DiscriminatorChanged { old, new }) => {
+            let old_handle = format!("{}#{:04}", old.username, old.discriminator);
+            let new_handle = format!("{}#{:04}", new.username, new.discriminator);
+            eprintln!(
+                "reclaiming {old_handle} failed (taken by someone else since the \
+                 directory last saw this device) — now {new_handle}"
+            );
+            if let Ok(contacts) = dratchet_app::list_contacts(db) {
+                for contact in contacts {
+                    if contact.verification_state != VerificationState::Verified {
+                        continue;
+                    }
+                    if let Err(e) =
+                        dratchet_app::announce_profile(db, &mut conn, account, &contact, &new).await
+                    {
+                        eprintln!("failed to announce new handle to a contact: {e}");
+                    }
+                }
+            }
+            notice = Some(OwnDiscriminatorChangeNoticeDto {
+                old_handle,
+                new_handle,
+            });
+        }
+        Ok(ProfileReconciliation::Unchanged(_) | ProfileReconciliation::Unregistered) => {}
+        Err(e) => eprintln!("reconcile_own_profile failed: {e}"),
+    }
+
+    Ok((conn, notice))
+}
+
+/// Whether `e` indicates the underlying transport actually failed (the
+/// WebSocket send/recv itself), as opposed to an application-level error
+/// (`NotAcknowledged`, a decode failure, etc.) that says nothing about
+/// whether the connection is still usable. Only the former should trigger
+/// `poll_loop`'s reconnect path — retrying a healthy connection because a
+/// peer's malformed entry produced some other `Error` variant would be
+/// pointless and would blow away a connection that didn't need replacing.
+fn is_connection_error(e: &dratchet_app::Error) -> bool {
+    matches!(e, dratchet_app::Error::Connection(_))
+}
+
 /// Background receive loop, spawned once in `.setup()`: every
 /// `POLL_INTERVAL`, scans for new §6.4 pairing-code-gated first-contact
 /// attempts (`dratchet_app::receive_first_contact_attempts`) and calls
@@ -455,16 +527,59 @@ fn full_wipe(state: State<AppState>, app: AppHandle) -> Result<(), String> {
 /// frontend just refetches. Every `PREKEY_REPLENISH_CHECK_EVERY_N_TICKS`th
 /// tick it also checks `dratchet_app::replenish_prekeys_if_low` (§3.4) —
 /// silent either way, since a republished prekey batch isn't something the
-/// frontend needs to know about.
+/// frontend needs to know about. On a transport-layer error from any of
+/// the above, reconnects (`connect_authenticate_and_reconcile`) on a
+/// backoff-gated retry rather than silently and permanently going dark —
+/// see `docs/DELIVERY_FAILURE_FINDINGS.md` scenario 23 for the failure
+/// mode this closes.
 async fn poll_loop(app_handle: AppHandle) {
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
     let mut tick_count: u32 = 0;
+    // Set the moment a tick's work hits a transport-layer error
+    // (`is_connection_error`); cleared the moment a reconnect succeeds.
+    // While set, ordinary tick work is skipped in favor of a
+    // backoff-gated reconnect attempt — every command shares `state.conn`
+    // behind the same `Mutex`, so healing it here heals it for the whole
+    // app, not just this loop (`docs/DELIVERY_FAILURE_FINDINGS.md`
+    // scenario 23).
+    let mut reconnect_backoff = RECONNECT_INITIAL_BACKOFF;
+    let mut next_reconnect_attempt: Option<std::time::Instant> = None;
+
     loop {
         ticker.tick().await;
         tick_count = tick_count.wrapping_add(1);
         let state = app_handle.state::<AppState>();
 
+        if let Some(due) = next_reconnect_attempt {
+            if std::time::Instant::now() < due {
+                continue;
+            }
+            let mut account = state.account.lock().await;
+            match connect_authenticate_and_reconcile(SERVER_URL, &state.db, &mut account).await {
+                Ok((new_conn, notice)) => {
+                    eprintln!("poll: reconnected to {SERVER_URL}");
+                    *state.conn.lock().await = new_conn;
+                    if let Some(notice) = notice {
+                        *state
+                            .own_discriminator_change_notice
+                            .lock()
+                            .expect("own_discriminator_change_notice mutex poisoned") =
+                            Some(notice);
+                    }
+                    next_reconnect_attempt = None;
+                    reconnect_backoff = RECONNECT_INITIAL_BACKOFF;
+                }
+                Err(e) => {
+                    eprintln!("poll: reconnect failed, retrying in {reconnect_backoff:?}: {e}");
+                    next_reconnect_attempt = Some(std::time::Instant::now() + reconnect_backoff);
+                    reconnect_backoff = (reconnect_backoff * 2).min(RECONNECT_MAX_BACKOFF);
+                    continue;
+                }
+            }
+        }
+
         let mut changed = false;
+        let mut connection_died = false;
         {
             let mut conn = state.conn.lock().await;
             let mut account = state.account.lock().await;
@@ -473,60 +588,77 @@ async fn poll_loop(app_handle: AppHandle) {
             {
                 Ok(new_contacts) if !new_contacts.is_empty() => changed = true,
                 Ok(_) => {}
-                Err(e) => eprintln!("poll: receive_first_contact_attempts failed: {e}"),
+                Err(e) => {
+                    connection_died = is_connection_error(&e);
+                    eprintln!("poll: receive_first_contact_attempts failed: {e}");
+                }
             }
 
-            if tick_count.is_multiple_of(PREKEY_REPLENISH_CHECK_EVERY_N_TICKS) {
+            if !connection_died && tick_count.is_multiple_of(PREKEY_REPLENISH_CHECK_EVERY_N_TICKS) {
                 if let Err(e) = replenish_prekeys_if_low(&state.db, &mut conn, &mut account).await {
+                    connection_died = is_connection_error(&e);
                     eprintln!("poll: replenish_prekeys_if_low failed: {e}");
                 }
             }
         }
 
-        let contacts = match dratchet_app::list_contacts(&state.db) {
-            Ok(contacts) => contacts,
-            Err(e) => {
-                eprintln!("poll: list_contacts failed: {e}");
-                continue;
-            }
-        };
-
-        for contact in contacts {
-            let mailbox_before = contact.mailbox_id.clone();
-            let received = {
-                let mut conn = state.conn.lock().await;
-                let account = state.account.lock().await;
-                dratchet_app::receive_pending(&state.db, &mut conn, &account, &contact).await
+        if !connection_died {
+            let contacts = match dratchet_app::list_contacts(&state.db) {
+                Ok(contacts) => contacts,
+                Err(e) => {
+                    eprintln!("poll: list_contacts failed: {e}");
+                    continue;
+                }
             };
-            match received {
-                Ok(outcome) => {
-                    if !outcome.messages.is_empty()
-                        || outcome.wipe_activity
-                        || !outcome.profile_changes.is_empty()
-                    {
+
+            for contact in contacts {
+                if connection_died {
+                    break;
+                }
+                let mailbox_before = contact.mailbox_id.clone();
+                let received = {
+                    let mut conn = state.conn.lock().await;
+                    let account = state.account.lock().await;
+                    dratchet_app::receive_pending(&state.db, &mut conn, &account, &contact).await
+                };
+                match received {
+                    Ok(outcome) => {
+                        if !outcome.messages.is_empty()
+                            || outcome.wipe_activity
+                            || !outcome.profile_changes.is_empty()
+                        {
+                            changed = true;
+                        }
+                        if !outcome.profile_changes.is_empty() {
+                            let mut notices = state
+                                .peer_profile_change_notices
+                                .lock()
+                                .expect("peer_profile_change_notices mutex poisoned");
+                            notices.extend(outcome.profile_changes.into_iter().map(|n| {
+                                PeerProfileChangeNoticeDto {
+                                    fingerprint: hex::encode(&n.fingerprint),
+                                    old_handle: n.old_handle,
+                                    new_handle: n.new_handle,
+                                }
+                            }));
+                        }
+                    }
+                    Err(e) => {
+                        connection_died = is_connection_error(&e);
+                        eprintln!("poll: receive_pending failed for a contact: {e}");
+                    }
+                }
+                if let Ok(Some(updated)) = state.db.load_contact(&contact.fingerprint) {
+                    if updated.mailbox_id != mailbox_before {
                         changed = true;
                     }
-                    if !outcome.profile_changes.is_empty() {
-                        let mut notices = state
-                            .peer_profile_change_notices
-                            .lock()
-                            .expect("peer_profile_change_notices mutex poisoned");
-                        notices.extend(outcome.profile_changes.into_iter().map(|n| {
-                            PeerProfileChangeNoticeDto {
-                                fingerprint: hex::encode(&n.fingerprint),
-                                old_handle: n.old_handle,
-                                new_handle: n.new_handle,
-                            }
-                        }));
-                    }
-                }
-                Err(e) => eprintln!("poll: receive_pending failed for a contact: {e}"),
-            }
-            if let Ok(Some(updated)) = state.db.load_contact(&contact.fingerprint) {
-                if updated.mailbox_id != mailbox_before {
-                    changed = true;
                 }
             }
+        }
+
+        if connection_died {
+            eprintln!("poll: connection lost, will attempt to reconnect next tick");
+            next_reconnect_attempt = Some(std::time::Instant::now());
         }
 
         if changed {
@@ -555,52 +687,16 @@ pub fn run() {
     // considered ready — fails loudly if dratchetd isn't reachable,
     // matching the existing db/account `.expect(...)` posture. A real
     // server-address setting/retry UI is future work. Also reconciles
-    // this device's own registration (`dratchet_app::reconcile_own_profile`)
-    // and, if the directory forgot it owned its discriminator, broadcasts
-    // the new one to every already-Verified contact right away — closing
-    // the window between "this device reconnects" and "someone notices
-    // their handle changed" as tightly as possible.
-    let (conn, own_discriminator_change_notice) = tauri::async_runtime::block_on(async {
-        let mut conn = Connection::connect(SERVER_URL)
-            .await
-            .unwrap_or_else(|e| panic!("connect to {SERVER_URL} (is dratchetd running?): {e}"));
-        conn.authenticate(&account)
-            .await
-            .expect("authenticate with dratchetd");
-
-        let mut notice = None;
-        match dratchet_app::reconcile_own_profile(&db, &mut conn, &mut account).await {
-            Ok(ProfileReconciliation::DiscriminatorChanged { old, new }) => {
-                let old_handle = format!("{}#{:04}", old.username, old.discriminator);
-                let new_handle = format!("{}#{:04}", new.username, new.discriminator);
-                eprintln!(
-                    "startup: reclaiming {old_handle} failed (taken by someone else since \
-                         the directory last saw this device) — now {new_handle}"
-                );
-                if let Ok(contacts) = dratchet_app::list_contacts(&db) {
-                    for contact in contacts {
-                        if contact.verification_state != VerificationState::Verified {
-                            continue;
-                        }
-                        if let Err(e) =
-                            dratchet_app::announce_profile(&db, &mut conn, &account, &contact, &new)
-                                .await
-                        {
-                            eprintln!("startup: failed to announce new handle to a contact: {e}");
-                        }
-                    }
-                }
-                notice = Some(OwnDiscriminatorChangeNoticeDto {
-                    old_handle,
-                    new_handle,
-                });
-            }
-            Ok(ProfileReconciliation::Unchanged(_) | ProfileReconciliation::Unregistered) => {}
-            Err(e) => eprintln!("startup: reconcile_own_profile failed: {e}"),
-        }
-
-        (conn, notice)
-    });
+    // this device's own registration and, if the directory forgot it
+    // owned its discriminator, broadcasts the new one to every
+    // already-Verified contact right away — see
+    // `connect_authenticate_and_reconcile`'s doc, also reused by
+    // `poll_loop`'s reconnect-after-failure path so a re-established
+    // connection is never any less complete than this first one.
+    let (conn, own_discriminator_change_notice) = tauri::async_runtime::block_on(
+        connect_authenticate_and_reconcile(SERVER_URL, &db, &mut account),
+    )
+    .unwrap_or_else(|e| panic!("connect to {SERVER_URL} (is dratchetd running?): {e}"));
     let conn = Arc::new(Mutex::new(conn));
     let account = Arc::new(Mutex::new(account));
 
@@ -639,4 +735,120 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// Real, no-mocks coverage for the two testable units behind `poll_loop`'s
+/// reconnect logic (`docs/DELIVERY_FAILURE_FINDINGS.md` scenario 23):
+/// `is_connection_error`'s classification, and
+/// `connect_authenticate_and_reconcile` actually producing a live,
+/// usable connection against a real spawned `dratchet_server::app()` (the
+/// same helper both `run()`'s startup and `poll_loop`'s reconnect path
+/// call). `poll_loop`'s own backoff *timing* state machine isn't covered
+/// here — it needs a real `tauri::AppHandle`, which isn't practical to
+/// construct in a plain unit test — but the two pieces that actually
+/// determine correctness (does a dead connection get correctly
+/// recognized, does a fresh one actually work) are.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    async fn spawn_server() -> String {
+        let (router, _state) = dratchet_server::app();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        format!("ws://{addr}/v1/ws")
+    }
+
+    fn temp_db() -> Db {
+        let dir = tempfile::tempdir().unwrap().keep();
+        Db::create(dir.join("test.redb"), "pw").unwrap()
+    }
+
+    #[test]
+    fn is_connection_error_matches_only_the_transport_variant() {
+        assert!(is_connection_error(&dratchet_app::Error::Connection(
+            "socket closed".into()
+        )));
+        assert!(!is_connection_error(&dratchet_app::Error::NotAcknowledged));
+        assert!(!is_connection_error(&dratchet_app::Error::NoSession));
+        assert!(!is_connection_error(&dratchet_app::Error::UsernameTaken));
+    }
+
+    /// The actual risk surface: does the helper `run()` and `poll_loop`
+    /// both depend on really produce a working connection? Connects
+    /// against a real server, confirms the returned `Connection` can
+    /// genuinely be used afterward (a real `FetchOwnPrekeyCount`
+    /// round-trip), and confirms reconciliation is a no-op for an
+    /// account that's never published anything — matching what a normal,
+    /// healthy reconnect looks like.
+    #[tokio::test]
+    async fn connect_authenticate_and_reconcile_produces_a_live_usable_connection() {
+        let url = spawn_server().await;
+        let db = temp_db();
+        let mut account = open_account(&db).unwrap();
+
+        let (mut conn, notice) = connect_authenticate_and_reconcile(&url, &db, &mut account)
+            .await
+            .expect("connect + authenticate + reconcile against a real, reachable server");
+        assert!(
+            notice.is_none(),
+            "an account that's never published anything reconciles as a no-op, \
+             so there's no discriminator-change notice to surface"
+        );
+
+        // The connection really is live, not just "didn't error" — a
+        // further real round-trip on it succeeds, exactly what
+        // `poll_loop`'s very next tick immediately does after reconnecting.
+        let count = dratchet_app::replenish_prekeys_if_low(&db, &mut conn, &mut account).await;
+        assert!(
+            count.is_ok(),
+            "the connection this helper hands back must still be usable for a real \
+             follow-up call"
+        );
+    }
+
+    /// The failure path `poll_loop`'s backoff depends on: connecting to
+    /// nothing reachable must return a real `Err`, not hang or panic.
+    #[tokio::test]
+    async fn connect_authenticate_and_reconcile_fails_cleanly_against_an_unreachable_server() {
+        let db = temp_db();
+        let mut account = open_account(&db).unwrap();
+        let result =
+            connect_authenticate_and_reconcile("ws://127.0.0.1:1/v1/ws", &db, &mut account).await;
+        assert!(
+            result.is_err(),
+            "an unreachable address must fail fast with an Err, which is what \
+             poll_loop's backoff branch is built to receive and act on"
+        );
+    }
+
+    /// Proof that a fresh connection from this helper really does replace
+    /// a dead one end to end: authenticate once, drop that connection
+    /// (simulating the transport dying), call the helper again, and
+    /// confirm the *new* connection still works for a real round-trip —
+    /// the exact sequence `poll_loop` performs when `connection_died` is
+    /// set and its backoff timer fires.
+    #[tokio::test]
+    async fn a_second_call_produces_a_working_replacement_connection() {
+        let url = spawn_server().await;
+        let db = temp_db();
+        let mut account = open_account(&db).unwrap();
+
+        let (first_conn, _) = connect_authenticate_and_reconcile(&url, &db, &mut account)
+            .await
+            .unwrap();
+        drop(first_conn); // simulates the transport dying
+
+        let (mut second_conn, _) = connect_authenticate_and_reconcile(&url, &db, &mut account)
+            .await
+            .expect("reconnecting after the first connection is gone must still succeed");
+        let ok = dratchet_app::replenish_prekeys_if_low(&db, &mut second_conn, &mut account)
+            .await
+            .is_ok();
+        assert!(ok, "the replacement connection is genuinely usable");
+    }
 }

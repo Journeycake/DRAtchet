@@ -12,9 +12,10 @@ system. Every scenario below is either:
 
 Three genuine, previously-undocumented findings came out of this pass
 (#12, #14, #23 below) — two turned out more benign than the code
-structure first suggested (#12, #14), one is a real, currently-unaddressed
-gap worth fixing (#23). Everything else confirms existing behavior, good
-or bad, precisely.
+structure first suggested (#12, #14); the third (#23) was a real gap and
+has since been fixed and tested (`ui/src-tauri/src/lib.rs`'s `poll_loop`
+now reconnects with backoff instead of silently dying forever). Everything
+else confirms existing behavior, good or bad, precisely.
 
 Companion test files: `server/tests/delivery_failures.rs` (mailbox
 layer), `core/src/ratchet.rs`'s `tests` module (ratchet layer, new cases
@@ -47,7 +48,7 @@ added alongside the many that already existed), `app/tests/delivery_failures.rs`
 | 20 | Alice's contact is Verified regardless of Bob's code check | Tested (new) | Confirmed asymmetry (by design) |
 | 21 | Network error surfaces immediately, no partial commit | Tested | Safe |
 | 22 | Retry from unsaved ratchet state reuses chain position | Tested (new) | Real crypto-hygiene finding, practically masked |
-| 23 | `poll_loop` never reconnects after a connection failure | Analyzed | **Confirmed gap — high severity** |
+| 23 | `poll_loop` never reconnects after a connection failure | Analyzed, then fixed + tested | **Fixed** — was a confirmed high-severity gap |
 | 24 | Pairing-code / mailbox TTL clock-skew exposure | Analyzed | Not a gap — corrected initial suspicion |
 | 25 | Rapid replenish cycles and the signed prekey | Tested + analyzed | Safe |
 
@@ -273,41 +274,51 @@ construction (each call reloads from `Db`) — so this is really just a
 note that the *safety* here is emergent, not to be relied on if the
 persistence strategy ever changes.
 
-### 23. `poll_loop` never reconnects after a connection failure
-**Analyzed**: `ui/src-tauri/src/lib.rs`. `Connection::connect` is called
-exactly once, synchronously, in `run()` before `poll_loop` is spawned
-(line ~564). `poll_loop` (line 459 on) holds that same `Connection`
-behind `state.conn: Arc<Mutex<Connection>>` for its entire lifetime.
-Every error path in the loop (`receive_first_contact_attempts`,
-`replenish_prekeys_if_low`, `receive_pending`, per contact) does nothing
-but `eprintln!` and move on to the next contact/tick — there is no
-`Connection::connect` call anywhere inside `poll_loop`, and nothing
-else in the file re-establishes the connection either.
+### 23. `poll_loop` never reconnects after a connection failure — **fixed**
+**Originally analyzed, now fixed and tested.** `ui/src-tauri/src/lib.rs`:
+`Connection::connect` used to be called exactly once, synchronously, in
+`run()` before `poll_loop` was spawned, and every error path in the loop
+(`receive_first_contact_attempts`, `replenish_prekeys_if_low`,
+`receive_pending` per contact) did nothing but `eprintln!` and move on —
+reusing the same dead `Connection` behind `state.conn: Arc<Mutex<Connection>>`
+forever.
 
-**This is the one real, unambiguous, high-severity gap this pass found.**
-Any transient disconnect — laptop sleep/wake, a wifi network switch, a
-server restart, a brief network blip — leaves every subsequent
-`conn.send`/`conn.recv` call failing against a permanently-dead socket.
-The app keeps running, keeps ticking every 2 seconds, keeps silently
-logging errors to a console the user never sees, and never sends or
-receives another message again until the user manually quits and
-restarts the app. This is a much more common real-world trigger than any
-of #1/#9/#19's TTL-driven scenarios — it doesn't need 14 days or a server
-crash, just a laptop lid closing.
+**This was the one real, unambiguous, high-severity gap this pass
+found.** Any transient disconnect — laptop sleep/wake, a wifi network
+switch, a server restart, a brief network blip — left every subsequent
+`conn.send`/`conn.recv` call failing against a permanently-dead socket,
+silently, with no user-visible signal, until the app was manually
+restarted. A much more common real-world trigger than any of #1/#9/#19's
+TTL-driven scenarios — no 14 days or server crash needed, just a laptop
+lid closing.
 
-**Options**:
-1. Detect a `conn.send`/`conn.recv` `Err` in `poll_loop`, and on that
-   signal, drop the dead `Connection` and call `Connection::connect` +
-   `.authenticate()` again before continuing — the natural, minimal fix,
-   mirroring what `reconcile_own_profile` already does for a *different*
-   kind of "state went stale" recovery at startup.
-2. Add exponential backoff around the reconnect attempt itself (a
-   `Connection::connect` failure — server genuinely down — shouldn't
-   retry every 2 seconds forever).
-3. Surface a connection-state indicator in the UI (a small "reconnecting…"
-   badge) so a user isn't left wondering why messages stopped arriving —
-   currently there is no signal of any kind, even a healthy one, about
-   connection state.
+**Fix applied** (options 1 and 2 below; option 3 deliberately deferred):
+- `connect_authenticate_and_reconcile(url, db, account)` — the
+  connect+authenticate+reconcile sequence `run()`'s startup used to
+  perform inline is now a shared helper, reused by both startup and
+  `poll_loop`'s reconnect path, so a re-established connection is never
+  any less complete than the original one (crucially, it still reclaims
+  a squatted handle via `reconcile_own_profile` if the directory forgot
+  this device — the same server-restart scenario a dropped socket often
+  coincides with).
+- `poll_loop` now classifies each tick's errors with `is_connection_error`
+  (matching only `dratchet_app::Error::Connection`, never an
+  application-level error like `NotAcknowledged`) and, on a real
+  transport failure, skips the rest of that tick's work and schedules a
+  reconnect attempt for the next tick.
+- Reconnect attempts back off exponentially on repeated failure
+  (`RECONNECT_INITIAL_BACKOFF` = one poll tick, doubling up to
+  `RECONNECT_MAX_BACKOFF` = 60s) — the first attempt is prompt, but a
+  genuinely down server doesn't get hammered every 2 seconds forever.
+- Real tests (`ui/src-tauri/src/lib.rs`'s `tests` module, against a real
+  spawned `dratchet_server::app()`): the helper produces a live, usable
+  connection; it fails cleanly against an unreachable address; and,
+  directly proving the reconnect scenario end to end, a second call after
+  the first connection is dropped produces a working replacement.
+
+**Deferred**: a UI connection-state indicator (option 3) — the backend is
+now self-healing, but there's still no visible signal to the user while
+a reconnect is in progress. Tracked as follow-up work, not blocking.
 
 ---
 
