@@ -19,6 +19,7 @@
 //! rather than any DEK) rather than silently producing garbage.
 
 use std::path::Path;
+use std::sync::atomic::AtomicU64;
 use std::sync::RwLock;
 
 use argon2::password_hash::SaltString;
@@ -66,6 +67,11 @@ pub struct Db {
     identity_key: Zeroizing<[u8; 32]>,
     contacts_key: Zeroizing<[u8; 32]>,
     content_key: RwLock<Zeroizing<[u8; 32]>>,
+    // In-memory only, reset to 0 on every `create`/`open` — see
+    // `messages.rs`'s module doc for why that's fine: it only ever needs
+    // to break ties *within* the same `now_unix()` second, and a same-
+    // second collision spanning an app restart isn't a real scenario.
+    pub(crate) message_sequence: AtomicU64,
 }
 
 impl Db {
@@ -101,6 +107,7 @@ impl Db {
             identity_key,
             contacts_key,
             content_key: RwLock::new(content_key),
+            message_sequence: AtomicU64::new(0),
         })
     }
 
@@ -151,6 +158,7 @@ impl Db {
             identity_key,
             contacts_key,
             content_key: RwLock::new(content_key),
+            message_sequence: AtomicU64::new(0),
         })
     }
 
@@ -646,6 +654,7 @@ mod tests {
                 sender_is_local: true,
                 content: b"gone after a quick wipe".to_vec(),
                 timestamp: 100,
+                sequence: 0,
             },
         )
         .unwrap();
@@ -699,6 +708,7 @@ mod tests {
                 sender_is_local: true,
                 content: b"written after the wipe, under the new key".to_vec(),
                 timestamp: 200,
+                sequence: 0,
             },
         )
         .unwrap();

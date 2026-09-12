@@ -17,6 +17,12 @@ has since been fixed and tested (`ui/src-tauri/src/lib.rs`'s `poll_loop`
 now reconnects with backoff instead of silently dying forever). Everything
 else confirms existing behavior, good or bad, precisely.
 
+A fourth genuine gap (#26) turned up later, outside this 25-scenario
+pass — from the real two-client 100-message functionality test — and is
+documented in its own section below alongside the other findings, since
+it's the same class of "found a real bug, fixed it, tested the fix"
+result.
+
 Companion test files: `server/tests/delivery_failures.rs` (mailbox
 layer), `core/src/ratchet.rs`'s `tests` module (ratchet layer, new cases
 added alongside the many that already existed), `app/tests/delivery_failures.rs`
@@ -51,6 +57,7 @@ added alongside the many that already existed), `app/tests/delivery_failures.rs`
 | 23 | `poll_loop` never reconnects after a connection failure | Analyzed, then fixed + tested | **Fixed** — was a confirmed high-severity gap |
 | 24 | Pairing-code / mailbox TTL clock-skew exposure | Analyzed | Not a gap — corrected initial suspicion |
 | 25 | Rapid replenish cycles and the signed prekey | Tested + analyzed | Safe |
+| 26 | Same-second messages sort by random key order, not send order | Tested (new) | **Fixed** — was a confirmed gap |
 
 ---
 
@@ -365,3 +372,74 @@ reassigned by `generate_one_time_prekeys`/`publish_bundle`/anything in
 rotate on replenish, the signed prekey does not. No in-flight handshake
 can ever have its signed-prekey reference invalidated by a replenish
 race.
+
+## App / display layer (found by the 100-message functionality test)
+
+### 26. Same-second messages sort by random key order, not send order
+**Tested (new)**: found by `app/tests/full_conversation_100_messages.rs`,
+the real two-client 100-message functionality test requested outside
+this 25-scenario pass but documented here since it's the same class of
+finding. Not one of the original 25 — a genuinely new, previously-
+undiscovered gap.
+
+`store::messages::now_unix()` has 1-second resolution
+(`SystemTime::now().duration_since(UNIX_EPOCH).as_secs()`), and
+`Db::list_messages` sorted purely by that `timestamp`. Rust's
+`sort_by_key` is stable, so ties fell back to iteration order from
+`keys_with_prefix`, which walks redb's B-tree key order — keys are
+`message:{conv_id}:{message_id}` where `message_id` is 16 random bytes
+(`random_message_id()`). Any real burst of messages landing in the same
+wall-clock second (phase 1 of the 100-message test sends 25 in a tight
+loop) therefore came back in **effectively random order**, not the order
+they were actually sent — confirmed empirically: the failing test's
+panic output showed content like "alice burst 10", "bob reply 22", "bob
+reply 6", "alice turn 6" interleaved with no relation to send order.
+
+This is a real, user-visible bug: a chat history rendered straight from
+`list_messages` (exactly what `ui/src-tauri/src/lib.rs`'s `list_messages`
+command does — no re-sorting on the frontend) could show messages out of
+order whenever more than one landed in the same second, which ordinary
+fast typing or a burst of replies makes common, not rare.
+
+**Fix implemented and tested**: added `Db::message_sequence`, an
+in-memory `AtomicU64` (reset on every `create`/`open` — sufficient
+because it only needs to disambiguate messages saved within the same
+wall-clock second, which can only happen within one continuous process
+run) and a `sequence: u64` field on `Message`, assigned by
+`save_message_now` via `fetch_add`. `list_messages` now sorts by
+`(timestamp, sequence)`. Regression tests:
+`store/src/messages.rs::tests::messages_sharing_the_same_timestamp_still_sort_by_insertion_order`
+(5 messages, one shared timestamp, asserts insertion order is preserved)
+and `save_message_now_assigns_increasing_sequence_numbers` (asserts the
+real production call path assigns strictly increasing sequence numbers).
+Confirmed fixed end-to-end by re-running
+`app/tests/full_conversation_100_messages.rs` after the fix — passes,
+all 100 messages come back on both sides in the exact order they were
+sent.
+
+Checked whether the frontend needs a matching change: `ui/src-tauri/src/lib.rs`'s
+`MessageDto`/`to_message_dto` carry no ordering field, and
+`ui/src/routes/+page.svelte` never re-sorts the array `list_messages`
+returns — it renders it as-is. No frontend change needed; the backend
+fix alone corrects what the UI displays.
+
+**Options considered** (for completeness — the option actually taken is
+listed first):
+1. **(Taken) In-memory monotonic sequence counter, compound sort key.**
+   Minimal, no cross-restart persistence complexity, and no migration
+   concern since there are no deployed databases predating this fix.
+2. Switch `now_unix()` to millisecond or microsecond resolution. Narrows
+   the window but doesn't close it — two messages in the same
+   millisecond is still possible under real load (e.g. two devices on a
+   fast LAN, or `receive_pending` decrypting a stored batch faster than
+   the clock ticks), and doesn't fix already-affected historical data
+   any better than option 1. Rejected as a partial fix to the same
+   problem option 1 solves completely.
+3. Persist a per-conversation sequence counter across restarts (e.g. a
+   dedicated redb counter key, incremented transactionally with each
+   save). Strictly stronger (survives process restarts, not just
+   same-run bursts) but adds real complexity — a persisted counter needs
+   its own crash-consistency story — for a property that in practice
+   never matters across a restart (wall-clock time has moved on by then,
+   so `timestamp` alone already disambiguates). Rejected as
+   unnecessary complexity for no practical benefit over option 1.

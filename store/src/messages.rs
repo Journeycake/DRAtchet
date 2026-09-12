@@ -7,6 +7,7 @@
 //! §11.5's current text.)
 
 use std::fmt;
+use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -22,8 +23,21 @@ pub struct Message {
     pub sender_is_local: bool,
     #[serde(with = "serde_bytes")]
     pub content: Vec<u8>,
-    /// Unix seconds.
+    /// Unix seconds — coarse, and *not* on its own enough to order
+    /// messages for display (see `sequence`): plenty of real usage sends
+    /// several messages within the same second, and `list_messages`'
+    /// tie-break without a second key would otherwise fall back to
+    /// `keys_with_prefix`'s redb-key order, which is effectively random
+    /// (`id` is random, not sequential). Kept for display ("sent at
+    /// 2:30 PM") and as the primary sort key across longer gaps.
     pub timestamp: u64,
+    /// Tie-breaks `timestamp` with a real ordering guarantee —
+    /// `Db::message_sequence`, an in-memory counter incremented once per
+    /// `save_message_now` call. Resets to 0 on every `create`/`open`,
+    /// which is fine: it only ever needs to disambiguate messages saved
+    /// within the same wall-clock second, and that can only happen
+    /// within one continuous run.
+    pub sequence: u64,
 }
 
 /// Hand-written, not `#[derive(Debug)]`: `content` is plaintext message
@@ -39,6 +53,7 @@ impl fmt::Debug for Message {
                 &format!("<{} bytes redacted>", self.content.len()),
             )
             .field("timestamp", &self.timestamp)
+            .field("sequence", &self.sequence)
             .finish()
     }
 }
@@ -80,7 +95,11 @@ impl Db {
     }
 
     /// Build and store a new message — the convenience path a chat UI
-    /// actually sends through.
+    /// actually sends through. Assigns the next `message_sequence` value,
+    /// the real ordering guarantee `list_messages` sorts by (see
+    /// `Message::sequence`'s doc) — `save_message` (the lower-level
+    /// primitive) does not do this itself, so any caller building a
+    /// `Message` by hand is responsible for setting `sequence` sensibly.
     pub fn save_message_now(
         &self,
         conversation_id: [u8; 16],
@@ -92,6 +111,7 @@ impl Db {
             sender_is_local,
             content,
             timestamp: now_unix(),
+            sequence: self.message_sequence.fetch_add(1, Ordering::Relaxed),
         };
         self.save_message(conversation_id, &message)?;
         Ok(message)
@@ -110,7 +130,7 @@ impl Db {
                 .ok_or(Error::MalformedRecord("message key listed but not found"))?;
             messages.push(decode_message(&bytes)?);
         }
-        messages.sort_by_key(|m| m.timestamp);
+        messages.sort_by_key(|m| (m.timestamp, m.sequence));
         Ok(messages)
     }
 }
@@ -145,11 +165,16 @@ mod tests {
     }
 
     fn sample_message(timestamp: u64, content: &str) -> Message {
+        sample_message_with_sequence(timestamp, 0, content)
+    }
+
+    fn sample_message_with_sequence(timestamp: u64, sequence: u64, content: &str) -> Message {
         Message {
             id: random_id(),
             sender_is_local: true,
             content: content.as_bytes().to_vec(),
             timestamp,
+            sequence,
         }
     }
 
@@ -182,6 +207,70 @@ mod tests {
             .map(|m| String::from_utf8(m.content.clone()).unwrap())
             .collect();
         assert_eq!(contents, vec!["first", "second", "third"]);
+    }
+
+    /// Real, previously-undiscovered bug, found by a two-real-client
+    /// 100-message conversation test (`app/tests/full_conversation_100_messages.rs`):
+    /// `now_unix()` is only 1-second resolution, so any real burst of
+    /// messages (25 in a row, the way that test's phase 1 does) lands on
+    /// the *same* timestamp — and without a second sort key, `list_messages`
+    /// fell back to `keys_with_prefix`'s redb key order, keyed by a
+    /// *random* message id, which came back essentially shuffled, not
+    /// chronological. `Message::sequence` fixes it: same timestamp, still
+    /// sorts by insertion order.
+    #[test]
+    fn messages_sharing_the_same_timestamp_still_sort_by_insertion_order() {
+        let db = temp_db();
+        let conv = [1u8; 16];
+
+        // All 5 share one timestamp — exactly the real burst scenario.
+        for (i, text) in ["a", "b", "c", "d", "e"].iter().enumerate() {
+            db.save_message(conv, &sample_message_with_sequence(500, i as u64, text))
+                .unwrap();
+        }
+
+        let messages = db.list_messages(conv).unwrap();
+        let contents: Vec<String> = messages
+            .iter()
+            .map(|m| String::from_utf8(m.content.clone()).unwrap())
+            .collect();
+        assert_eq!(
+            contents,
+            vec!["a", "b", "c", "d", "e"],
+            "same-timestamp messages must still come back in the order they were \
+             actually saved, not redb's key order"
+        );
+    }
+
+    /// The real production path (`save_message_now`, not the lower-level
+    /// `save_message` the tests above use directly) assigns `sequence`
+    /// itself, from `Db::message_sequence` — proving the *real* call sites
+    /// this fix actually matters for, not just the primitive.
+    #[test]
+    fn save_message_now_assigns_increasing_sequence_numbers() {
+        let db = temp_db();
+        let conv = [1u8; 16];
+
+        let texts = ["alpha", "beta", "gamma", "delta"];
+        for text in texts {
+            db.save_message_now(conv, text.as_bytes().to_vec(), true)
+                .unwrap();
+        }
+
+        let messages = db.list_messages(conv).unwrap();
+        let contents: Vec<String> = messages
+            .iter()
+            .map(|m| String::from_utf8(m.content.clone()).unwrap())
+            .collect();
+        assert_eq!(
+            contents, texts,
+            "save_message_now's real, in-order calls must list back in that same order, \
+             whether or not they land in the same timestamp second"
+        );
+        // Strictly increasing, not just distinct.
+        for pair in messages.windows(2) {
+            assert!(pair[0].sequence < pair[1].sequence);
+        }
     }
 
     #[test]

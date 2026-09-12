@@ -206,6 +206,7 @@ mod tests {
             sender_is_local: true,
             content: b"hello".to_vec(),
             timestamp: 100,
+            sequence: 0,
         }
     }
 
