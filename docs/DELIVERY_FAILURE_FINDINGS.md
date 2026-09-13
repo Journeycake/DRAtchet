@@ -25,9 +25,11 @@ result.
 
 Two more (#27, #28) turned up while building and testing `DeliveryAck`
 (`ARCHITECTURE.md` §4.6): #27 is a real, high-severity, previously-latent
-gap in the mailbox model itself (fixed and tested); #28 is a real, open
-limitation in `DeliveryAck`'s own matching scheme, documented with
-remediation options rather than fixed outright — see its section for why.
+gap in the mailbox model itself; #28 is a real limitation in `DeliveryAck`'s
+own matching scheme. Both were fixed and tested — #28 was initially
+documented with remediation options rather than fixed outright, then
+closed in a follow-up pass (see its section for the fix and why it was
+worth doing).
 
 Companion test files: `server/tests/delivery_failures.rs` (mailbox
 layer), `core/src/ratchet.rs`'s `tests` module (ratchet layer, new cases
@@ -65,7 +67,7 @@ added alongside the many that already existed), `app/tests/delivery_failures.rs`
 | 25 | Rapid replenish cycles and the signed prekey | Tested + analyzed | Safe |
 | 26 | Same-second messages sort by random key order, not send order | Tested (new) | **Fixed** — was a confirmed gap |
 | 27 | A writer's own not-yet-collected mailbox entry is fetchable by the writer itself | Tested (new) | **Fixed** — was a confirmed high-severity gap |
-| 28 | `DeliveryAck.acked_n` collides across sending chains | Analyzed + tested | Confirmed, open limitation — options given, not fixed |
+| 28 | `DeliveryAck.acked_n` collides across sending chains | Analyzed + tested | **Fixed** — was a confirmed, open limitation |
 
 ---
 
@@ -533,65 +535,68 @@ connection.
    has the right information.
 
 ### 28. `DeliveryAck.acked_n` collides across sending chains
-**Analyzed + tested**: a real, open limitation in `DeliveryAck` itself
-(`core::payload::DeliveryAck`, `docs/MESSAGE_SCHEMA.md` §7), not something
-this pass fixed — see below for why fixing it outright wasn't the right
-call yet.
+**Analyzed + tested, then fixed**: a real, previously-open limitation in
+`DeliveryAck` itself (`core::payload::DeliveryAck`, `docs/MESSAGE_SCHEMA.md`
+§7), closed in a follow-up pass after being recorded here.
 
 `acked_n` is the ratchet header `n` of the message being acknowledged —
 but `n` only disambiguates messages *within one sending chain*. Every
 Double Ratchet DH step (which, per `docs/DELIVERY_FAILURE_FINDINGS.md`'s
 own module doc and `ARCHITECTURE.md` §3.3, happens on nearly every message
 in ordinary back-and-forth chat) resets the new chain's `n` back to 0. The
-wire schema carries no `dh_pub` alongside `acked_n` to say which chain
-produced it (matching the shape `ARCHITECTURE.md` §4.6/`MESSAGE_SCHEMA.md`
-§7 originally specified). A receiver of an ack can only match it back
+wire schema originally carried no `dh_pub` alongside `acked_n` to say
+which chain produced it, so a receiver of an ack could only match it back
 against its own sent messages by `acked_n`'s bare value.
 
-The implementation (`Db::mark_message_delivered`) resolves this by picking
-the **oldest undelivered** locally-sent message with a matching `send_n` —
-correct as long as a chain's messages get acked before the next chain's
-`n` values start repeating, which holds for the ordinary turn-taking
-`app/tests/delivery_ack.rs::acks_flow_correctly_in_both_directions` and
-the 100-round exchange below exercise, but is not a hard guarantee: two
+The original implementation (`Db::mark_message_delivered`) resolved this
+by picking the **oldest undelivered** locally-sent message with a
+matching `send_n` — correct as long as a chain's messages got acked
+before the next chain's `n` values started repeating, which held for the
+ordinary turn-taking `app/tests/delivery_ack.rs::acks_flow_correctly_in_both_directions`
+and the 100-round exchange exercise, but wasn't a hard guarantee: two
 messages sent in genuinely different, still-unacked-at-the-time chains
-that happen to share an `n` (e.g. both `n=0`, the single most common case
-since every fresh chain starts there) would be indistinguishable to the
-receiver of their acks, and the wrong one could be marked delivered.
-`store/src/messages.rs::mark_message_delivered_picks_the_oldest_matching_undelivered_message`
-proves the deliberate tie-break exists and behaves predictably, not that
-the underlying ambiguity is gone.
+that happened to share an `n` (e.g. both `n=0`, the single most common
+case since every fresh chain starts there) would have been
+indistinguishable to the receiver of their acks, with the wrong one
+possibly marked delivered.
 
-**Not fixed in this pass, deliberately**: closing this properly means
-changing the wire schema (see options below), which is a bigger, more
-disruptive change than this feature's scope warranted once the ambiguity
-was understood to be rare in practice (requires two *specific*,
-still-unacknowledged chains to coincidentally share an `n`, under
-real-world turn-taking where most chains are short) and non-catastrophic
-when it does occur (worst case: a message gets marked delivered based on
-a different message's ack, which only ever affects a delivered
-*indicator* and outbox pruning — never message content, ordering, or
-loss). Recorded here as an open, known limitation rather than silently
-assumed away, per this project's standing practice.
+**Fixed**: `DeliveryAck` now carries the acknowledged envelope's `dh_pub`
+alongside `acked_n` (`MESSAGE_SCHEMA.md` §7's updated schema) — the same
+`(dh_pub, n)` pair `RatchetState`'s own skipped-message-key cache already
+keys by (`core/src/ratchet.rs`'s `SkippedEntry`), a real,
+already-proven-unique identifier for one specific message.
+`Message::send_dh_pub` (`store/src/messages.rs`) records it alongside
+`send_n` at send time, and `Db::mark_message_delivered` now matches
+`(dh_pub, n)` exactly instead of picking the oldest same-`n` candidate —
+this was option 1 below, taken as originally described. New test:
+`store/src/messages.rs::mark_message_delivered_disambiguates_same_n_across_different_chains`
+constructs two locally-sent messages from different chains that both
+have `n = 0` and proves each incoming ack now flips the *correct* one,
+never the other — the exact ambiguity this finding originally described,
+now provably closed rather than merely narrowed. The existing turn-taking
+tests (`acks_flow_correctly_in_both_directions`, the 100-round exchange)
+continued passing unchanged after the field was added, confirming the fix
+is transparent to the ordinary, non-colliding case.
 
-**Options considered** (for a future pass, none taken yet):
-1. **Extend `DeliveryAck` with the acknowledged envelope's `dh_pub`.**
+**Options considered** (the option taken is listed first):
+1. **(Taken) Extend `DeliveryAck` with the acknowledged envelope's `dh_pub`.**
    Fully disambiguates — `(dh_pub, n)` together are exactly
-   `RatchetState`'s own skipped-message-key cache key
-   (`core/src/ratchet.rs`'s `SkippedEntry`), a real, already-proven-unique
-   identifier for one specific message. Requires a `MESSAGE_SCHEMA.md` §7
-   schema change (one more `bytes(32)` field) — a real but small wire
-   change, and backward-incompatible with any already-deployed client
-   (none exist yet, so no migration cost today).
+   `RatchetState`'s own skipped-message-key cache key, a real,
+   already-proven-unique identifier for one specific message. Required a
+   `MESSAGE_SCHEMA.md` §7 schema change (one more `bytes(32)` field) — a
+   real but small wire change, backward-incompatible with any
+   already-deployed client, but none exist yet, so no migration cost.
 2. **Track a locally-unique, monotonic per-conversation send counter**
    (distinct from the ratchet's own `n`) and echo *that* back in the ack
-   instead of the ratchet header's `n`. Fully disambiguates without
-   needing `dh_pub` at all, and reuses the same "in-memory monotonic
+   instead of the ratchet header's `n`. Would have fully disambiguated
+   without needing `dh_pub` at all, reusing the same "in-memory monotonic
    counter" pattern finding #26 already established for `Message::sequence`.
-   Slightly larger conceptual change: the ack would no longer literally be
-   acknowledging "ratchet position `n`" (the originally-specified
+   Rejected in favor of option 1: it would have made the ack no longer
+   literally acknowledge "ratchet position `n`" (the originally-specified
    semantic) but "the `k`-th message I ever sent in this conversation" — a
-   deliberate schema meaning change, not just an added field.
+   deliberate schema *meaning* change, not just an added field, for no
+   benefit over option 1 once option 1 was confirmed small enough to ship
+   directly.
 3. **Leave it as documented behavior, narrow the risk window instead.**
    E.g., have a sender refuse to start a new chain (hold outgoing sends)
    until all of the previous chain's messages are acked or a timeout

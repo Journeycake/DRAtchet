@@ -200,21 +200,26 @@ impl FirstContactContent {
 /// documented wire shape exactly, and gives a receiver an explicit sanity
 /// check rather than relying purely on which session decrypted it.
 ///
-/// `acked_n` is the just-decrypted envelope's ratchet header `n` (`docs/MESSAGE_SCHEMA.md`
-/// §2) — **scoped to the sending chain that produced it, not globally
-/// unique across a conversation's lifetime.** Every Double Ratchet DH step
-/// resets the new sending chain's `n` back to 0, and this schema (matching
-/// the wire format `ARCHITECTURE.md`/`MESSAGE_SCHEMA.md` actually
-/// document) carries no `dh_pub` alongside `acked_n` to disambiguate which
-/// chain it belongs to. A receiver of this ack can only match it back
-/// against its own locally-sent messages by `acked_n` value — see
-/// `dratchet_app`'s delivery-ack handling for the matching heuristic this
-/// implementation uses, and `docs/DELIVERY_FAILURE_FINDINGS.md` for why
-/// that's a real, documented limitation rather than an oversight.
+/// `acked_n` is the just-decrypted envelope's ratchet header `n`
+/// (`docs/MESSAGE_SCHEMA.md` §2) — scoped to the sending chain that
+/// produced it, not globally unique across a conversation's lifetime:
+/// every Double Ratchet DH step resets the new sending chain's `n` back
+/// to 0. `dh_pub` (that same envelope's ratchet header `dh_pub`) is
+/// carried alongside it for exactly this reason — together `(dh_pub, n)`
+/// is a genuinely unique identifier for one specific message, the same
+/// pair `RatchetState`'s own skipped-message-key cache already keys by
+/// (`core/src/ratchet.rs`'s `SkippedEntry`). This closes a real gap the
+/// first implementation shipped with — `acked_n` alone collided across
+/// chains that happened to share an `n` (every fresh chain starts at 0,
+/// so this was the common case, not a rare one) — see
+/// `docs/DELIVERY_FAILURE_FINDINGS.md` finding #28 for the original
+/// limitation and why this field closes it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeliveryAck {
     #[serde(with = "serde_bytes")]
     pub conversation_id: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub dh_pub: Vec<u8>,
     pub acked_n: u32,
 }
 
@@ -409,6 +414,7 @@ mod tests {
     fn delivery_ack_round_trips_through_encode_and_tag_and_pad() {
         let ack = DeliveryAck {
             conversation_id: vec![9u8; 16],
+            dh_pub: vec![7u8; 32],
             acked_n: 42,
         };
         let encoded = ack.encode();

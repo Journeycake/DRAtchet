@@ -656,6 +656,7 @@ mod tests {
                 timestamp: 100,
                 sequence: 0,
                 send_n: None,
+                send_dh_pub: None,
                 delivered: false,
             },
         )
@@ -712,6 +713,7 @@ mod tests {
                 timestamp: 200,
                 sequence: 0,
                 send_n: None,
+                send_dh_pub: None,
                 delivered: false,
             },
         )

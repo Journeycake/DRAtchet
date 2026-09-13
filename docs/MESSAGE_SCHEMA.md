@@ -248,14 +248,15 @@ as §6.
 | `MailboxDelete` (recipient → service, after successful decrypt) | `mailbox_id` | bytes (16) | |
 | | `entry_id` | bytes (16) | service-assigned on write, echoed back on fetch |
 | `DeliveryAck` (recipient → sender, routed like any other message) | `conversation_id` | bytes (16) | same derivation as §2 |
+| | `dh_pub` | bytes (32) | the acknowledged envelope's ratchet header `dh_pub` (§2) — which sending chain `acked_n` is a position within |
 | | `acked_n` | uint32 | the ratchet header's `n` (§2) being acknowledged |
 | `RoutingIdAnnounce` (either side → the other, routed like any other message) | `routing_id` | bytes (32) | this side's fresh, single-use routing id (`ARCHITECTURE.md` §11.1) — sent once, right after the session is established |
 
-`DeliveryAck`'s two fields (`conversation_id`, `acked_n`) are CBOR-encoded
-and become the *content* of a ratchet envelope's plaintext, tagged with
-`payload_type = 1` (§2) — it's carried as an ordinary ratchet message, not
-a separate wire format, and gets the same encryption, padding, and (for
-Tier 1) mailbox routing as a chat message. `RoutingIdAnnounce` is the same
+`DeliveryAck`'s fields (`conversation_id`, `dh_pub`, `acked_n`) are
+CBOR-encoded and become the *content* of a ratchet envelope's plaintext,
+tagged with `payload_type = 1` (§2) — it's carried as an ordinary ratchet
+message, not a separate wire format, and gets the same encryption,
+padding, and (for Tier 1) mailbox routing as a chat message. `RoutingIdAnnounce` is the same
 shape of thing, tagged `payload_type = 3` (§2) — sent over
 `bootstrap_mailbox_id` before either side has a routing-id-derived mailbox
 to use yet, and, like `DeliveryAck`, never gated by `ARCHITECTURE.md`
@@ -270,15 +271,15 @@ be able to read routing metadata to do its job (§4.1/§4.2 of
 
 **Implementation note (`core::payload::DeliveryAck`, `dratchet_app`):**
 `acked_n` alone only disambiguates messages *within one sending chain* —
-every Double Ratchet DH step resets a new chain's `n` back to 0, and this
-schema (matching the shape documented above) carries no `dh_pub` alongside
-it to say which chain produced it. A receiver matches an incoming ack back
-to its own sent messages by picking the oldest undelivered
-locally-sent message with that `n` (`Db::mark_message_delivered`) — correct
-for ordinary turn-taking, not a hard guarantee under sufficiently
-out-of-order ack arrival. See `docs/DELIVERY_FAILURE_FINDINGS.md` finding
-#28 for the analysis and remediation options (extending the schema with
-`dh_pub`, among them).
+every Double Ratchet DH step resets a new chain's `n` back to 0, and
+`n = 0` colliding across chains is the *common* case, not a rare one,
+since every fresh chain starts there. The original implementation shipped
+without `dh_pub` and matched acks by `n` alone (a real, documented gap —
+`docs/DELIVERY_FAILURE_FINDINGS.md` finding #28); `dh_pub` was added here
+specifically to close it — `(dh_pub, n)` together are a genuinely unique
+identifier for one message, the same pair `RatchetState`'s own
+skipped-message-key cache already keys by, so `Db::mark_message_delivered`
+now matches exactly rather than guessing.
 
 ## 8. Recovery profile negotiation (CBOR) — §7.2/§7.3/§7.5 of `ARCHITECTURE.md`
 

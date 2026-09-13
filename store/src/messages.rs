@@ -43,11 +43,24 @@ pub struct Message {
     /// position within whatever sending chain was active at the time.
     /// `None` for a received message (nothing sends *us* a `DeliveryAck`
     /// to attach an `n` to) and for any locally-sent message predating
-    /// this field. Used to match an incoming `DeliveryAck.acked_n`
-    /// (`dratchet_core::payload::DeliveryAck`) back to the message it
-    /// acknowledges — see `Db::mark_message_delivered`'s doc for the
-    /// matching heuristic and its known limitation.
+    /// this field. Paired with `send_dh_pub` to match an incoming
+    /// `DeliveryAck` (`dratchet_core::payload::DeliveryAck`) back to the
+    /// message it acknowledges — see `Db::mark_message_delivered`'s doc.
     pub send_n: Option<u32>,
+    /// Only meaningful when `sender_is_local` — the ratchet header
+    /// `dh_pub` (`docs/MESSAGE_SCHEMA.md` §2) this message was sent with,
+    /// i.e. which sending chain `send_n` is a position within. `None`
+    /// under the same conditions as `send_n`. `(send_dh_pub, send_n)`
+    /// together are a genuinely unique identifier for one specific
+    /// message — the same pair a `DeliveryAck` now carries
+    /// (`core::payload::DeliveryAck`'s doc) and the same pair
+    /// `RatchetState`'s own skipped-message-key cache already keys by.
+    /// Without this, `send_n` alone collides across sending chains, since
+    /// every Double Ratchet DH step resets a fresh chain's `n` back to 0
+    /// — the real gap `docs/DELIVERY_FAILURE_FINDINGS.md` finding #28
+    /// documents and this field closes.
+    #[serde(with = "serde_bytes")]
+    pub send_dh_pub: Option<Vec<u8>>,
     /// Only meaningful when `sender_is_local` — whether a `DeliveryAck`
     /// for this message has been received (`ARCHITECTURE.md` §4.6).
     /// Always `false` for a received message; not itself a signal of
@@ -71,6 +84,7 @@ impl fmt::Debug for Message {
             .field("timestamp", &self.timestamp)
             .field("sequence", &self.sequence)
             .field("send_n", &self.send_n)
+            .field("send_dh_pub", &self.send_dh_pub.as_deref().map(hex))
             .field("delivered", &self.delivered)
             .finish()
     }
@@ -119,15 +133,17 @@ impl Db {
     /// primitive) does not do this itself, so any caller building a
     /// `Message` by hand is responsible for setting `sequence` sensibly.
     ///
-    /// `send_n` is the ratchet header `n` this message was actually sent
-    /// with (`Some`, for a locally-sent chat message — see `Message::send_n`'s
-    /// doc) or `None` for a received message.
+    /// `send_n`/`send_dh_pub` are the ratchet header `n`/`dh_pub` this
+    /// message was actually sent with (`Some`, for a locally-sent chat
+    /// message — see `Message::send_n`/`send_dh_pub`'s docs) or `None`
+    /// for a received message.
     pub fn save_message_now(
         &self,
         conversation_id: [u8; 16],
         content: Vec<u8>,
         sender_is_local: bool,
         send_n: Option<u32>,
+        send_dh_pub: Option<Vec<u8>>,
     ) -> Result<Message> {
         let message = Message {
             id: random_message_id(),
@@ -136,6 +152,7 @@ impl Db {
             timestamp: now_unix(),
             sequence: self.message_sequence.fetch_add(1, Ordering::Relaxed),
             send_n,
+            send_dh_pub,
             delivered: false,
         };
         self.save_message(conversation_id, &message)?;
@@ -159,35 +176,35 @@ impl Db {
         Ok(messages)
     }
 
-    /// Handle an incoming `DeliveryAck.acked_n` (`dratchet_core::payload::DeliveryAck`,
+    /// Handle an incoming `DeliveryAck` (`dratchet_core::payload::DeliveryAck`,
     /// `ARCHITECTURE.md` §4.6): find the locally-sent, not-yet-delivered
     /// message in `conversation_id` this ack refers to, mark it delivered,
     /// and return it — or `Ok(None)` if nothing matches (a stale/duplicate
-    /// ack for an already-delivered message, or one naming an `n` this
-    /// side never actually sent).
+    /// ack for an already-delivered message, or one naming a
+    /// `(dh_pub, n)` this side never actually sent).
     ///
-    /// **Matching heuristic and its known limitation**: `acked_n` alone is
-    /// only unique *within one sending chain* — every Double Ratchet DH
-    /// step resets the new chain's `n` back to 0, and the wire schema
-    /// carries no `dh_pub` alongside `acked_n` to disambiguate which chain
-    /// produced it (see `DeliveryAck`'s doc). This picks the
-    /// lowest-`sequence` (oldest) matching, undelivered, locally-sent
-    /// message — correct as long as a chain's messages are acked
-    /// before the next chain's `n` values start repeating, which holds for
-    /// ordinary turn-taking but is not a hard guarantee under a
-    /// sufficiently out-of-order ack arrival. Tracked as a real, open
-    /// limitation in `docs/DELIVERY_FAILURE_FINDINGS.md`, not silently
-    /// assumed away.
+    /// **Exact match, not a heuristic**: `(dh_pub, n)` together uniquely
+    /// identify one specific sent message — `dh_pub` names which sending
+    /// chain, `n` the position within it — the same pair
+    /// `RatchetState`'s own skipped-message-key cache already keys by.
+    /// This closes a real gap the first `DeliveryAck` implementation had:
+    /// matching on `n` alone collided across chains that happened to
+    /// share one (every fresh chain starts at `n = 0`, so this was the
+    /// common case) — see `docs/DELIVERY_FAILURE_FINDINGS.md` finding #28
+    /// for the original limitation and its resolution.
     pub fn mark_message_delivered(
         &self,
         conversation_id: [u8; 16],
+        dh_pub: &[u8],
         acked_n: u32,
     ) -> Result<Option<Message>> {
         let messages = self.list_messages(conversation_id)?;
-        let Some(mut matched) = messages
-            .into_iter()
-            .find(|m| m.sender_is_local && !m.delivered && m.send_n == Some(acked_n))
-        else {
+        let Some(mut matched) = messages.into_iter().find(|m| {
+            m.sender_is_local
+                && !m.delivered
+                && m.send_n == Some(acked_n)
+                && m.send_dh_pub.as_deref() == Some(dh_pub)
+        }) else {
             return Ok(None);
         };
         matched.delivered = true;
@@ -237,6 +254,7 @@ mod tests {
             timestamp,
             sequence,
             send_n: None,
+            send_dh_pub: None,
             delivered: false,
         }
     }
@@ -316,7 +334,7 @@ mod tests {
 
         let texts = ["alpha", "beta", "gamma", "delta"];
         for text in texts {
-            db.save_message_now(conv, text.as_bytes().to_vec(), true, None)
+            db.save_message_now(conv, text.as_bytes().to_vec(), true, None, None)
                 .unwrap();
         }
 
@@ -381,13 +399,17 @@ mod tests {
     fn mark_message_delivered_flips_the_matching_sent_message() {
         let db = temp_db();
         let conv = [1u8; 16];
+        let dh_pub = vec![1u8; 32];
 
         let sent = db
-            .save_message_now(conv, b"hi".to_vec(), true, Some(7))
+            .save_message_now(conv, b"hi".to_vec(), true, Some(7), Some(dh_pub.clone()))
             .unwrap();
         assert!(!sent.delivered);
 
-        let updated = db.mark_message_delivered(conv, 7).unwrap().unwrap();
+        let updated = db
+            .mark_message_delivered(conv, &dh_pub, 7)
+            .unwrap()
+            .unwrap();
         assert_eq!(updated.id, sent.id);
         assert!(updated.delivered);
 
@@ -397,46 +419,102 @@ mod tests {
     }
 
     #[test]
-    fn mark_message_delivered_ignores_received_messages_and_wrong_n() {
+    fn mark_message_delivered_ignores_received_messages_and_wrong_n_or_dh_pub() {
         let db = temp_db();
         let conv = [1u8; 16];
+        let dh_pub = vec![2u8; 32];
+        let other_dh_pub = vec![9u8; 32];
 
         // A received message with the same send_n-shaped value would never
         // actually have send_n set, but prove it explicitly: sender_is_local
         // must be true to match at all.
-        db.save_message_now(conv, b"incoming".to_vec(), false, None)
+        db.save_message_now(conv, b"incoming".to_vec(), false, None, None)
             .unwrap();
-        db.save_message_now(conv, b"outgoing".to_vec(), true, Some(3))
-            .unwrap();
+        db.save_message_now(
+            conv,
+            b"outgoing".to_vec(),
+            true,
+            Some(3),
+            Some(dh_pub.clone()),
+        )
+        .unwrap();
 
-        assert!(db.mark_message_delivered(conv, 3).unwrap().is_some());
-        // Already delivered — a duplicate/stale ack for the same n finds nothing left.
-        assert!(db.mark_message_delivered(conv, 3).unwrap().is_none());
-        // Never sent at all.
-        assert!(db.mark_message_delivered(conv, 99).unwrap().is_none());
+        // Right n, wrong dh_pub — no match.
+        assert!(db
+            .mark_message_delivered(conv, &other_dh_pub, 3)
+            .unwrap()
+            .is_none());
+        // Right dh_pub, wrong n — no match.
+        assert!(db
+            .mark_message_delivered(conv, &dh_pub, 99)
+            .unwrap()
+            .is_none());
+        // Both right — matches.
+        assert!(db
+            .mark_message_delivered(conv, &dh_pub, 3)
+            .unwrap()
+            .is_some());
+        // Already delivered — a duplicate/stale ack for the same (dh_pub, n) finds nothing left.
+        assert!(db
+            .mark_message_delivered(conv, &dh_pub, 3)
+            .unwrap()
+            .is_none());
     }
 
+    /// The real fix for finding #28's collision: two messages from
+    /// *different* sending chains sharing the same `n` (every DH ratchet
+    /// step resets a fresh chain's `n` back to 0 — `n = 0` colliding is
+    /// the common case, not a rare one) are now disambiguated exactly by
+    /// `dh_pub`, not by an "oldest wins" heuristic — each ack correctly
+    /// flips the message from *its own* chain, never the other one.
     #[test]
-    fn mark_message_delivered_picks_the_oldest_matching_undelivered_message() {
-        // Documents the known cross-chain-collision limitation: two
-        // messages from *different* sending chains can share the same
-        // send_n (every DH ratchet step resets n back to 0). This proves
-        // the deliberate tie-break — oldest (lowest sequence) first —
-        // rather than leaving the choice unspecified.
+    fn mark_message_delivered_disambiguates_same_n_across_different_chains() {
         let db = temp_db();
         let conv = [1u8; 16];
+        let chain_a = vec![0xAAu8; 32];
+        let chain_b = vec![0xBBu8; 32];
 
         let first = db
-            .save_message_now(conv, b"first chain, n=0".to_vec(), true, Some(0))
+            .save_message_now(
+                conv,
+                b"first chain, n=0".to_vec(),
+                true,
+                Some(0),
+                Some(chain_a.clone()),
+            )
             .unwrap();
-        let _second = db
-            .save_message_now(conv, b"second chain, also n=0".to_vec(), true, Some(0))
+        let second = db
+            .save_message_now(
+                conv,
+                b"second chain, also n=0".to_vec(),
+                true,
+                Some(0),
+                Some(chain_b.clone()),
+            )
             .unwrap();
 
-        let updated = db.mark_message_delivered(conv, 0).unwrap().unwrap();
+        // Acking chain B's n=0 must flip *second*, not the older *first*.
+        let updated = db
+            .mark_message_delivered(conv, &chain_b, 0)
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            updated.id, first.id,
-            "the oldest undelivered match must be the one flipped"
+            updated.id, second.id,
+            "must match the message from the acked chain, not merely the oldest n=0"
         );
+
+        let after_one_ack = db.list_messages(conv).unwrap();
+        let first_reloaded = after_one_ack.iter().find(|m| m.id == first.id).unwrap();
+        assert!(
+            !first_reloaded.delivered,
+            "the other chain's still-unacked message must not be touched"
+        );
+
+        // Acking chain A's n=0 now correctly flips *first*.
+        let updated = db
+            .mark_message_delivered(conv, &chain_a, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.id, first.id);
     }
 }

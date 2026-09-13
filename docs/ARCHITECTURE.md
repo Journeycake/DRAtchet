@@ -518,14 +518,17 @@ schema message, `DeliveryAck` (§7 of `MESSAGE_SCHEMA.md`), closes this loop:
   delivered-indicator for that one message — never a duplicate. Found and
   fixed during this feature's own real, no-mocks testing; see
   `docs/DELIVERY_FAILURE_FINDINGS.md`.
-- `DeliveryAck.acked_n` matches back to a locally-sent `Message` via a new
-  `Message::send_n` field. This has a real, documented limitation: `n` is
-  only unique *within one sending chain*, and every Double Ratchet DH step
-  resets a new chain's `n` back to 0. The current matching heuristic
-  (oldest undelivered message with that `n`) is correct for ordinary
-  turn-taking but not a hard guarantee under sufficiently out-of-order ack
-  arrival — see `docs/DELIVERY_FAILURE_FINDINGS.md` for the full analysis
-  and remediation options.
+- `DeliveryAck` matches back to a locally-sent `Message` via `Message::send_n`
+  and `Message::send_dh_pub`. `n` alone is only unique *within one sending
+  chain* (every Double Ratchet DH step resets a new chain's `n` back to 0,
+  and `n = 0` colliding is the common case, not a rare one) — the first
+  implementation matched on `n` alone and documented that as a real,
+  open limitation (`docs/DELIVERY_FAILURE_FINDINGS.md` finding #28).
+  **Fixed**: `DeliveryAck` now also carries `dh_pub`
+  (`MESSAGE_SCHEMA.md` §7), and `Db::mark_message_delivered` matches
+  `(dh_pub, n)` exactly — the same pair `RatchetState`'s own
+  skipped-message-key cache already keys by, so no heuristic or tie-break
+  is needed anymore.
 - Building this feature also surfaced and fixed a more fundamental,
   previously-undiscovered gap in §11.1's bidirectional mailbox model
   itself — a sender could self-consume (and silently destroy) its own

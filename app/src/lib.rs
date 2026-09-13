@@ -722,6 +722,7 @@ pub async fn send_message(
 
     let envelope = encrypt_gated(&mut ratchet, contact, PAYLOAD_CHAT, content)?;
     let send_n = envelope.n;
+    let send_dh_pub = envelope.dh_pub.to_vec();
 
     conn.send(
         FrameTag::MailboxWrite,
@@ -738,7 +739,13 @@ pub async fn send_message(
     }
 
     db.save_ratchet(conv_id, &ratchet)?;
-    Ok(db.save_message_now(conv_id, content.to_vec(), true, Some(send_n))?)
+    Ok(db.save_message_now(
+        conv_id,
+        content.to_vec(),
+        true,
+        Some(send_n),
+        Some(send_dh_pub),
+    )?)
 }
 
 /// Fetch and process everything currently sitting in the mailbox `contact`
@@ -834,12 +841,12 @@ pub async fn receive_pending(
         // only after the delete has already succeeded means a lost ack
         // costs nothing but the sender's delivered-indicator for this one
         // message — never a duplicate.
-        let mut ack_after_delete: Option<u32> = None;
+        let mut ack_after_delete: Option<(Vec<u8>, u32)> = None;
 
         match apply_entry(db, &mut ratchet, contact, conv_id, &entry.envelope) {
             Ok(EntryEffect::None) => {}
-            Ok(EntryEffect::Message(message, acked_n)) => {
-                ack_after_delete = Some(acked_n);
+            Ok(EntryEffect::Message(message, dh_pub, acked_n)) => {
+                ack_after_delete = Some((dh_pub, acked_n));
                 received.push(message);
             }
             Ok(EntryEffect::Delivered(message)) => delivered.push(message),
@@ -892,9 +899,10 @@ pub async fn receive_pending(
         // sending chain is currently active, persisted by the one
         // `db.save_ratchet` at the end of this function like everything
         // else this pass did to the ratchet.
-        if let Some(acked_n) = ack_after_delete {
+        if let Some((acked_dh_pub, acked_n)) = ack_after_delete {
             let ack_content = DeliveryAck {
                 conversation_id: conv_id.to_vec(),
+                dh_pub: acked_dh_pub,
                 acked_n,
             }
             .encode();
@@ -932,10 +940,10 @@ pub async fn receive_pending(
 /// to skip just this entry or abort the whole batch.
 enum EntryEffect {
     None,
-    /// A released chat message, plus the ratchet header `n` it arrived
-    /// with — `receive_pending` needs that `n` after this entry's
+    /// A released chat message, plus the ratchet header `dh_pub`/`n` it
+    /// arrived with — `receive_pending` needs those after this entry's
     /// `MailboxDelete` succeeds, to send back its `DeliveryAck`.
-    Message(Message, u32),
+    Message(Message, Vec<u8>, u32),
     /// An incoming `DeliveryAck` matched one of our own previously-sent
     /// messages (`Db::mark_message_delivered`) — the now-delivered
     /// message, for a caller to react to (e.g. a UI checkmark).
@@ -979,7 +987,8 @@ fn apply_entry(
             Ok(EntryEffect::None)
         }
         Ok((PAYLOAD_CHAT, content)) => Ok(EntryEffect::Message(
-            db.save_message_now(conv_id, content, false, None)?,
+            db.save_message_now(conv_id, content, false, None, None)?,
+            envelope.dh_pub.to_vec(),
             envelope.n,
         )),
         Ok((PAYLOAD_DELIVERY_ACK, content)) => {
@@ -990,10 +999,11 @@ fn apply_entry(
                 )
                 .into());
             }
-            match db.mark_message_delivered(conv_id, ack.acked_n)? {
+            match db.mark_message_delivered(conv_id, &ack.dh_pub, ack.acked_n)? {
                 Some(message) => Ok(EntryEffect::Delivered(message)),
-                // Stale/duplicate ack, or one naming an `n` this side
-                // never actually sent — not an error, just nothing to do.
+                // Stale/duplicate ack, or one naming a (dh_pub, n) this
+                // side never actually sent — not an error, just nothing
+                // to do.
                 None => Ok(EntryEffect::None),
             }
         }
