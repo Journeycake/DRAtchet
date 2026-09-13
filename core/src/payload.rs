@@ -187,6 +187,50 @@ impl FirstContactContent {
     }
 }
 
+/// `PAYLOAD_DELIVERY_ACK`'s content — `MESSAGE_SCHEMA.md` §7,
+/// `ARCHITECTURE.md` §4.6. Sent by a recipient the moment a ratchet
+/// envelope **decrypts successfully** (not on mere receipt — a
+/// corrupted-in-transit message never gets falsely acked), so the sender
+/// can prune it from its local outbox/retry queue and the UI can show a
+/// delivered indicator. Deliberately *delivery*, not *read* — see
+/// `ARCHITECTURE.md` §4.6 for why those stay separate signals.
+///
+/// `conversation_id` is included even though the sending ratchet already
+/// scopes this message to one conversation — it's cheap, matches the
+/// documented wire shape exactly, and gives a receiver an explicit sanity
+/// check rather than relying purely on which session decrypted it.
+///
+/// `acked_n` is the just-decrypted envelope's ratchet header `n` (`docs/MESSAGE_SCHEMA.md`
+/// §2) — **scoped to the sending chain that produced it, not globally
+/// unique across a conversation's lifetime.** Every Double Ratchet DH step
+/// resets the new sending chain's `n` back to 0, and this schema (matching
+/// the wire format `ARCHITECTURE.md`/`MESSAGE_SCHEMA.md` actually
+/// document) carries no `dh_pub` alongside `acked_n` to disambiguate which
+/// chain it belongs to. A receiver of this ack can only match it back
+/// against its own locally-sent messages by `acked_n` value — see
+/// `dratchet_app`'s delivery-ack handling for the matching heuristic this
+/// implementation uses, and `docs/DELIVERY_FAILURE_FINDINGS.md` for why
+/// that's a real, documented limitation rather than an oversight.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryAck {
+    #[serde(with = "serde_bytes")]
+    pub conversation_id: Vec<u8>,
+    pub acked_n: u32,
+}
+
+impl DeliveryAck {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        ciborium::into_writer(self, &mut bytes)
+            .expect("CBOR encoding of a well-formed struct cannot fail");
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        ciborium::from_reader(bytes).map_err(|_| Error::MalformedPayload("not a valid DeliveryAck"))
+    }
+}
+
 /// `PAYLOAD_PROFILE_ANNOUNCE`'s content — the announcing side's current
 /// `username#NNNN`. Deliberately as small as `RoutingIdAnnounce`: nothing
 /// about *why* it changed travels over the wire, since the recipient
@@ -359,5 +403,26 @@ mod tests {
     #[test]
     fn profile_announce_garbage_bytes_are_rejected_not_panicking() {
         assert!(ProfileAnnounce::decode(&[0xFF, 0x00, 0x01]).is_err());
+    }
+
+    #[test]
+    fn delivery_ack_round_trips_through_encode_and_tag_and_pad() {
+        let ack = DeliveryAck {
+            conversation_id: vec![9u8; 16],
+            acked_n: 42,
+        };
+        let encoded = ack.encode();
+        let decoded = DeliveryAck::decode(&encoded).unwrap();
+        assert_eq!(decoded, ack);
+
+        let padded = tag_and_pad(PAYLOAD_DELIVERY_ACK, &encoded).unwrap();
+        let (ty, content) = untag_and_unpad(&padded).unwrap();
+        assert_eq!(ty, PAYLOAD_DELIVERY_ACK);
+        assert_eq!(DeliveryAck::decode(&content).unwrap(), ack);
+    }
+
+    #[test]
+    fn delivery_ack_garbage_bytes_are_rejected_not_panicking() {
+        assert!(DeliveryAck::decode(&[0xFF, 0x00, 0x01]).is_err());
     }
 }

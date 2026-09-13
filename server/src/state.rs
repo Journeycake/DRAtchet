@@ -46,6 +46,21 @@ pub struct MailboxEntry {
     pub entry_id: [u8; 16],
     pub envelope: Vec<u8>,
     pub expires_at: SystemTime,
+    /// The authenticated identity that wrote this entry — `ARCHITECTURE.md`
+    /// §11.1's "bidirectional per-conversation `mailbox_id`" means both
+    /// sides of a pairing write to and fetch from the exact same address,
+    /// with nothing else distinguishing "my own outgoing mail, still
+    /// waiting for the peer to collect it" from "the peer's mail, waiting
+    /// for me." Without this, `MailboxFetch` would hand a writer back its
+    /// own not-yet-collected entries — decrypting a self-authored envelope
+    /// with the *receiving* side of the ratchet fails the AEAD check, gets
+    /// classified as a per-entry content error, and (worse) still gets
+    /// deleted as "processed" — silently destroying a message before its
+    /// real recipient ever sees it. Found while adding `DeliveryAck`
+    /// (`ARCHITECTURE.md` §4.6), whose ack-back-over-the-same-mailbox
+    /// pattern turns this from a rare, easily-avoided-by-test-choreography
+    /// edge case into the common one (`docs/DELIVERY_FAILURE_FINDINGS.md`).
+    pub written_by: Fingerprint,
 }
 
 /// One connected client's outbound channel — frames pushed here are written

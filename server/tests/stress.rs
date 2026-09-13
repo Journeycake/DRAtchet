@@ -13,6 +13,7 @@
 mod common;
 
 use common::*;
+use dratchet_core::account::Account;
 use dratchet_server::protocol::*;
 use std::sync::Arc;
 use std::time::Instant;
@@ -65,6 +66,19 @@ async fn many_concurrent_clients_publish_fetch_mailbox_presence_rendezvous_witho
                 .send(FrameTag::PublishBundle, &PublishBundle { bundle })
                 .await;
             let _ack: Ack = client.recv_skip_pushes(FrameTag::Ack).await;
+
+            // A second, throwaway-identity connection purely for the
+            // mailbox-fetch step below. `ARCHITECTURE.md` §11.1's mailbox
+            // is bidirectional and `MailboxFetch` never hands a fetcher
+            // back its own not-yet-collected entries (`MailboxEntry::written_by`,
+            // found while building `DeliveryAck` — see
+            // `docs/DELIVERY_FAILURE_FINDINGS.md`) — so fetching with the
+            // same identity that just wrote would (correctly) see
+            // nothing. Mailbox access is capability-based, not tied to a
+            // published bundle, so a bare authenticated identity is
+            // enough; no `PublishBundle` needed for it.
+            let mut reader = TestClient::connect(&url).await;
+            reader.authenticate(&Account::generate().unwrap()).await;
 
             start_barrier.wait().await;
 
@@ -125,7 +139,7 @@ async fn many_concurrent_clients_publish_fetch_mailbox_presence_rendezvous_witho
                 );
                 ops += 1;
 
-                client
+                reader
                     .send(
                         FrameTag::MailboxFetch,
                         &MailboxFetch {
@@ -134,7 +148,7 @@ async fn many_concurrent_clients_publish_fetch_mailbox_presence_rendezvous_witho
                     )
                     .await;
                 let entries: MailboxEntries =
-                    client.recv_skip_pushes(FrameTag::MailboxEntries).await;
+                    reader.recv_skip_pushes(FrameTag::MailboxEntries).await;
                 assert_eq!(
                     entries.entries.len(),
                     1,

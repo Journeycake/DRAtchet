@@ -207,6 +207,8 @@ mod tests {
             content: b"hello".to_vec(),
             timestamp: 100,
             sequence: 0,
+            send_n: None,
+            delivered: false,
         }
     }
 

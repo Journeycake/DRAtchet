@@ -325,7 +325,7 @@ async fn dispatch(
         }
 
         FrameTag::MailboxWrite => {
-            authenticated.ok_or(Error::AuthRequired)?;
+            let writer = authenticated.ok_or(Error::AuthRequired)?;
             let req: MailboxWrite = decode_body(body)?;
             let mailbox_id: [u8; 16] = req
                 .mailbox_id
@@ -336,6 +336,7 @@ async fn dispatch(
                 entry_id: random_16(),
                 envelope: req.envelope,
                 expires_at: std::time::SystemTime::now() + crate::state::ttl_from_secs(req.ttl),
+                written_by: writer,
             };
             let mut inner = state.inner.write().await;
             inner.mailboxes.entry(mailbox_id).or_default().push(entry);
@@ -345,7 +346,7 @@ async fn dispatch(
         }
 
         FrameTag::MailboxFetch => {
-            authenticated.ok_or(Error::AuthRequired)?;
+            let fetcher = authenticated.ok_or(Error::AuthRequired)?;
             let req: MailboxFetch = decode_body(body)?;
             let mailbox_id: [u8; 16] = req
                 .mailbox_id
@@ -355,8 +356,15 @@ async fn dispatch(
             let mut inner = state.inner.write().await;
             let entries = inner.mailboxes.entry(mailbox_id).or_default();
             prune_expired(entries);
+            // `ARCHITECTURE.md` §11.1: this mailbox is bidirectional — both
+            // sides of a pairing write to and fetch from the identical
+            // address, so without this a fetcher would get its own
+            // not-yet-collected entries handed back to it (see
+            // `MailboxEntry::written_by`'s doc for what that silently
+            // breaks).
             let wire_entries: Vec<MailboxEntryWire> = entries
                 .iter()
+                .filter(|e| e.written_by != fetcher)
                 .map(|e| MailboxEntryWire {
                     entry_id: e.entry_id.to_vec(),
                     envelope: e.envelope.clone(),

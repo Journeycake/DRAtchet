@@ -655,6 +655,8 @@ mod tests {
                 content: b"gone after a quick wipe".to_vec(),
                 timestamp: 100,
                 sequence: 0,
+                send_n: None,
+                delivered: false,
             },
         )
         .unwrap();
@@ -709,6 +711,8 @@ mod tests {
                 content: b"written after the wipe, under the new key".to_vec(),
                 timestamp: 200,
                 sequence: 0,
+                send_n: None,
+                delivered: false,
             },
         )
         .unwrap();

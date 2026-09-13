@@ -389,12 +389,21 @@ async fn rendezvous_to_an_offline_peer_acks_false_no_store_and_forward() {
 
 #[tokio::test]
 async fn mailbox_write_fetch_delete_round_trips() {
+    // Two distinct identities, deliberately — not the same connection
+    // writing and fetching. `ARCHITECTURE.md` §11.1's mailbox is
+    // bidirectional (both sides of a real pairing write to and fetch from
+    // the identical `mailbox_id`), and `MailboxFetch` never hands a
+    // fetcher back its own not-yet-collected entries (`MailboxEntry::written_by`) —
+    // so a same-identity round trip would (correctly) see nothing. Alice
+    // writes, Bob fetches and deletes, matching how this actually gets
+    // used.
     let url = spawn_server().await;
     let (alice, alice_bundle) = fresh_account_and_bundle("alice", 1, 0);
+    let (bob, bob_bundle) = fresh_account_and_bundle("bob", 2, 0);
 
-    let mut client = TestClient::connect(&url).await;
-    client.authenticate(&alice).await;
-    client
+    let mut alice_client = TestClient::connect(&url).await;
+    alice_client.authenticate(&alice).await;
+    alice_client
         .send(
             FrameTag::PublishBundle,
             &PublishBundle {
@@ -402,12 +411,22 @@ async fn mailbox_write_fetch_delete_round_trips() {
             },
         )
         .await;
-    let (_, _ack): (_, Ack) = client.recv().await;
+    let (_, _ack): (_, Ack) = alice_client.recv().await;
+
+    let mut bob_client = TestClient::connect(&url).await;
+    bob_client.authenticate(&bob).await;
+    bob_client
+        .send(
+            FrameTag::PublishBundle,
+            &PublishBundle { bundle: bob_bundle },
+        )
+        .await;
+    let (_, _ack): (_, Ack) = bob_client.recv().await;
 
     let mailbox_id = vec![9u8; 16];
     let envelope = vec![1, 2, 3, 4, 5];
 
-    client
+    alice_client
         .send(
             FrameTag::MailboxWrite,
             &MailboxWrite {
@@ -417,11 +436,11 @@ async fn mailbox_write_fetch_delete_round_trips() {
             },
         )
         .await;
-    let (tag, ack): (_, Ack) = client.recv().await;
+    let (tag, ack): (_, Ack) = alice_client.recv().await;
     assert_eq!(tag, FrameTag::Ack);
     assert!(ack.ok);
 
-    client
+    bob_client
         .send(
             FrameTag::MailboxFetch,
             &MailboxFetch {
@@ -429,13 +448,13 @@ async fn mailbox_write_fetch_delete_round_trips() {
             },
         )
         .await;
-    let (tag, entries): (_, MailboxEntries) = client.recv().await;
+    let (tag, entries): (_, MailboxEntries) = bob_client.recv().await;
     assert_eq!(tag, FrameTag::MailboxEntries);
     assert_eq!(entries.entries.len(), 1);
     assert_eq!(entries.entries[0].envelope, envelope);
 
     let entry_id = entries.entries[0].entry_id.clone();
-    client
+    bob_client
         .send(
             FrameTag::MailboxDelete,
             &MailboxDelete {
@@ -444,17 +463,68 @@ async fn mailbox_write_fetch_delete_round_trips() {
             },
         )
         .await;
-    let (tag, ack): (_, Ack) = client.recv().await;
+    let (tag, ack): (_, Ack) = bob_client.recv().await;
     assert_eq!(tag, FrameTag::Ack);
     assert!(ack.ok);
 
-    client
+    bob_client
         .send(FrameTag::MailboxFetch, &MailboxFetch { mailbox_id })
         .await;
-    let (_, entries): (_, MailboxEntries) = client.recv().await;
+    let (_, entries): (_, MailboxEntries) = bob_client.recv().await;
     assert!(
         entries.entries.is_empty(),
         "deleted entry must not still be fetchable"
+    );
+}
+
+#[tokio::test]
+async fn a_writer_never_sees_its_own_not_yet_collected_entry() {
+    // The real, previously-undiscovered gap this test guards against,
+    // found while building `DeliveryAck` (`ARCHITECTURE.md` §4.6):
+    // `ARCHITECTURE.md` §11.1's mailbox is bidirectional — the exact same
+    // `mailbox_id` serves both directions of a pairing — so before
+    // `MailboxEntry::written_by` filtering existed, a writer polling the
+    // same mailbox before its peer collected an entry would fetch its own
+    // envelope back, fail to decrypt it (wrong ratchet chain), and the
+    // caller would still delete it as "processed" — silently destroying a
+    // message before its real recipient ever saw it. See
+    // `docs/DELIVERY_FAILURE_FINDINGS.md` for the full writeup.
+    let url = spawn_server().await;
+    let (alice, alice_bundle) = fresh_account_and_bundle("alice", 3, 0);
+
+    let mut alice_client = TestClient::connect(&url).await;
+    alice_client.authenticate(&alice).await;
+    alice_client
+        .send(
+            FrameTag::PublishBundle,
+            &PublishBundle {
+                bundle: alice_bundle,
+            },
+        )
+        .await;
+    let (_, _ack): (_, Ack) = alice_client.recv().await;
+
+    let mailbox_id = vec![11u8; 16];
+    alice_client
+        .send(
+            FrameTag::MailboxWrite,
+            &MailboxWrite {
+                mailbox_id: mailbox_id.clone(),
+                envelope: vec![1, 2, 3],
+                ttl: 3600,
+            },
+        )
+        .await;
+    let (_, ack): (_, Ack) = alice_client.recv().await;
+    assert!(ack.ok);
+
+    alice_client
+        .send(FrameTag::MailboxFetch, &MailboxFetch { mailbox_id })
+        .await;
+    let (_, entries): (_, MailboxEntries) = alice_client.recv().await;
+    assert!(
+        entries.entries.is_empty(),
+        "a writer must never fetch back its own not-yet-collected entry"
     );
 }
 

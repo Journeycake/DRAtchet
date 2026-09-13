@@ -116,6 +116,10 @@ struct MessageDto {
     sender_is_local: bool,
     content: String,
     timestamp: u64,
+    /// Only meaningful when `sender_is_local` — whether a `DeliveryAck`
+    /// has come back for this message yet (`ARCHITECTURE.md` §4.6). Always
+    /// `false` for a received message.
+    delivered: bool,
 }
 
 /// This device's own directory-facing profile (`dratchet_store::OwnProfile`),
@@ -186,6 +190,7 @@ fn to_message_dto(message: &dratchet_store::Message) -> MessageDto {
         sender_is_local: message.sender_is_local,
         content: String::from_utf8_lossy(&message.content).into_owned(),
         timestamp: message.timestamp,
+        delivered: message.delivered,
     }
 }
 
@@ -673,6 +678,7 @@ async fn poll_loop(app_handle: AppHandle) {
                 match received {
                     Ok(outcome) => {
                         if !outcome.messages.is_empty()
+                            || !outcome.delivered.is_empty()
                             || outcome.wipe_activity
                             || !outcome.profile_changes.is_empty()
                         {

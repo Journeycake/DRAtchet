@@ -268,6 +268,18 @@ the WebSocket with no ratchet encryption of their own — the service has to
 be able to read routing metadata to do its job (§4.1/§4.2 of
 `ARCHITECTURE.md`), unlike message content.
 
+**Implementation note (`core::payload::DeliveryAck`, `dratchet_app`):**
+`acked_n` alone only disambiguates messages *within one sending chain* —
+every Double Ratchet DH step resets a new chain's `n` back to 0, and this
+schema (matching the shape documented above) carries no `dh_pub` alongside
+it to say which chain produced it. A receiver matches an incoming ack back
+to its own sent messages by picking the oldest undelivered
+locally-sent message with that `n` (`Db::mark_message_delivered`) — correct
+for ordinary turn-taking, not a hard guarantee under sufficiently
+out-of-order ack arrival. See `docs/DELIVERY_FAILURE_FINDINGS.md` finding
+#28 for the analysis and remediation options (extending the schema with
+`dh_pub`, among them).
+
 ## 8. Recovery profile negotiation (CBOR) — §7.2/§7.3/§7.5 of `ARCHITECTURE.md`
 
 | Field | Type | Notes |

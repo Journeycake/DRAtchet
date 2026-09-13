@@ -421,7 +421,9 @@ async fn scenario_14_a_crash_before_save_ratchet_does_not_lose_already_processed
         let envelope = dratchet_core::envelope::Envelope::decode(&entry.envelope).unwrap();
         let (payload_type, content) = in_memory_ratchet.decrypt_payload(&envelope).unwrap();
         assert_eq!(payload_type, PAYLOAD_CHAT);
-        db_alice.save_message_now(conv_id, content, false).unwrap();
+        db_alice
+            .save_message_now(conv_id, content, false, None)
+            .unwrap();
         alice_conn
             .send(
                 FrameTag::MailboxDelete,

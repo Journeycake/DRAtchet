@@ -478,7 +478,7 @@ requires relay-side coordination beyond the TTL):
 | Local outbox retention | 500 messages/conversation **or** 30 days, whichever hits first | Oldest-pruned-first; pruning surfaces a visible "couldn't be delivered" notice rather than failing silently |
 | Retry trigger for a stalled outbox | Event-driven on a presence transition to online, plus a 5-minute periodic sweep while foregrounded | Avoids polling the relay/peer on a tight loop while still self-healing if a presence event was missed |
 
-### 4.6 Delivery acknowledgment
+### 4.6 Delivery acknowledgment — **v1, implemented**
 
 A message being *sent* isn't the same as it being *delivered* — the sender
 needs to know when to stop retrying (§4.5's `LocalOutbox`/`QueuedRemote`
@@ -490,7 +490,10 @@ schema message, `DeliveryAck` (§7 of `MESSAGE_SCHEMA.md`), closes this loop:
   never gets falsely acked.
 - Routed back exactly like a normal message would be: over an open Tier 0
   DataChannel if one exists, otherwise written to a Tier 1 mailbox the same
-  way — `DeliveryAck` gets no special-cased transport.
+  way — `DeliveryAck` gets no special-cased transport. (Tier 0 direct
+  delivery itself isn't implemented yet — only the Tier 1 mailbox path is
+  real code today — so in practice every `DeliveryAck` currently travels
+  the mailbox.)
 - On receipt, the sender prunes the corresponding entry from its local
   outbox/retry queue (§4.5) and the UI can show a delivered indicator.
 - **This is deliberately *delivery*, not *read*.** Whether the human on the
@@ -501,6 +504,33 @@ schema message, `DeliveryAck` (§7 of `MESSAGE_SCHEMA.md`), closes this loop:
   only; a `ReadReceipt` message would follow the identical pattern but
   should default to **off**, user-toggleable per conversation, tracked as
   an open decision in §10 rather than shipped as an unconditional default.
+
+**Implementation notes (`dratchet_app::receive_pending`, `store::messages::Message`):**
+
+- The ack is sent *after* the just-decrypted entry's `MailboxDelete` has
+  already succeeded, not immediately on decrypt — sending it earlier and
+  having that round trip itself fail would abort the whole batch before
+  the delete ran, and a still-undeleted entry gets refetched and
+  reprocessed next time, decrypting fine again (the ratchet's on-disk
+  position hasn't advanced past it either) but re-saved as a second,
+  duplicate `Message` record. Acking only after the delete has already
+  committed means a lost ack costs nothing worse than the sender's
+  delivered-indicator for that one message — never a duplicate. Found and
+  fixed during this feature's own real, no-mocks testing; see
+  `docs/DELIVERY_FAILURE_FINDINGS.md`.
+- `DeliveryAck.acked_n` matches back to a locally-sent `Message` via a new
+  `Message::send_n` field. This has a real, documented limitation: `n` is
+  only unique *within one sending chain*, and every Double Ratchet DH step
+  resets a new chain's `n` back to 0. The current matching heuristic
+  (oldest undelivered message with that `n`) is correct for ordinary
+  turn-taking but not a hard guarantee under sufficiently out-of-order ack
+  arrival — see `docs/DELIVERY_FAILURE_FINDINGS.md` for the full analysis
+  and remediation options.
+- Building this feature also surfaced and fixed a more fundamental,
+  previously-undiscovered gap in §11.1's bidirectional mailbox model
+  itself — a sender could self-consume (and silently destroy) its own
+  not-yet-collected message. See §11.1's own note and
+  `docs/DELIVERY_FAILURE_FINDINGS.md` finding #27.
 
 ## 5. Client / platform architecture
 
@@ -1399,6 +1429,25 @@ contact makes somewhere (Signal's own initial-session establishment is
 addressed by a stable identifier too, before sealed-sender-style opaque
 routing takes over); DRAtchet's version is scoped to exactly the one
 message that needs it.
+
+**A third gap, found while building `DeliveryAck` (§4.6), fixed in the
+same pass:** the final adopted fix below makes `mailbox_id` *bidirectional*
+— the identical address for both directions of a pairing — and the
+server-side implementation (`server/src/ws.rs`) originally handed a
+`MailboxFetch` caller back *every* entry in that mailbox, including its
+own not-yet-collected writes. Decrypting a self-authored envelope with the
+*receiving* side of the ratchet fails the AEAD check, gets classified as a
+per-entry content error, and — worse — still gets deleted as "processed,"
+silently destroying a message before its real recipient ever saw it. This
+was a latent risk for ordinary chat from the start (masked only by every
+existing test's choreography never having the sender poll between sending
+and the recipient's fetch); `DeliveryAck`'s ack-back-over-the-same-mailbox
+pattern turns it from a rare edge case into the common one, since it's
+common for a sender to poll again shortly after sending. **Fixed**: the
+server now tracks each `MailboxEntry`'s authenticated writer
+(`MailboxEntry::written_by`) and `MailboxFetch` excludes entries the
+fetcher itself wrote. See `docs/DELIVERY_FAILURE_FINDINGS.md` finding #27
+for the full writeup and remediation options considered.
 
 **Correction, found immediately after writing the above while implementing
 the first reference client — the "adopted fix" two paragraphs up is not

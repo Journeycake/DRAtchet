@@ -35,9 +35,10 @@ use dratchet_core::envelope::Envelope;
 use dratchet_core::first_contact::FirstContactWire;
 use dratchet_core::identity::fingerprint_of_public_key;
 use dratchet_core::payload::{
-    ConversationWipePolicyAnnounce, FirstContactContent, ProfileAnnounce, RoutingIdAnnounce,
-    PAYLOAD_CHAT, PAYLOAD_CONVERSATION_WIPE_POLICY_ANNOUNCE, PAYLOAD_CONVERSATION_WIPE_REQUEST,
-    PAYLOAD_FIRST_CONTACT, PAYLOAD_PROFILE_ANNOUNCE, PAYLOAD_ROUTING_ID_ANNOUNCE,
+    ConversationWipePolicyAnnounce, DeliveryAck, FirstContactContent, ProfileAnnounce,
+    RoutingIdAnnounce, PAYLOAD_CHAT, PAYLOAD_CONVERSATION_WIPE_POLICY_ANNOUNCE,
+    PAYLOAD_CONVERSATION_WIPE_REQUEST, PAYLOAD_DELIVERY_ACK, PAYLOAD_FIRST_CONTACT,
+    PAYLOAD_PROFILE_ANNOUNCE, PAYLOAD_ROUTING_ID_ANNOUNCE,
 };
 use dratchet_core::prekey::{OneTimePrekeyPublic, PrekeyBundle, SignedPrekeyPublic};
 use dratchet_core::ratchet::{RatchetState, DEFAULT_MAX_SKIP};
@@ -720,6 +721,7 @@ pub async fn send_message(
     let mut ratchet = db.load_ratchet(conv_id)?.ok_or(Error::NoSession)?;
 
     let envelope = encrypt_gated(&mut ratchet, contact, PAYLOAD_CHAT, content)?;
+    let send_n = envelope.n;
 
     conn.send(
         FrameTag::MailboxWrite,
@@ -736,7 +738,7 @@ pub async fn send_message(
     }
 
     db.save_ratchet(conv_id, &ratchet)?;
-    Ok(db.save_message_now(conv_id, content.to_vec(), true)?)
+    Ok(db.save_message_now(conv_id, content.to_vec(), true, Some(send_n))?)
 }
 
 /// Fetch and process everything currently sitting in the mailbox `contact`
@@ -803,6 +805,7 @@ pub async fn receive_pending(
     let (_, entries): (_, MailboxEntries) = conn.recv().await?;
 
     let mut received = Vec::new();
+    let mut delivered = Vec::new();
     let mut wipe_activity = false;
     let mut profile_changes = Vec::new();
     let mut skipped = 0usize;
@@ -818,9 +821,28 @@ pub async fn receive_pending(
     // in this batch is correct. Wipe-policy decisions below use this same
     // stale-within-the-batch snapshot for the same reason.
     for entry in &entries.entries {
+        // Set by a successfully-decrypted chat message below — the ratchet
+        // header `n` it arrived with, still needed *after* this entry's
+        // `MailboxDelete` below to send its `DeliveryAck` (`ARCHITECTURE.md`
+        // §4.6). Sent only once the entry is confirmed deleted, not before:
+        // sending it earlier and having the ack round trip itself fail
+        // would abort this function before the delete ever ran, and a
+        // still-undeleted entry gets refetched and reprocessed next time —
+        // decrypting fine again (the ratchet's on-disk position hasn't
+        // advanced past it either, since `db.save_ratchet` below hasn't run
+        // yet) but re-saved as a second, duplicate `Message` record. Acking
+        // only after the delete has already succeeded means a lost ack
+        // costs nothing but the sender's delivered-indicator for this one
+        // message — never a duplicate.
+        let mut ack_after_delete: Option<u32> = None;
+
         match apply_entry(db, &mut ratchet, contact, conv_id, &entry.envelope) {
             Ok(EntryEffect::None) => {}
-            Ok(EntryEffect::Message(message)) => received.push(message),
+            Ok(EntryEffect::Message(message, acked_n)) => {
+                ack_after_delete = Some(acked_n);
+                received.push(message);
+            }
+            Ok(EntryEffect::Delivered(message)) => delivered.push(message),
             Ok(EntryEffect::WipeActivity { session_wiped: sw }) => {
                 wipe_activity = true;
                 if sw {
@@ -861,6 +883,36 @@ pub async fn receive_pending(
         if !ack.ok {
             return Err(Error::NotAcknowledged);
         }
+
+        // `ARCHITECTURE.md` §4.6: sent the moment a ratchet envelope
+        // decrypts successfully, over the same mailbox path any other
+        // message uses — no special-cased transport. Uses the same live
+        // `ratchet` this whole batch already holds (not a fresh
+        // `db.load_ratchet`), so it's just the next message in whatever
+        // sending chain is currently active, persisted by the one
+        // `db.save_ratchet` at the end of this function like everything
+        // else this pass did to the ratchet.
+        if let Some(acked_n) = ack_after_delete {
+            let ack_content = DeliveryAck {
+                conversation_id: conv_id.to_vec(),
+                acked_n,
+            }
+            .encode();
+            let ack_envelope = ratchet.encrypt_payload(PAYLOAD_DELIVERY_ACK, &ack_content)?;
+            conn.send(
+                FrameTag::MailboxWrite,
+                &MailboxWrite {
+                    mailbox_id: contact.mailbox_id.clone(),
+                    envelope: ack_envelope.encode(),
+                    ttl: 14 * 24 * 60 * 60,
+                },
+            )
+            .await?;
+            let (_, ack): (_, Ack) = conn.recv().await?;
+            if !ack.ok {
+                return Err(Error::NotAcknowledged);
+            }
+        }
     }
 
     if !session_wiped {
@@ -868,6 +920,7 @@ pub async fn receive_pending(
     }
     Ok(Received {
         messages: received,
+        delivered,
         wipe_activity,
         profile_changes,
         skipped,
@@ -879,8 +932,17 @@ pub async fn receive_pending(
 /// to skip just this entry or abort the whole batch.
 enum EntryEffect {
     None,
-    Message(Message),
-    WipeActivity { session_wiped: bool },
+    /// A released chat message, plus the ratchet header `n` it arrived
+    /// with — `receive_pending` needs that `n` after this entry's
+    /// `MailboxDelete` succeeds, to send back its `DeliveryAck`.
+    Message(Message, u32),
+    /// An incoming `DeliveryAck` matched one of our own previously-sent
+    /// messages (`Db::mark_message_delivered`) — the now-delivered
+    /// message, for a caller to react to (e.g. a UI checkmark).
+    Delivered(Message),
+    WipeActivity {
+        session_wiped: bool,
+    },
     ProfileChange(ProfileChangeNotice),
 }
 
@@ -917,8 +979,24 @@ fn apply_entry(
             Ok(EntryEffect::None)
         }
         Ok((PAYLOAD_CHAT, content)) => Ok(EntryEffect::Message(
-            db.save_message_now(conv_id, content, false)?,
+            db.save_message_now(conv_id, content, false, None)?,
+            envelope.n,
         )),
+        Ok((PAYLOAD_DELIVERY_ACK, content)) => {
+            let ack = DeliveryAck::decode(&content)?;
+            if ack.conversation_id != conv_id {
+                return Err(dratchet_core::error::Error::MalformedPayload(
+                    "DeliveryAck.conversation_id doesn't match the session it arrived on",
+                )
+                .into());
+            }
+            match db.mark_message_delivered(conv_id, ack.acked_n)? {
+                Some(message) => Ok(EntryEffect::Delivered(message)),
+                // Stale/duplicate ack, or one naming an `n` this side
+                // never actually sent — not an error, just nothing to do.
+                None => Ok(EntryEffect::None),
+            }
+        }
         Ok((PAYLOAD_CONVERSATION_WIPE_POLICY_ANNOUNCE, content)) => {
             let announce = ConversationWipePolicyAnnounce::decode(&content)?;
             db.record_peer_wipe_policy(
@@ -987,6 +1065,11 @@ pub struct Received {
     /// Newly received, released chat messages — what a caller used to get
     /// directly before this type existed.
     pub messages: Vec<Message>,
+    /// Previously-sent messages a `DeliveryAck` arrived for this pass
+    /// (`ARCHITECTURE.md` §4.6) — now `Message::delivered == true`. A
+    /// caller (the Tauri poll loop) uses this to refresh a delivered
+    /// indicator without needing to know which message ids to look for.
+    pub delivered: Vec<Message>,
     /// Something about this conversation changed that isn't reflected in
     /// `messages` — a wipe-policy announcement was recorded, or a wipe
     /// request either auto-complied or set `Contact::wipe_request_pending`.

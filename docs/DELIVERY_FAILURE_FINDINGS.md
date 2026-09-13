@@ -23,6 +23,12 @@ documented in its own section below alongside the other findings, since
 it's the same class of "found a real bug, fixed it, tested the fix"
 result.
 
+Two more (#27, #28) turned up while building and testing `DeliveryAck`
+(`ARCHITECTURE.md` §4.6): #27 is a real, high-severity, previously-latent
+gap in the mailbox model itself (fixed and tested); #28 is a real, open
+limitation in `DeliveryAck`'s own matching scheme, documented with
+remediation options rather than fixed outright — see its section for why.
+
 Companion test files: `server/tests/delivery_failures.rs` (mailbox
 layer), `core/src/ratchet.rs`'s `tests` module (ratchet layer, new cases
 added alongside the many that already existed), `app/tests/delivery_failures.rs`
@@ -58,6 +64,8 @@ added alongside the many that already existed), `app/tests/delivery_failures.rs`
 | 24 | Pairing-code / mailbox TTL clock-skew exposure | Analyzed | Not a gap — corrected initial suspicion |
 | 25 | Rapid replenish cycles and the signed prekey | Tested + analyzed | Safe |
 | 26 | Same-second messages sort by random key order, not send order | Tested (new) | **Fixed** — was a confirmed gap |
+| 27 | A writer's own not-yet-collected mailbox entry is fetchable by the writer itself | Tested (new) | **Fixed** — was a confirmed high-severity gap |
+| 28 | `DeliveryAck.acked_n` collides across sending chains | Analyzed + tested | Confirmed, open limitation — options given, not fixed |
 
 ---
 
@@ -443,3 +451,151 @@ listed first):
    never matters across a restart (wall-clock time has moved on by then,
    so `timestamp` alone already disambiguates). Rejected as
    unnecessary complexity for no practical benefit over option 1.
+
+## `DeliveryAck` (found building and testing `ARCHITECTURE.md` §4.6)
+
+### 27. A writer's own not-yet-collected mailbox entry is fetchable by the writer itself
+**Tested (new)**: found while building `DeliveryAck`, then reproduced and
+fixed at the layer it actually lives in — the server's mailbox, not the
+app. `ARCHITECTURE.md` §11.1's final adopted fix makes a conversation's
+`mailbox_id` **bidirectional**: both sides write to and fetch from the
+exact identical address (`store::routing::compute_mailbox_id` is a
+symmetric, order-independent hash). The server (`server/src/ws.rs`,
+before this fix) returned *every* entry in a mailbox to *whoever* fetched
+it, with no notion of "entries I wrote" vs. "entries my peer wrote."
+
+Consequence: if a device ever calls `receive_pending` on a conversation
+after writing to that same mailbox but before its peer has fetched-and-
+deleted that entry, it fetches its own envelope back. Decrypting it with
+the *receiving* side of the ratchet fails the AEAD check every time (it
+was encrypted with the sender's own *sending* chain key, not a key the
+receiving side has), gets classified as a per-entry content error, and —
+this is the actually damaging part — **`receive_pending` still deletes it
+as "processed" afterward**, exactly like any other consumed entry. The
+message is gone from the mailbox forever, and the real recipient never
+gets it. No error surfaces to the user; it just silently vanishes.
+
+This was a real, latent risk for *ordinary chat* from the moment §11.1's
+bidirectional mailbox was adopted, not something `DeliveryAck` introduced
+— but every existing test's choreography happened to avoid it (the sender
+never called `receive_pending` between sending and the recipient's
+fetch). `DeliveryAck` turns this from a rare, avoidable-by-convention edge
+case into the *common* case: it writes an ack back to the shared mailbox
+on every single received chat message, and a normal polling client (this
+project's `poll_loop`) has no reason not to poll again almost immediately
+after. Confirmed via `app/tests/receive_pending_resilience.rs`'s existing
+regression test failing outright once `DeliveryAck` started writing acks
+(it expected a second `receive_pending` call to see nothing new, and
+instead saw the client's own just-sent acks come back and get skipped).
+
+**Fixed**: `server/src/state.rs`'s `MailboxEntry` gained a `written_by`
+field (the authenticated identity that wrote it); `MailboxFetch`
+(`server/src/ws.rs`) now excludes entries the fetcher itself wrote. New
+tests: `server/tests/integration.rs::a_writer_never_sees_its_own_not_yet_collected_entry`
+(a bare write-then-immediately-fetch-with-the-same-identity proves the
+entry no longer comes back) and
+`app/tests/delivery_ack.rs::polling_immediately_after_sending_does_not_self_consume_the_message`
+(the real, at-the-application-layer version of the exact scenario that
+broke). `server/tests/integration.rs::mailbox_write_fetch_delete_round_trips`
+(a pre-existing test that happened to write and fetch with the same
+identity) was updated to use two identities, matching how the mailbox is
+actually used; `server/tests/stress.rs`'s concurrency test similarly
+switched its per-iteration mailbox fetch to a second, throwaway-identity
+connection.
+
+**Options considered** (the option taken is listed first):
+1. **(Taken) Server-side `written_by` filtering.** Minimal, symmetric with
+   how the server already authenticates every connection, and closes the
+   gap for every message type through this mailbox (chat, acks,
+   `RoutingIdAnnounce`, wipe messages), not just `DeliveryAck`. No wire
+   format change visible to a well-behaved client — `MailboxFetch`'s
+   request/response shapes are unchanged, it just returns fewer, correct
+   entries.
+2. Client-side heuristic: before attempting to decrypt an entry, check
+   whether its `dh_pub` matches the client's own current *sending* chain's
+   public key, and skip (without deleting) anything that does. Rejected:
+   fragile across DH ratchet steps (a client's own dh_pub changes over
+   time, and reconstructing "was this ever one of my own sending keys"
+   client-side means keeping a growing history around just to answer this
+   one question), and every client would need this logic independently —
+   the server already has the authoritative answer for free from the
+   authenticated connection it's already checking.
+3. Split the bidirectional mailbox into two unidirectional ones (a
+   per-direction `mailbox_id` instead of one symmetric one). Closes the
+   gap by construction — a device only ever fetches from the mailbox its
+   peer writes to — but is a real wire-protocol change (both sides would
+   need to derive and track two ids per conversation instead of one,
+   coordinate which is "theirs," and this is exactly the design §11.1's
+   own "second gap" section already explored and rejected for unrelated
+   reasons: a rotating-with-the-ratchet id can't be computed by both sides
+   at a mutually-known moment). Rejected as disproportionate to the
+   problem when option 1 closes it completely at the layer that already
+   has the right information.
+
+### 28. `DeliveryAck.acked_n` collides across sending chains
+**Analyzed + tested**: a real, open limitation in `DeliveryAck` itself
+(`core::payload::DeliveryAck`, `docs/MESSAGE_SCHEMA.md` §7), not something
+this pass fixed — see below for why fixing it outright wasn't the right
+call yet.
+
+`acked_n` is the ratchet header `n` of the message being acknowledged —
+but `n` only disambiguates messages *within one sending chain*. Every
+Double Ratchet DH step (which, per `docs/DELIVERY_FAILURE_FINDINGS.md`'s
+own module doc and `ARCHITECTURE.md` §3.3, happens on nearly every message
+in ordinary back-and-forth chat) resets the new chain's `n` back to 0. The
+wire schema carries no `dh_pub` alongside `acked_n` to say which chain
+produced it (matching the shape `ARCHITECTURE.md` §4.6/`MESSAGE_SCHEMA.md`
+§7 originally specified). A receiver of an ack can only match it back
+against its own sent messages by `acked_n`'s bare value.
+
+The implementation (`Db::mark_message_delivered`) resolves this by picking
+the **oldest undelivered** locally-sent message with a matching `send_n` —
+correct as long as a chain's messages get acked before the next chain's
+`n` values start repeating, which holds for the ordinary turn-taking
+`app/tests/delivery_ack.rs::acks_flow_correctly_in_both_directions` and
+the 100-round exchange below exercise, but is not a hard guarantee: two
+messages sent in genuinely different, still-unacked-at-the-time chains
+that happen to share an `n` (e.g. both `n=0`, the single most common case
+since every fresh chain starts there) would be indistinguishable to the
+receiver of their acks, and the wrong one could be marked delivered.
+`store/src/messages.rs::mark_message_delivered_picks_the_oldest_matching_undelivered_message`
+proves the deliberate tie-break exists and behaves predictably, not that
+the underlying ambiguity is gone.
+
+**Not fixed in this pass, deliberately**: closing this properly means
+changing the wire schema (see options below), which is a bigger, more
+disruptive change than this feature's scope warranted once the ambiguity
+was understood to be rare in practice (requires two *specific*,
+still-unacknowledged chains to coincidentally share an `n`, under
+real-world turn-taking where most chains are short) and non-catastrophic
+when it does occur (worst case: a message gets marked delivered based on
+a different message's ack, which only ever affects a delivered
+*indicator* and outbox pruning — never message content, ordering, or
+loss). Recorded here as an open, known limitation rather than silently
+assumed away, per this project's standing practice.
+
+**Options considered** (for a future pass, none taken yet):
+1. **Extend `DeliveryAck` with the acknowledged envelope's `dh_pub`.**
+   Fully disambiguates — `(dh_pub, n)` together are exactly
+   `RatchetState`'s own skipped-message-key cache key
+   (`core/src/ratchet.rs`'s `SkippedEntry`), a real, already-proven-unique
+   identifier for one specific message. Requires a `MESSAGE_SCHEMA.md` §7
+   schema change (one more `bytes(32)` field) — a real but small wire
+   change, and backward-incompatible with any already-deployed client
+   (none exist yet, so no migration cost today).
+2. **Track a locally-unique, monotonic per-conversation send counter**
+   (distinct from the ratchet's own `n`) and echo *that* back in the ack
+   instead of the ratchet header's `n`. Fully disambiguates without
+   needing `dh_pub` at all, and reuses the same "in-memory monotonic
+   counter" pattern finding #26 already established for `Message::sequence`.
+   Slightly larger conceptual change: the ack would no longer literally be
+   acknowledging "ratchet position `n`" (the originally-specified
+   semantic) but "the `k`-th message I ever sent in this conversation" — a
+   deliberate schema meaning change, not just an added field.
+3. **Leave it as documented behavior, narrow the risk window instead.**
+   E.g., have a sender refuse to start a new chain (hold outgoing sends)
+   until all of the previous chain's messages are acked or a timeout
+   elapses. Rejected as the worst option: trades a rare, low-severity
+   ambiguity for real send-latency/backpressure complexity, and Double
+   Ratchet's whole design point is *not* forcing turn-taking to be
+   strictly synchronous.

@@ -38,6 +38,22 @@ pub struct Message {
     /// within the same wall-clock second, and that can only happen
     /// within one continuous run.
     pub sequence: u64,
+    /// Only meaningful when `sender_is_local` — the ratchet header `n`
+    /// (`docs/MESSAGE_SCHEMA.md` §2) this message was sent with, i.e. its
+    /// position within whatever sending chain was active at the time.
+    /// `None` for a received message (nothing sends *us* a `DeliveryAck`
+    /// to attach an `n` to) and for any locally-sent message predating
+    /// this field. Used to match an incoming `DeliveryAck.acked_n`
+    /// (`dratchet_core::payload::DeliveryAck`) back to the message it
+    /// acknowledges — see `Db::mark_message_delivered`'s doc for the
+    /// matching heuristic and its known limitation.
+    pub send_n: Option<u32>,
+    /// Only meaningful when `sender_is_local` — whether a `DeliveryAck`
+    /// for this message has been received (`ARCHITECTURE.md` §4.6).
+    /// Always `false` for a received message; not itself a signal of
+    /// anything there (a received message is definitionally already
+    /// delivered to us).
+    pub delivered: bool,
 }
 
 /// Hand-written, not `#[derive(Debug)]`: `content` is plaintext message
@@ -54,6 +70,8 @@ impl fmt::Debug for Message {
             )
             .field("timestamp", &self.timestamp)
             .field("sequence", &self.sequence)
+            .field("send_n", &self.send_n)
+            .field("delivered", &self.delivered)
             .finish()
     }
 }
@@ -100,11 +118,16 @@ impl Db {
     /// `Message::sequence`'s doc) — `save_message` (the lower-level
     /// primitive) does not do this itself, so any caller building a
     /// `Message` by hand is responsible for setting `sequence` sensibly.
+    ///
+    /// `send_n` is the ratchet header `n` this message was actually sent
+    /// with (`Some`, for a locally-sent chat message — see `Message::send_n`'s
+    /// doc) or `None` for a received message.
     pub fn save_message_now(
         &self,
         conversation_id: [u8; 16],
         content: Vec<u8>,
         sender_is_local: bool,
+        send_n: Option<u32>,
     ) -> Result<Message> {
         let message = Message {
             id: random_message_id(),
@@ -112,6 +135,8 @@ impl Db {
             content,
             timestamp: now_unix(),
             sequence: self.message_sequence.fetch_add(1, Ordering::Relaxed),
+            send_n,
+            delivered: false,
         };
         self.save_message(conversation_id, &message)?;
         Ok(message)
@@ -132,6 +157,42 @@ impl Db {
         }
         messages.sort_by_key(|m| (m.timestamp, m.sequence));
         Ok(messages)
+    }
+
+    /// Handle an incoming `DeliveryAck.acked_n` (`dratchet_core::payload::DeliveryAck`,
+    /// `ARCHITECTURE.md` §4.6): find the locally-sent, not-yet-delivered
+    /// message in `conversation_id` this ack refers to, mark it delivered,
+    /// and return it — or `Ok(None)` if nothing matches (a stale/duplicate
+    /// ack for an already-delivered message, or one naming an `n` this
+    /// side never actually sent).
+    ///
+    /// **Matching heuristic and its known limitation**: `acked_n` alone is
+    /// only unique *within one sending chain* — every Double Ratchet DH
+    /// step resets the new chain's `n` back to 0, and the wire schema
+    /// carries no `dh_pub` alongside `acked_n` to disambiguate which chain
+    /// produced it (see `DeliveryAck`'s doc). This picks the
+    /// lowest-`sequence` (oldest) matching, undelivered, locally-sent
+    /// message — correct as long as a chain's messages are acked
+    /// before the next chain's `n` values start repeating, which holds for
+    /// ordinary turn-taking but is not a hard guarantee under a
+    /// sufficiently out-of-order ack arrival. Tracked as a real, open
+    /// limitation in `docs/DELIVERY_FAILURE_FINDINGS.md`, not silently
+    /// assumed away.
+    pub fn mark_message_delivered(
+        &self,
+        conversation_id: [u8; 16],
+        acked_n: u32,
+    ) -> Result<Option<Message>> {
+        let messages = self.list_messages(conversation_id)?;
+        let Some(mut matched) = messages
+            .into_iter()
+            .find(|m| m.sender_is_local && !m.delivered && m.send_n == Some(acked_n))
+        else {
+            return Ok(None);
+        };
+        matched.delivered = true;
+        self.save_message(conversation_id, &matched)?;
+        Ok(Some(matched))
     }
 }
 
@@ -175,6 +236,8 @@ mod tests {
             content: content.as_bytes().to_vec(),
             timestamp,
             sequence,
+            send_n: None,
+            delivered: false,
         }
     }
 
@@ -253,7 +316,7 @@ mod tests {
 
         let texts = ["alpha", "beta", "gamma", "delta"];
         for text in texts {
-            db.save_message_now(conv, text.as_bytes().to_vec(), true)
+            db.save_message_now(conv, text.as_bytes().to_vec(), true, None)
                 .unwrap();
         }
 
@@ -312,5 +375,68 @@ mod tests {
     fn empty_conversation_returns_no_messages_not_an_error() {
         let db = temp_db();
         assert!(db.list_messages([9u8; 16]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn mark_message_delivered_flips_the_matching_sent_message() {
+        let db = temp_db();
+        let conv = [1u8; 16];
+
+        let sent = db
+            .save_message_now(conv, b"hi".to_vec(), true, Some(7))
+            .unwrap();
+        assert!(!sent.delivered);
+
+        let updated = db.mark_message_delivered(conv, 7).unwrap().unwrap();
+        assert_eq!(updated.id, sent.id);
+        assert!(updated.delivered);
+
+        let reloaded = db.list_messages(conv).unwrap();
+        assert_eq!(reloaded.len(), 1);
+        assert!(reloaded[0].delivered);
+    }
+
+    #[test]
+    fn mark_message_delivered_ignores_received_messages_and_wrong_n() {
+        let db = temp_db();
+        let conv = [1u8; 16];
+
+        // A received message with the same send_n-shaped value would never
+        // actually have send_n set, but prove it explicitly: sender_is_local
+        // must be true to match at all.
+        db.save_message_now(conv, b"incoming".to_vec(), false, None)
+            .unwrap();
+        db.save_message_now(conv, b"outgoing".to_vec(), true, Some(3))
+            .unwrap();
+
+        assert!(db.mark_message_delivered(conv, 3).unwrap().is_some());
+        // Already delivered — a duplicate/stale ack for the same n finds nothing left.
+        assert!(db.mark_message_delivered(conv, 3).unwrap().is_none());
+        // Never sent at all.
+        assert!(db.mark_message_delivered(conv, 99).unwrap().is_none());
+    }
+
+    #[test]
+    fn mark_message_delivered_picks_the_oldest_matching_undelivered_message() {
+        // Documents the known cross-chain-collision limitation: two
+        // messages from *different* sending chains can share the same
+        // send_n (every DH ratchet step resets n back to 0). This proves
+        // the deliberate tie-break — oldest (lowest sequence) first —
+        // rather than leaving the choice unspecified.
+        let db = temp_db();
+        let conv = [1u8; 16];
+
+        let first = db
+            .save_message_now(conv, b"first chain, n=0".to_vec(), true, Some(0))
+            .unwrap();
+        let _second = db
+            .save_message_now(conv, b"second chain, also n=0".to_vec(), true, Some(0))
+            .unwrap();
+
+        let updated = db.mark_message_delivered(conv, 0).unwrap().unwrap();
+        assert_eq!(
+            updated.id, first.id,
+            "the oldest undelivered match must be the one flipped"
+        );
     }
 }

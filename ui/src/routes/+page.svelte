@@ -19,6 +19,7 @@
     sender_is_local: boolean;
     content: string;
     timestamp: number;
+    delivered: boolean;
   };
 
   type OwnProfileDto = {
@@ -625,6 +626,11 @@
         {#each messages as message (message.id)}
           <div class="bubble" class:local={message.sender_is_local}>
             {message.content}
+            {#if message.sender_is_local}
+              <span class="delivery-status" class:delivered={message.delivered}>
+                {message.delivered ? "✓✓" : "✓"}
+              </span>
+            {/if}
           </div>
         {/each}
       </div>
@@ -1251,6 +1257,18 @@
     background: var(--teal-dim);
     color: var(--ink);
     align-self: flex-end;
+  }
+
+  .delivery-status {
+    margin-left: 6px;
+    font-size: 11px;
+    opacity: 0.5;
+    letter-spacing: -1px;
+  }
+
+  .delivery-status.delivered {
+    opacity: 0.85;
+    color: var(--teal);
   }
 
   .composer {

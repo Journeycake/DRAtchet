@@ -97,6 +97,7 @@ mod tests {
             entry_id: [1u8; 16],
             envelope: vec![1, 2, 3],
             expires_at: SystemTime::now() + expires_in,
+            written_by: [0u8; 32],
         }
     }
 
@@ -106,6 +107,7 @@ mod tests {
             envelope: vec![4, 5, 6],
             // Already in the past.
             expires_at: SystemTime::now() - Duration::from_secs(1),
+            written_by: [0u8; 32],
         }
     }
 
