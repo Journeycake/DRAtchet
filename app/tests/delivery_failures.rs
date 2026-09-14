@@ -14,7 +14,7 @@ use dratchet_app::{
 };
 use dratchet_client::net::Connection;
 use dratchet_core::account::Account;
-use dratchet_core::payload::PAYLOAD_CHAT;
+use dratchet_core::payload::{ChatContent, PAYLOAD_CHAT};
 use dratchet_core::prekey::{OneTimePrekeyPublic, PrekeyBundle, SignedPrekeyPublic};
 use dratchet_core::ratchet::{RatchetState, DEFAULT_MAX_SKIP};
 use dratchet_core::x3dh::{self, bootstrap_mailbox_id};
@@ -211,9 +211,12 @@ async fn scenario_22_retrying_from_unsaved_ratchet_state_reuses_the_same_chain_p
     // encrypting, and — because the (simulated) network failed before an
     // Ack arrived — deliberately *not* saving it back.
     let mut attempt_1 = db.load_ratchet(conv_id).unwrap().unwrap();
-    let envelope_1 = attempt_1
-        .encrypt_payload(PAYLOAD_CHAT, b"are you free tonight?")
-        .unwrap();
+    let content_1 = ChatContent {
+        text: b"are you free tonight?".to_vec(),
+        piggyback_ack: None,
+    }
+    .encode();
+    let envelope_1 = attempt_1.encrypt_payload(PAYLOAD_CHAT, &content_1).unwrap();
 
     // "Attempt 2": the user retries. Because attempt 1 was never
     // persisted, this loads the *same* starting state — and, realistically,
@@ -221,9 +224,12 @@ async fn scenario_22_retrying_from_unsaved_ratchet_state_reuses_the_same_chain_p
     // the draft, or a second queued message went out around the same
     // time) — a different plaintext, to make the point sharply.
     let mut attempt_2 = db.load_ratchet(conv_id).unwrap().unwrap();
-    let envelope_2 = attempt_2
-        .encrypt_payload(PAYLOAD_CHAT, b"never mind, it can wait")
-        .unwrap();
+    let content_2 = ChatContent {
+        text: b"never mind, it can wait".to_vec(),
+        piggyback_ack: None,
+    }
+    .encode();
+    let envelope_2 = attempt_2.encrypt_payload(PAYLOAD_CHAT, &content_2).unwrap();
 
     assert_eq!(
         envelope_1.dh_pub, envelope_2.dh_pub,
@@ -380,9 +386,12 @@ async fn scenario_14_a_crash_before_save_ratchet_does_not_lose_already_processed
     // in-memory for this test since only Alice's persistence is at issue).
     let plaintexts = ["message one", "message two", "message three"];
     for text in &plaintexts {
-        let envelope = bob_ratchet
-            .encrypt_payload(PAYLOAD_CHAT, text.as_bytes())
-            .unwrap();
+        let content = ChatContent {
+            text: text.as_bytes().to_vec(),
+            piggyback_ack: None,
+        }
+        .encode();
+        let envelope = bob_ratchet.encrypt_payload(PAYLOAD_CHAT, &content).unwrap();
         bob_conn
             .send(
                 FrameTag::MailboxWrite,
@@ -421,8 +430,9 @@ async fn scenario_14_a_crash_before_save_ratchet_does_not_lose_already_processed
         let envelope = dratchet_core::envelope::Envelope::decode(&entry.envelope).unwrap();
         let (payload_type, content) = in_memory_ratchet.decrypt_payload(&envelope).unwrap();
         assert_eq!(payload_type, PAYLOAD_CHAT);
+        let chat = ChatContent::decode(&content).unwrap();
         db_alice
-            .save_message_now(conv_id, content, false, None, None)
+            .save_message_now(conv_id, chat.text, false, None, None)
             .unwrap();
         alice_conn
             .send(
@@ -474,8 +484,13 @@ async fn scenario_14_a_crash_before_save_ratchet_does_not_lose_already_processed
     // what comes next.
 
     // Bob sends a 4th, real message.
+    let content_4 = ChatContent {
+        text: b"message four".to_vec(),
+        piggyback_ack: None,
+    }
+    .encode();
     let envelope_4 = bob_ratchet
-        .encrypt_payload(PAYLOAD_CHAT, b"message four")
+        .encrypt_payload(PAYLOAD_CHAT, &content_4)
         .unwrap();
     bob_conn
         .send(

@@ -20,6 +20,7 @@
     content: string;
     timestamp: number;
     delivered: boolean;
+    uncertain: boolean;
   };
 
   type OwnProfileDto = {
@@ -627,8 +628,15 @@
           <div class="bubble" class:local={message.sender_is_local}>
             {message.content}
             {#if message.sender_is_local}
-              <span class="delivery-status" class:delivered={message.delivered}>
-                {message.delivered ? "✓✓" : "✓"}
+              <span
+                class="delivery-status"
+                class:delivered={message.delivered}
+                class:uncertain={message.uncertain}
+                title={message.uncertain
+                  ? "Delivery uncertain — a connection interruption was detected after sending; this will resolve automatically once the conversation continues"
+                  : undefined}
+              >
+                {message.uncertain ? "?" : message.delivered ? "✓✓" : "✓"}
               </span>
             {/if}
           </div>
@@ -1269,6 +1277,13 @@
   .delivery-status.delivered {
     opacity: 0.85;
     color: var(--teal);
+  }
+
+  .delivery-status.uncertain {
+    opacity: 0.9;
+    color: var(--amber);
+    font-weight: 600;
+    letter-spacing: 0;
   }
 
   .composer {

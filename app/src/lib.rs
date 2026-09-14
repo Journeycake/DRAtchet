@@ -35,8 +35,8 @@ use dratchet_core::envelope::Envelope;
 use dratchet_core::first_contact::FirstContactWire;
 use dratchet_core::identity::fingerprint_of_public_key;
 use dratchet_core::payload::{
-    ConversationWipePolicyAnnounce, DeliveryAck, FirstContactContent, ProfileAnnounce,
-    RoutingIdAnnounce, PAYLOAD_CHAT, PAYLOAD_CONVERSATION_WIPE_POLICY_ANNOUNCE,
+    ChatContent, ConversationWipePolicyAnnounce, DeliveryAck, FirstContactContent, PiggybackAck,
+    ProfileAnnounce, RoutingIdAnnounce, PAYLOAD_CHAT, PAYLOAD_CONVERSATION_WIPE_POLICY_ANNOUNCE,
     PAYLOAD_CONVERSATION_WIPE_REQUEST, PAYLOAD_DELIVERY_ACK, PAYLOAD_FIRST_CONTACT,
     PAYLOAD_PROFILE_ANNOUNCE, PAYLOAD_ROUTING_ID_ANNOUNCE,
 };
@@ -75,6 +75,29 @@ pub fn list_contacts(db: &Db) -> Result<Vec<Contact>> {
 pub fn list_messages(db: &Db, account: &Account, contact: &Contact) -> Result<Vec<Message>> {
     let conv_id = conversation_id_for(account, contact);
     Ok(db.list_messages(conv_id)?)
+}
+
+/// Marks every currently undelivered, locally-sent message across every
+/// conversation as `uncertain` (`dratchet_store::Message::uncertain`'s
+/// doc) — called once right after this device detects and recovers from
+/// a connection interruption (the Tauri poll loop's reconnect-succeeded
+/// path), since any send attempted during that gap has genuine reason to
+/// be in doubt: it may never have reached the relay at all, as opposed to
+/// simply "sent, ack not back yet." Ordinary continued chat in each
+/// affected conversation resolves this without any further action here —
+/// `send_message`'s piggybacked `PiggybackAck` on the next outgoing
+/// message, or the peer's own next message's piggyback the other
+/// direction, either confirms delivery (clearing `uncertain`) or the
+/// conversation simply continues with the sender aware some prior sends
+/// are unconfirmed. Returns how many messages were newly marked, summed
+/// across every conversation.
+pub fn mark_pending_sends_uncertain(db: &Db, account: &Account) -> Result<usize> {
+    let mut total = 0;
+    for contact in db.list_contacts()? {
+        let conv_id = conversation_id_for(account, &contact);
+        total += db.mark_undelivered_uncertain(conv_id)?;
+    }
+    Ok(total)
 }
 
 fn conversation_id_for(account: &Account, contact: &Contact) -> [u8; 16] {
@@ -720,7 +743,21 @@ pub async fn send_message(
     let conv_id = conversation_id_for(account, contact);
     let mut ratchet = db.load_ratchet(conv_id)?.ok_or(Error::NoSession)?;
 
-    let envelope = encrypt_gated(&mut ratchet, contact, PAYLOAD_CHAT, content)?;
+    // TCP-style cumulative piggyback ack (`ARCHITECTURE.md` §4.6): ride
+    // "everything I've received on your current chain so far" along on
+    // this ordinary chat send, supplementary to the dedicated
+    // `DeliveryAck` `receive_pending` already sends. `None` if nothing's
+    // been received on the current receiving chain yet (most commonly,
+    // this is the first message this side has ever sent).
+    let piggyback_ack = ratchet
+        .receiving_progress()
+        .map(|(dh_pub, highest_n)| PiggybackAck { dh_pub, highest_n });
+    let chat = ChatContent {
+        text: content.to_vec(),
+        piggyback_ack,
+    };
+
+    let envelope = encrypt_gated(&mut ratchet, contact, PAYLOAD_CHAT, &chat.encode())?;
     let send_n = envelope.n;
     let send_dh_pub = envelope.dh_pub.to_vec();
 
@@ -845,9 +882,10 @@ pub async fn receive_pending(
 
         match apply_entry(db, &mut ratchet, contact, conv_id, &entry.envelope) {
             Ok(EntryEffect::None) => {}
-            Ok(EntryEffect::Message(message, dh_pub, acked_n)) => {
+            Ok(EntryEffect::Message(message, dh_pub, acked_n, piggyback_delivered)) => {
                 ack_after_delete = Some((dh_pub, acked_n));
                 received.push(message);
+                delivered.extend(piggyback_delivered);
             }
             Ok(EntryEffect::Delivered(message)) => delivered.push(message),
             Ok(EntryEffect::WipeActivity { session_wiped: sw }) => {
@@ -940,10 +978,14 @@ pub async fn receive_pending(
 /// to skip just this entry or abort the whole batch.
 enum EntryEffect {
     None,
-    /// A released chat message, plus the ratchet header `dh_pub`/`n` it
-    /// arrived with — `receive_pending` needs those after this entry's
-    /// `MailboxDelete` succeeds, to send back its `DeliveryAck`.
-    Message(Message, Vec<u8>, u32),
+    /// A released chat message, the ratchet header `dh_pub`/`n` it
+    /// arrived with (`receive_pending` needs those after this entry's
+    /// `MailboxDelete` succeeds, to send back its `DeliveryAck`), and any
+    /// of our own previously-sent messages this entry's `PiggybackAck`
+    /// newly confirmed delivered (`Db::mark_messages_delivered_up_to`) —
+    /// usually empty, non-empty whenever the sender's chat message
+    /// carried a cumulative ack.
+    Message(Message, Vec<u8>, u32, Vec<Message>),
     /// An incoming `DeliveryAck` matched one of our own previously-sent
     /// messages (`Db::mark_message_delivered`) — the now-delivered
     /// message, for a caller to react to (e.g. a UI checkmark).
@@ -986,11 +1028,25 @@ fn apply_entry(
             db.record_peer_routing_id(&contact.fingerprint, announce.routing_id)?;
             Ok(EntryEffect::None)
         }
-        Ok((PAYLOAD_CHAT, content)) => Ok(EntryEffect::Message(
-            db.save_message_now(conv_id, content, false, None, None)?,
-            envelope.dh_pub.to_vec(),
-            envelope.n,
-        )),
+        Ok((PAYLOAD_CHAT, content)) => {
+            let chat = ChatContent::decode(&content)?;
+            // Cumulative piggyback ack, if the sender had anything to
+            // report yet — resolves any of our own messages this client
+            // may have marked `uncertain` (`Message::uncertain`'s doc)
+            // even if their dedicated `DeliveryAck` never arrived.
+            let piggyback_delivered = match &chat.piggyback_ack {
+                Some(ack) => {
+                    db.mark_messages_delivered_up_to(conv_id, &ack.dh_pub, ack.highest_n)?
+                }
+                None => Vec::new(),
+            };
+            Ok(EntryEffect::Message(
+                db.save_message_now(conv_id, chat.text, false, None, None)?,
+                envelope.dh_pub.to_vec(),
+                envelope.n,
+                piggyback_delivered,
+            ))
+        }
         Ok((PAYLOAD_DELIVERY_ACK, content)) => {
             let ack = DeliveryAck::decode(&content)?;
             if ack.conversation_id != conv_id {

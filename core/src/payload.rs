@@ -187,6 +187,53 @@ impl FirstContactContent {
     }
 }
 
+/// A TCP-style cumulative "next expected sequence" ack, piggybacked on
+/// an ordinary outgoing chat message (`ChatContent::piggyback_ack`) —
+/// supplementary and redundant to the dedicated per-message
+/// `DeliveryAck` below, not a replacement for it. Where `DeliveryAck`
+/// names one exact message, this names "everything up to and including
+/// `highest_n` on chain `dh_pub`" — so if a dedicated `DeliveryAck` for
+/// an earlier message was itself lost (e.g. the connection dropped
+/// between decrypting that message and sending its ack), the next
+/// ordinary chat message in the same direction re-asserts coverage for
+/// it, the same way a TCP segment's ack field covers everything received
+/// so far even if an earlier discrete ACK segment never arrived. See
+/// `Db::mark_messages_delivered_up_to` for how a receiver applies this.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PiggybackAck {
+    #[serde(with = "serde_bytes")]
+    pub dh_pub: Vec<u8>,
+    pub highest_n: u32,
+}
+
+/// `PAYLOAD_CHAT`'s content. `text` is exactly what earlier versions of
+/// this protocol sent as the payload's entire (unwrapped) content —
+/// wrapped in a small CBOR struct now so an ordinary chat message can
+/// also carry `piggyback_ack` alongside it, without a second payload
+/// type or a second envelope. `piggyback_ack` is `None` whenever the
+/// sender's ratchet has nothing yet received on its current chain
+/// (`RatchetState::receiving_progress`) — most commonly, the very first
+/// message either side ever sends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatContent {
+    #[serde(with = "serde_bytes")]
+    pub text: Vec<u8>,
+    pub piggyback_ack: Option<PiggybackAck>,
+}
+
+impl ChatContent {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        ciborium::into_writer(self, &mut bytes)
+            .expect("CBOR encoding of a well-formed struct cannot fail");
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        ciborium::from_reader(bytes).map_err(|_| Error::MalformedPayload("not a valid ChatContent"))
+    }
+}
+
 /// `PAYLOAD_DELIVERY_ACK`'s content — `MESSAGE_SCHEMA.md` §7,
 /// `ARCHITECTURE.md` §4.6. Sent by a recipient the moment a ratchet
 /// envelope **decrypts successfully** (not on mere receipt — a
@@ -430,5 +477,34 @@ mod tests {
     #[test]
     fn delivery_ack_garbage_bytes_are_rejected_not_panicking() {
         assert!(DeliveryAck::decode(&[0xFF, 0x00, 0x01]).is_err());
+    }
+
+    #[test]
+    fn chat_content_round_trips_with_and_without_a_piggyback_ack() {
+        for piggyback_ack in [
+            None,
+            Some(PiggybackAck {
+                dh_pub: vec![3u8; 32],
+                highest_n: 7,
+            }),
+        ] {
+            let chat = ChatContent {
+                text: b"hi bob".to_vec(),
+                piggyback_ack,
+            };
+            let encoded = chat.encode();
+            let decoded = ChatContent::decode(&encoded).unwrap();
+            assert_eq!(decoded, chat);
+
+            let padded = tag_and_pad(PAYLOAD_CHAT, &encoded).unwrap();
+            let (ty, content) = untag_and_unpad(&padded).unwrap();
+            assert_eq!(ty, PAYLOAD_CHAT);
+            assert_eq!(ChatContent::decode(&content).unwrap(), chat);
+        }
+    }
+
+    #[test]
+    fn chat_content_garbage_bytes_are_rejected_not_panicking() {
+        assert!(ChatContent::decode(&[0xFF, 0x00, 0x01]).is_err());
     }
 }

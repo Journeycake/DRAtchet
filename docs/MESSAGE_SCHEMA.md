@@ -75,7 +75,9 @@ as a known gap in `ARCHITECTURE.md` §8 and as an open decision (header
 encryption) in `ARCHITECTURE.md` §10, rather than solved here.
 
 **Payload type:** the plaintext (before padding, inside what becomes
-`ciphertext`) starts with a 1-byte `payload_type` tag: `0 = chat message`,
+`ciphertext`) starts with a 1-byte `payload_type` tag: `0 = chat message`
+(content is CBOR-encoded `ChatContent` — §7a — not raw bytes, since Phase
+1.5's piggyback ack needs somewhere to ride alongside the text),
 `1 = DeliveryAck` (§7), `2 = RecoveryProfileAnnounce` (§8),
 `3 = RoutingIdAnnounce` (§7), `4 = ConversationWipePolicyAnnounce` (§10),
 `5 = ConversationWipeRequest` (§10), `6 = FirstContactContent` (§3 — the
@@ -280,6 +282,52 @@ specifically to close it — `(dh_pub, n)` together are a genuinely unique
 identifier for one message, the same pair `RatchetState`'s own
 skipped-message-key cache already keys by, so `Db::mark_message_delivered`
 now matches exactly rather than guessing.
+
+## 7a. Chat content and the piggyback delivery ack (CBOR)
+
+| Field | Type | Notes |
+|---|---|---|
+| `text` (`ChatContent`) | bytes | the actual message content — previously the entire `payload_type = 0` content; now wrapped, see below |
+| `piggyback_ack` (`ChatContent`) | optional `PiggybackAck` | present whenever the sender has received at least one message on the current chain from this conversation's peer (`RatchetState::receiving_progress`); absent otherwise (e.g. the very first message of a conversation, before anything has been received back) |
+| `dh_pub` (`PiggybackAck`) | bytes (32) | identifies which of the peer's sending chains `highest_n` is a position within — same reasoning as `DeliveryAck.dh_pub` above |
+| `highest_n` (`PiggybackAck`) | uint32 | cumulative: "I have successfully decrypted every message from `n = 0` through `n = highest_n`, inclusive, on this chain" — not a single message index |
+
+`payload_type = 0` (chat message, §2) is `ChatContent`, CBOR-encoded, not
+raw text — the wrapping this table describes. This is what lets a
+`piggyback_ack` ride inside the *same* encrypted envelope as an ordinary
+outgoing chat message, rather than as a second, separate envelope: every
+chat message a client sends doubles as a TCP-style cumulative ack of
+everything it has received so far, the same way a TCP segment's `ACK` field
+piggybacks on outgoing data instead of requiring a dedicated ack packet.
+
+**Why cumulative, and why in addition to `DeliveryAck` rather than instead
+of it:** `DeliveryAck` (§7) names one exact message and is sent once, right
+after that message is decrypted — if the sender's connection drops before
+that ack arrives (or the recipient crashes before sending it), the message
+silently reads as never delivered, even though it genuinely was received.
+`PiggybackAck` closes that gap without adding a new round trip: it costs
+nothing beyond what the recipient was already about to send (an ordinary
+reply), and being cumulative means it doesn't matter which specific
+`DeliveryAck`s were lost — any later message on the conversation resolves
+every earlier uncertain send on that chain in one shot, the same way a
+single TCP ack covering "next expected sequence" implicitly acknowledges
+every earlier byte. The two mechanisms are supplementary: `DeliveryAck`
+gives the fastest possible per-message confirmation when nothing is lost;
+`PiggybackAck` is the backstop that only matters when something was.
+
+**The "uncertain" delivery state (`dratchet_app`, `store::messages`):** a
+sent `Message` gains a `delivered: bool` (existing, set by either ack path)
+and a new `uncertain: bool`. `uncertain` is set when the client detects a
+connection interruption after a send but before that send's `delivered`
+flag has been confirmed either way (`mark_pending_sends_uncertain`, called
+from the Tauri poll loop's reconnect-succeeded path) — it is the UI-visible
+signal that a message's fate is presently unknown, distinct from "sent,
+awaiting the first ack" and from "confirmed delivered." It clears the
+moment `delivered` flips true via either `DeliveryAck` or a `PiggybackAck`
+covering that message's `(dh_pub, n)` (`Db::mark_messages_delivered_up_to`
+also clears `uncertain` on every message it marks delivered) — there is no
+separate manual dismissal, since resolution is exactly what both ack paths
+already exist to do.
 
 ## 8. Recovery profile negotiation (CBOR) — §7.2/§7.3/§7.5 of `ARCHITECTURE.md`
 

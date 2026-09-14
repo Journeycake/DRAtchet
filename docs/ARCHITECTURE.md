@@ -535,6 +535,49 @@ schema message, `DeliveryAck` (§7 of `MESSAGE_SCHEMA.md`), closes this loop:
   not-yet-collected message. See §11.1's own note and
   `docs/DELIVERY_FAILURE_FINDINGS.md` finding #27.
 
+#### 4.6a "Uncertain" delivery and the piggyback ack — **v1, implemented**
+
+`DeliveryAck` alone has a real gap, found and precisely quantified during
+this feature's own controlled server-crash fault-injection testing: a
+message can be genuinely decrypted by the recipient, but the crash window
+between "decrypted" and "`DeliveryAck` sent" (or the ack itself being lost
+in transit, or the relay's in-memory-only mailbox — §11.1 — losing it
+before the sender ever fetches it) leaves the sender's copy permanently
+reading as undelivered, with no way to tell "genuinely lost" apart from
+"still in flight." Two additions close this, modeled on TCP's cumulative
+ack behavior rather than adding a second round trip:
+
+- **`uncertain` (`store::messages::Message::uncertain`)**: set on every
+  outstanding (not yet `delivered`) sent message the moment the client
+  detects a connection interruption — `mark_pending_sends_uncertain`,
+  called from the Tauri poll loop's reconnect-succeeded path, the same
+  moment a client already knows something disrupted its session. This is a
+  local, sender-side signal only (nothing is sent over the wire to set it)
+  — it means "this message's fate is presently unknown," distinct in the
+  UI from the existing sent/delivered checkmarks.
+- **Piggyback ack (`core::payload::ChatContent::piggyback_ack`,
+  `MESSAGE_SCHEMA.md` §7a)**: every ordinary outgoing chat message now
+  optionally carries a *cumulative* ack — "I have decrypted everything up
+  through `n = highest_n` on your current sending chain" — computed from
+  `RatchetState::receiving_progress()` and riding inside the same encrypted
+  envelope as the chat text, not a separate message. Because it's
+  cumulative, a client doesn't need to remember which individual
+  `DeliveryAck`s it already sent or whether they arrived; any later message
+  on the conversation resolves every earlier uncertain send in one shot.
+  `Db::mark_messages_delivered_up_to` applies it, setting `delivered = true`
+  and clearing `uncertain` on every matching message.
+
+The two ack paths are supplementary, not a replacement of one by the
+other: `DeliveryAck` gives the fastest per-message confirmation in the
+common case; the piggyback ack is the backstop that resolves an `uncertain`
+message via ordinary continued conversation even when its dedicated ack
+never arrived. A conversation that goes permanently quiet after an
+`uncertain` send still has no way to resolve it — this is an accepted,
+documented limitation of a design that deliberately avoids adding
+keepalive/heartbeat traffic; it's the same class of gap §4.5's outbox
+retention already documents ("permanently undelivered … a chronically
+flaky connection, or a recipient who never comes back").
+
 ## 5. Client / platform architecture
 
 **Decided:** one stack, one codebase, for all three target platforms —

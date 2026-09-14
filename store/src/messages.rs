@@ -62,11 +62,24 @@ pub struct Message {
     #[serde(with = "serde_bytes")]
     pub send_dh_pub: Option<Vec<u8>>,
     /// Only meaningful when `sender_is_local` — whether a `DeliveryAck`
-    /// for this message has been received (`ARCHITECTURE.md` §4.6).
-    /// Always `false` for a received message; not itself a signal of
-    /// anything there (a received message is definitionally already
-    /// delivered to us).
+    /// or a cumulative `PiggybackAck` for this message has been received
+    /// (`ARCHITECTURE.md` §4.6). Always `false` for a received message;
+    /// not itself a signal of anything there (a received message is
+    /// definitionally already delivered to us).
     pub delivered: bool,
+    /// Only meaningful when `sender_is_local && !delivered` — set when
+    /// this client detected a connection interruption after sending this
+    /// message and before either acknowledgment path confirmed it, so
+    /// there's genuine reason to doubt whether it ever reached the relay
+    /// at all (as opposed to simply "sent, ack not back yet," the normal
+    /// transient state every message passes through). Cleared back to
+    /// `false` the moment `delivered` flips `true`, by either
+    /// `mark_message_delivered` or `mark_messages_delivered_up_to`.
+    /// `#[serde(default)]` so a message record written before this field
+    /// existed decodes as `false` (never uncertain) rather than failing
+    /// to decode at all.
+    #[serde(default)]
+    pub uncertain: bool,
 }
 
 /// Hand-written, not `#[derive(Debug)]`: `content` is plaintext message
@@ -86,6 +99,7 @@ impl fmt::Debug for Message {
             .field("send_n", &self.send_n)
             .field("send_dh_pub", &self.send_dh_pub.as_deref().map(hex))
             .field("delivered", &self.delivered)
+            .field("uncertain", &self.uncertain)
             .finish()
     }
 }
@@ -154,6 +168,7 @@ impl Db {
             send_n,
             send_dh_pub,
             delivered: false,
+            uncertain: false,
         };
         self.save_message(conversation_id, &message)?;
         Ok(message)
@@ -208,8 +223,73 @@ impl Db {
             return Ok(None);
         };
         matched.delivered = true;
+        matched.uncertain = false;
         self.save_message(conversation_id, &matched)?;
         Ok(Some(matched))
+    }
+
+    /// Handle an incoming `PiggybackAck` (`dratchet_core::payload::
+    /// PiggybackAck`, carried on an ordinary chat message's
+    /// `ChatContent::piggyback_ack`): mark every locally-sent,
+    /// not-yet-delivered message on chain `dh_pub` with `send_n <=
+    /// highest_n` as delivered — cumulative, not a single exact match
+    /// like `mark_message_delivered`, the same "everything up through
+    /// this point" semantics as a TCP cumulative ack. This is what lets
+    /// an ordinary follow-up chat message resolve a message this client
+    /// had marked `uncertain` (`Message::uncertain`'s doc) even though no
+    /// dedicated `DeliveryAck` for it ever arrived — the peer's next
+    /// message re-asserts coverage for everything it has actually
+    /// received on this chain so far, so one lost dedicated ack doesn't
+    /// leave the sender guessing forever as long as the conversation
+    /// continues.
+    ///
+    /// Returns every message this call newly marked delivered, oldest
+    /// first, for a caller to react to (e.g. UI checkmarks) — mirrors
+    /// `mark_message_delivered`'s single-`Message` return, just
+    /// potentially more than one at a time.
+    pub fn mark_messages_delivered_up_to(
+        &self,
+        conversation_id: [u8; 16],
+        dh_pub: &[u8],
+        highest_n: u32,
+    ) -> Result<Vec<Message>> {
+        let messages = self.list_messages(conversation_id)?;
+        let mut newly_delivered = Vec::new();
+        for mut m in messages.into_iter().filter(|m| {
+            m.sender_is_local
+                && !m.delivered
+                && m.send_dh_pub.as_deref() == Some(dh_pub)
+                && m.send_n.is_some_and(|n| n <= highest_n)
+        }) {
+            m.delivered = true;
+            m.uncertain = false;
+            self.save_message(conversation_id, &m)?;
+            newly_delivered.push(m);
+        }
+        newly_delivered.sort_by_key(|m| (m.timestamp, m.sequence));
+        Ok(newly_delivered)
+    }
+
+    /// Mark every currently undelivered, locally-sent message in
+    /// `conversation_id` as `uncertain` (`Message::uncertain`'s doc) —
+    /// called once per conversation right after this client detects and
+    /// recovers from a connection interruption, since any of those sends
+    /// might have never actually reached the relay. Returns how many
+    /// messages were newly marked (already-uncertain or already-delivered
+    /// messages are left untouched, so calling this repeatedly across
+    /// several short reconnects in a row is harmless).
+    pub fn mark_undelivered_uncertain(&self, conversation_id: [u8; 16]) -> Result<usize> {
+        let messages = self.list_messages(conversation_id)?;
+        let mut count = 0;
+        for mut m in messages
+            .into_iter()
+            .filter(|m| m.sender_is_local && !m.delivered && !m.uncertain)
+        {
+            m.uncertain = true;
+            self.save_message(conversation_id, &m)?;
+            count += 1;
+        }
+        Ok(count)
     }
 }
 
@@ -256,6 +336,7 @@ mod tests {
             send_n: None,
             send_dh_pub: None,
             delivered: false,
+            uncertain: false,
         }
     }
 

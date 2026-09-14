@@ -210,6 +210,7 @@ mod tests {
             send_n: None,
             send_dh_pub: None,
             delivered: false,
+            uncertain: false,
         }
     }
 

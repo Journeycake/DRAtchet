@@ -120,6 +120,14 @@ struct MessageDto {
     /// has come back for this message yet (`ARCHITECTURE.md` §4.6). Always
     /// `false` for a received message.
     delivered: bool,
+    /// Only meaningful when `sender_is_local && !delivered` — this client
+    /// detected a connection interruption after sending this message and
+    /// before either acknowledgment path confirmed it, so there's genuine
+    /// reason to doubt whether it ever reached the relay
+    /// (`dratchet_store::Message::uncertain`'s doc). The frontend shows a
+    /// distinct indicator for this rather than the ordinary "sent,
+    /// awaiting ack" state.
+    uncertain: bool,
 }
 
 /// This device's own directory-facing profile (`dratchet_store::OwnProfile`),
@@ -191,6 +199,7 @@ fn to_message_dto(message: &dratchet_store::Message) -> MessageDto {
         content: String::from_utf8_lossy(&message.content).into_owned(),
         timestamp: message.timestamp,
         delivered: message.delivered,
+        uncertain: message.uncertain,
     }
 }
 
@@ -603,6 +612,7 @@ async fn poll_loop(app_handle: AppHandle) {
         tick_count = tick_count.wrapping_add(1);
         let state = app_handle.state::<AppState>();
 
+        let mut changed = false;
         if let Some(due) = next_reconnect_attempt {
             if std::time::Instant::now() < due {
                 continue;
@@ -612,6 +622,16 @@ async fn poll_loop(app_handle: AppHandle) {
                 Ok((new_conn, notice)) => {
                     eprintln!("poll: reconnected to {SERVER_URL}");
                     *state.conn.lock().await = new_conn;
+                    // Anything sent during the outage has genuine reason
+                    // to be in doubt — see `mark_pending_sends_uncertain`'s
+                    // doc. Best-effort: a failure here shouldn't block
+                    // the reconnect itself from completing.
+                    if let Err(e) = dratchet_app::mark_pending_sends_uncertain(&state.db, &account)
+                    {
+                        eprintln!("poll: mark_pending_sends_uncertain failed: {e}");
+                    } else {
+                        changed = true;
+                    }
                     if let Some(notice) = notice {
                         *state
                             .own_discriminator_change_notice
@@ -632,7 +652,6 @@ async fn poll_loop(app_handle: AppHandle) {
             }
         }
 
-        let mut changed = false;
         let mut connection_died = false;
         {
             let mut conn = state.conn.lock().await;

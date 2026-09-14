@@ -354,6 +354,29 @@ impl RatchetState {
         self.skipped.len()
     }
 
+    /// The current receiving chain's identity (`dh_pub`) and the highest
+    /// message index successfully decrypted on it so far — used to build
+    /// a TCP-style cumulative "next expected sequence" ack piggybacked on
+    /// outgoing chat messages (`dratchet_core::payload::ChatContent`'s
+    /// `piggyback_ack`), on top of the existing dedicated per-message
+    /// `DeliveryAck`. `None` until at least one message has actually been
+    /// decrypted on the current chain — `dh_remote`/`recv_n` are both
+    /// already meaningful immediately after `init_as_initiator`/
+    /// `init_as_responder` (needed to decrypt the *first* message), but
+    /// `recv_n == 0` at that point means "nothing received yet on this
+    /// chain," not "message 0 was received," so it must not be reported
+    /// as an ack. Deliberately scoped to only the *current* chain, not
+    /// every historical one this ratchet has ever stepped through — the
+    /// same "next expected in the current stream" scope TCP's cumulative
+    /// ack has, not a full historical ledger.
+    pub fn receiving_progress(&self) -> Option<(Vec<u8>, u32)> {
+        if self.recv_n == 0 {
+            return None;
+        }
+        let dh_remote = self.dh_remote?;
+        Some((dh_remote.to_bytes().to_vec(), self.recv_n - 1))
+    }
+
     /// Serialize this ratchet's full live state to bytes — CBOR-encoded,
     /// covering every field (root key, both chain keys, the DH keypair, and
     /// the skipped-message-key cache). **Not an at-rest-safe format on its
