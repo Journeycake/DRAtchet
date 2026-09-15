@@ -303,7 +303,10 @@ async fn main() {
         .expect("mark bob's contact verified");
 
     // --- The boundary-scoped wipe scenario itself. ---
-    for text in [&b"pre-announce message 1"[..], &b"pre-announce message 2"[..]] {
+    for text in [
+        &b"pre-announce message 1"[..],
+        &b"pre-announce message 2"[..],
+    ] {
         send_message(&db_bob, &mut bob_conn, &bob, &bob_contact, text)
             .await
             .expect("bob send pre-announce message");
