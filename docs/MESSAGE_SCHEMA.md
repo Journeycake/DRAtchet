@@ -417,11 +417,31 @@ a *general* remote-wipe capability was deliberately never built).
 the *content* of a ratchet envelope's plaintext, tagged with
 `payload_type = 4` (§2) — sent at session establishment and again any
 time the announcing side's preferences for that conversation change,
-exactly like `RecoveryProfileAnnounce` (§8). `ConversationWipeRequest`
-carries no fields at all — empty content, tagged `payload_type = 5` — the
-conversation is already identified by which ratchet/mailbox it arrived
-on. Both are ungated by `ARCHITECTURE.md` §6.5's mandatory-verification
-rule, like `RoutingIdAnnounce`: protocol machinery, not chat content.
+exactly like `RecoveryProfileAnnounce` (§8). Both are ungated by
+`ARCHITECTURE.md` §6.5's mandatory-verification rule, like
+`RoutingIdAnnounce`: protocol machinery, not chat content.
+
+`ConversationWipeRequest` (`core::payload::ConversationWipeRequestContent`,
+`payload_type = 5`) carries one field:
+
+| Field | Type | Notes |
+|---|---|---|
+| `include_session` | bool | the requester's own `include_session` preference for *this* wipe |
+
+**Implementation note — originally empty content, closed as finding #30
+(`docs/DELIVERY_FAILURE_FINDINGS.md`):** the request used to carry no
+fields at all, on the assumption that a prior `ConversationWipePolicyAnnounce`
+would always have already told the recipient everything needed. Real
+testing found that assumption breaks the moment a requester's preference
+is set locally without a separately-landed announcement (skipped, or
+racing the request) — the recipient's `effective_wipe_include_session()`
+has nothing to OR against but their own stale local state, silently
+wiping less than the requester did and leaving the two sides' ratchets
+desynced (one gone, one not, with no automatic recovery). Carrying the
+requester's own preference directly in the request closes the gap: the
+recipient now applies `own_preference OR requester's_preference` for this
+one wipe, matching §10's own documented most-restrictive-wins merge
+without depending on announce-then-wait ordering at all.
 
 **Two merge functions, computed independently and identically by both
 clients from (own preference, last-announced peer preference) — no

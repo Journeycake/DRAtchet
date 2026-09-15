@@ -35,10 +35,11 @@ use dratchet_core::envelope::Envelope;
 use dratchet_core::first_contact::FirstContactWire;
 use dratchet_core::identity::fingerprint_of_public_key;
 use dratchet_core::payload::{
-    ChatContent, ConversationWipePolicyAnnounce, DeliveryAck, FirstContactContent, PiggybackAck,
-    ProfileAnnounce, RoutingIdAnnounce, PAYLOAD_CHAT, PAYLOAD_CONVERSATION_WIPE_POLICY_ANNOUNCE,
-    PAYLOAD_CONVERSATION_WIPE_REQUEST, PAYLOAD_DELIVERY_ACK, PAYLOAD_FIRST_CONTACT,
-    PAYLOAD_PROFILE_ANNOUNCE, PAYLOAD_ROUTING_ID_ANNOUNCE,
+    ChatContent, ConversationWipePolicyAnnounce, ConversationWipeRequestContent, DeliveryAck,
+    FirstContactContent, PiggybackAck, ProfileAnnounce, RoutingIdAnnounce, PAYLOAD_CHAT,
+    PAYLOAD_CONVERSATION_WIPE_POLICY_ANNOUNCE, PAYLOAD_CONVERSATION_WIPE_REQUEST,
+    PAYLOAD_DELIVERY_ACK, PAYLOAD_FIRST_CONTACT, PAYLOAD_PROFILE_ANNOUNCE,
+    PAYLOAD_ROUTING_ID_ANNOUNCE,
 };
 use dratchet_core::prekey::{OneTimePrekeyPublic, PrekeyBundle, SignedPrekeyPublic};
 use dratchet_core::ratchet::{RatchetState, DEFAULT_MAX_SKIP};
@@ -1074,8 +1075,24 @@ fn apply_entry(
                 session_wiped: false,
             })
         }
-        Ok((PAYLOAD_CONVERSATION_WIPE_REQUEST, _content)) => {
+        Ok((PAYLOAD_CONVERSATION_WIPE_REQUEST, content)) => {
+            // The requester's own `include_session` preference, carried in
+            // the request itself since `docs/DELIVERY_FAILURE_FINDINGS.md`
+            // finding #30 — folded into this side's effective decision
+            // below (most-restrictive-wins) without depending on a prior
+            // `ConversationWipePolicyAnnounce` having already landed.
+            // Malformed content is per-entry-skippable like any other
+            // decode failure here, not fatal to the whole batch.
+            let requested = ConversationWipeRequestContent::decode(&content)?;
             if contact.effective_wipe_ask_before_delete() {
+                // Not applied to this path: the requester's carried
+                // preference isn't persisted anywhere between now and
+                // `confirm_pending_wipe` running later, so an un-announced
+                // `include_session` can still be missed here — a narrower
+                // residual case than finding #30's (this one requires
+                // *both* sides to have opted into ask-before-delete in the
+                // first place, a much smaller population) left as a known
+                // limitation rather than expanding this fix's scope.
                 let mut pending = contact.clone();
                 pending.wipe_request_pending = true;
                 db.save_contact(&pending)?;
@@ -1083,7 +1100,8 @@ fn apply_entry(
                     session_wiped: false,
                 })
             } else {
-                let include_session = contact.effective_wipe_include_session();
+                let include_session =
+                    contact.effective_wipe_include_session() || requested.include_session;
                 db.wipe_conversation(conv_id, include_session)?;
                 Ok(EntryEffect::WipeActivity {
                     session_wiped: include_session,
@@ -1269,6 +1287,15 @@ pub async fn announce_wipe_policy(
 /// doesn't mean the peer has received it yet, just that delivery has been
 /// queued, which is the normal store-and-forward behavior every mailbox
 /// message already has). Returns how many local records were removed.
+///
+/// Carries this side's own `include_session` preference in the request
+/// content (`core::payload::ConversationWipeRequestContent`) — not just
+/// the requester's own local wipe scope, but what the *recipient* needs
+/// to correctly apply most-restrictive-wins without depending on a prior,
+/// separately-landed `announce_wipe_policy` call having already reached
+/// them (`docs/DELIVERY_FAILURE_FINDINGS.md` finding #30: without this,
+/// an un-announced `include_session` preference desynced the two sides'
+/// ratchets — one gone, one not — with no automatic recovery).
 pub async fn request_conversation_wipe(
     db: &Db,
     conn: &mut Connection,
@@ -1278,7 +1305,9 @@ pub async fn request_conversation_wipe(
     let conv_id = conversation_id_for(account, contact);
     let mut ratchet = db.load_ratchet(conv_id)?.ok_or(Error::NoSession)?;
 
-    let envelope = ratchet.encrypt_payload(PAYLOAD_CONVERSATION_WIPE_REQUEST, &[])?;
+    let include_session = contact.effective_wipe_include_session();
+    let content = ConversationWipeRequestContent { include_session }.encode();
+    let envelope = ratchet.encrypt_payload(PAYLOAD_CONVERSATION_WIPE_REQUEST, &content)?;
     conn.send(
         FrameTag::MailboxWrite,
         &MailboxWrite {
@@ -1294,7 +1323,6 @@ pub async fn request_conversation_wipe(
     }
 
     db.save_ratchet(conv_id, &ratchet)?;
-    let include_session = contact.effective_wipe_include_session();
     Ok(db.wipe_conversation(conv_id, include_session)?)
 }
 

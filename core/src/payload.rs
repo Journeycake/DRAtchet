@@ -160,6 +160,46 @@ impl ConversationWipePolicyAnnounce {
     }
 }
 
+/// `PAYLOAD_CONVERSATION_WIPE_REQUEST`'s content — `MESSAGE_SCHEMA.md` §10.
+/// Originally empty content (no wire shape at all): the requester's own
+/// `include_session` preference alone is enough to decide the *effective*
+/// scope (`store::wipe_policy::Contact::effective_wipe_include_session`'s
+/// "most-restrictive-wins" merge means either side wanting the fuller wipe
+/// wins), but with nothing here to carry it, a recipient could only ever
+/// apply *their own* previously-announced preference
+/// (`ConversationWipePolicyAnnounce`, a separate message) — if the
+/// requester had turned `include_session` on locally without a prior,
+/// separately-landed announcement, the recipient had no way to know and
+/// wiped messages-only while the requester's own ratchet was already gone,
+/// a real, found-by-testing desync (`docs/DELIVERY_FAILURE_FINDINGS.md`
+/// finding #30). Carrying the requester's own `include_session` here
+/// closes it at the source: the recipient now folds it into their own
+/// effective decision for *this* wipe directly, without depending on
+/// announce-then-wait ordering at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationWipeRequestContent {
+    /// The requester's own `include_session` preference, computed the same
+    /// way `request_conversation_wipe` already computes it for the
+    /// requester's own local wipe — not necessarily "true" just because
+    /// this field exists; the recipient still ORs it with their own local
+    /// preference, matching most-restrictive-wins.
+    pub include_session: bool,
+}
+
+impl ConversationWipeRequestContent {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        ciborium::into_writer(self, &mut bytes)
+            .expect("CBOR encoding of a well-formed struct cannot fail");
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        ciborium::from_reader(bytes)
+            .map_err(|_| Error::MalformedPayload("not a valid ConversationWipeRequestContent"))
+    }
+}
+
 /// `PAYLOAD_FIRST_CONTACT`'s content — the pairing code the recipient
 /// generated and read out over an already-trusted channel (§6.4), plus
 /// the sender's chosen `username#NNNN` so the recipient's client can
@@ -402,11 +442,26 @@ mod tests {
     }
 
     #[test]
-    fn conversation_wipe_request_is_empty_content_tagged_and_padded_like_any_other_payload() {
-        let padded = tag_and_pad(PAYLOAD_CONVERSATION_WIPE_REQUEST, &[]).unwrap();
-        let (ty, content) = untag_and_unpad(&padded).unwrap();
-        assert_eq!(ty, PAYLOAD_CONVERSATION_WIPE_REQUEST);
-        assert!(content.is_empty());
+    fn conversation_wipe_request_content_round_trips_through_encode_and_tag_and_pad() {
+        for include_session in [false, true] {
+            let request = ConversationWipeRequestContent { include_session };
+            let encoded = request.encode();
+            let decoded = ConversationWipeRequestContent::decode(&encoded).unwrap();
+            assert_eq!(decoded, request);
+
+            let padded = tag_and_pad(PAYLOAD_CONVERSATION_WIPE_REQUEST, &encoded).unwrap();
+            let (ty, content) = untag_and_unpad(&padded).unwrap();
+            assert_eq!(ty, PAYLOAD_CONVERSATION_WIPE_REQUEST);
+            assert_eq!(
+                ConversationWipeRequestContent::decode(&content).unwrap(),
+                request
+            );
+        }
+    }
+
+    #[test]
+    fn conversation_wipe_request_content_garbage_bytes_are_rejected_not_panicking() {
+        assert!(ConversationWipeRequestContent::decode(&[0xFF, 0x00, 0x01]).is_err());
     }
 
     #[test]

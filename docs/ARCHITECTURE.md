@@ -1895,6 +1895,18 @@ conversation too, over a new pair of ratchet-encrypted protocol messages
   complied, declined, or hasn't seen the request yet — the same fire-and-
   forget limitation every mailbox message already has.
 
+**A real desync found and fixed testing a genuinely single-sided wipe
+(`docs/DELIVERY_FAILURE_FINDINGS.md` finding #30):** the request used to
+carry no policy data of its own, relying entirely on a prior, separately-
+landed `ConversationWipePolicyAnnounce` for the recipient to know the
+requester's `include_session` preference — skip or race that announcement
+and the two sides' ratchets could silently and permanently diverge, one
+destroyed, one not, with the surviving side's next ordinary message coming
+back as a hard, unrecoverable error on the other. Fixed by having the
+request carry the requester's own preference directly
+(`MESSAGE_SCHEMA.md` §10), so most-restrictive-wins applies correctly to
+that one wipe without depending on announce-then-wait ordering at all.
+
 ## 12. Deployment models: pure peer-to-peer vs. server-based
 
 Everything above frames Tier 0/1/2 as layered, composable choices. This

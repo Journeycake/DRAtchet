@@ -665,3 +665,63 @@ fix) still resolves each of those later messages individually and
 immediately in the ordinary case; only the piggyback backstop is scoped
 this strictly, and only for the remainder of that one chain's lifetime
 (a fresh DH ratchet step starts the tracking over).
+
+## Per-conversation wipe (found and fixed testing a genuinely single-sided `request_conversation_wipe`, `ARCHITECTURE.md` §11.9a)
+
+### 30. An un-announced `include_session` preference desynced the two sides' ratchets — **fixed**
+
+**Severity: high** — a real, silent, *unrecoverable* session desync, not
+a delivery-status cosmetic. `store::wipe_policy`'s own doc states
+`effective_wipe_include_session` is "most-restrictive-wins": either side
+wanting the fuller (ratchet-destroying) wipe should mean *both* get it.
+That only actually held when the preference had been separately announced
+(`ConversationWipePolicyAnnounce`, `payload_type = 4`) and landed on the
+peer's side *before* the wipe request arrived — `PAYLOAD_CONVERSATION_WIPE_REQUEST`
+itself carried no policy data at all (empty content), so the merge had
+nothing to work with on the recipient's side beyond their own,
+possibly-stale local preference.
+
+Found via a real, no-mocks test (`app/tests/single_sided_wipe_request.rs`)
+built to verify a genuinely single-sided wipe (only one party ever calls
+`request_conversation_wipe`, matching this session's fault-injection
+testing pattern) against the design's own documented merge semantics: a
+requester who sets `include_session = true` only in their own local
+`Contact` record — the same state a UI bug, or simply racing the "announce
+first" step, would produce — computes their *own* effective decision as
+`true` (their own local flag alone is sufficient) and destroys their own
+ratchet. The peer, having received no announcement, still computes
+`false` and only wipes messages. The two sides now permanently disagree
+about whether a session exists. The requester's own follow-up test
+assertion confirmed the real, user-visible consequence: the peer, unaware
+anything is wrong, sends an ordinary reply on their still-live ratchet,
+and the requester — who has none — gets a hard `NoSession` error with no
+automatic recovery path, not a graceful re-pairing prompt.
+
+**Fixed**: `request_conversation_wipe` now carries the requester's own
+`include_session` preference directly in the request content
+(`core::payload::ConversationWipeRequestContent`, `MESSAGE_SCHEMA.md`
+§10's updated schema) — the recipient's `apply_entry` now computes
+`own_preference OR requester's_preference` for *this* wipe specifically,
+correctly implementing most-restrictive-wins without depending on any
+prior announcement having landed. Four tests in
+`app/tests/single_sided_wipe_request.rs` lock this in: the default-policy
+(messages-only) case leaves the session usable afterward; an `uncertain`
+message gets wiped cleanly rather than orphaned; the exact
+previously-desyncing scenario now closes both ratchets together
+(`include_session_no_longer_desyncs_the_peer_even_when_never_announced`);
+and a positive control confirms the properly-announced-first path still
+works as it always did, proving the fix addresses the announce-ordering
+gap specifically rather than being a coincidental pass.
+
+**A known, smaller residual gap, left as-is rather than expanding this
+fix's scope**: the "ask before delete" gated path
+(`effective_wipe_ask_before_delete()` — unanimous, both sides must have
+opted in) doesn't persist the request's carried preference between
+`receive_pending` setting `Contact::wipe_request_pending` and
+`confirm_pending_wipe` actually running the wipe later, so the same class
+of gap could in principle still occur there. Judged lower priority: it
+requires *both* sides to have already unanimously opted into
+ask-before-delete in the first place, a much smaller population than the
+default (auto-comply) path finding #30 covers, and the human confirming
+the wipe sees a UI moment where a mismatch could plausibly be caught
+before real harm, unlike the fully automatic auto-comply path.
