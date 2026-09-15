@@ -192,6 +192,10 @@ async fn pending_gated_send_fails_then_succeeds_after_verification_over_a_real_s
         wipe_include_session: false,
         peer_wipe_include_session: None,
         wipe_request_pending: false,
+        wipe_boundary_timestamp: None,
+        wipe_boundary_sequence: None,
+        peer_wipe_boundary_timestamp: None,
+        peer_wipe_boundary_sequence: None,
     };
     db_alice.save_contact(&alice_contact).unwrap();
     db_alice.save_ratchet(conv_id, &alice_ratchet).unwrap();
@@ -212,6 +216,10 @@ async fn pending_gated_send_fails_then_succeeds_after_verification_over_a_real_s
         wipe_include_session: false,
         peer_wipe_include_session: None,
         wipe_request_pending: false,
+        wipe_boundary_timestamp: None,
+        wipe_boundary_sequence: None,
+        peer_wipe_boundary_timestamp: None,
+        peer_wipe_boundary_sequence: None,
     };
     db_bob.save_contact(&bob_contact).unwrap();
     db_bob.save_ratchet(conv_id, &bob_ratchet).unwrap();

@@ -236,6 +236,10 @@ async fn both_sides_exchange_routing_ids_over_the_real_server_and_converge_on_th
         wipe_include_session: false,
         peer_wipe_include_session: None,
         wipe_request_pending: false,
+        wipe_boundary_timestamp: None,
+        wipe_boundary_sequence: None,
+        peer_wipe_boundary_timestamp: None,
+        peer_wipe_boundary_sequence: None,
     };
     db_alice.save_contact(&alice_contact).unwrap();
 
@@ -254,6 +258,10 @@ async fn both_sides_exchange_routing_ids_over_the_real_server_and_converge_on_th
         wipe_include_session: false,
         peer_wipe_include_session: None,
         wipe_request_pending: false,
+        wipe_boundary_timestamp: None,
+        wipe_boundary_sequence: None,
+        peer_wipe_boundary_timestamp: None,
+        peer_wipe_boundary_sequence: None,
     };
     db_bob.save_contact(&bob_contact).unwrap();
 

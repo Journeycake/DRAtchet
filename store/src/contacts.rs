@@ -69,6 +69,34 @@ pub struct Contact {
     /// local confirmation (`dratchet_app::confirm_pending_wipe`/
     /// `decline_pending_wipe`).
     pub wipe_request_pending: bool,
+    /// This side's own local "wipe boundary" — the `(timestamp, sequence)`
+    /// this side had reached (`crate::messages`' own tie-break pair) the
+    /// moment it last successfully *sent* a `ConversationWipePolicyAnnounce`
+    /// to this contact (`dratchet_app::announce_wipe_policy`). Used only
+    /// locally, to estimate — never guarantee, since no mailbox message
+    /// ever gets a delivery receipt — how much of this side's own history
+    /// likely still survives on the peer's device before a wipe request is
+    /// sent (`dratchet_app::preview_conversation_wipe`). `#[serde(default)]`
+    /// so an already-persisted `Contact` predating this field decodes as
+    /// `None` (no boundary ever recorded) rather than failing to decode.
+    #[serde(default)]
+    pub wipe_boundary_timestamp: Option<u64>,
+    #[serde(default)]
+    pub wipe_boundary_sequence: Option<u64>,
+    /// The mirror image, this side's record of the *peer's* boundary:
+    /// the `(timestamp, sequence)` this side had reached the moment it
+    /// *processed* an incoming `ConversationWipePolicyAnnounce` from this
+    /// peer (`Db::record_peer_wipe_policy`). `None` until the first such
+    /// announcement arrives. This is what actually gates this side's own
+    /// compliance with an incoming wipe request from this peer
+    /// (`Db::wipe_conversation_since`) — everything already stored before
+    /// this moment is protected; everything saved from this moment
+    /// forward is in scope. A fresh announcement overwrites it — last one
+    /// wins, no history kept.
+    #[serde(default)]
+    pub peer_wipe_boundary_timestamp: Option<u64>,
+    #[serde(default)]
+    pub peer_wipe_boundary_sequence: Option<u64>,
 }
 
 fn contact_key(fingerprint: &[u8]) -> String {
@@ -139,6 +167,10 @@ mod tests {
             wipe_include_session: false,
             peer_wipe_include_session: None,
             wipe_request_pending: false,
+            wipe_boundary_timestamp: None,
+            wipe_boundary_sequence: None,
+            peer_wipe_boundary_timestamp: None,
+            peer_wipe_boundary_sequence: None,
         }
     }
 

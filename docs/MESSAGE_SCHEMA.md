@@ -474,6 +474,52 @@ the peer complied, declined, or hasn't seen the request yet — the same
 fire-and-forget limitation every mailbox message already has (no
 `ReadReceipt` exists either, per `ARCHITECTURE.md` §10's open decisions).
 
+**Boundary-scoped wipe on the peer's side (v1.1, `ARCHITECTURE.md` §11.9a's
+"Boundary-scoped wipe on the peer's side" note).** No new wire field:
+the boundary is a `(timestamp, sequence)` pair — the same tie-break shape
+`Db::list_messages` already sorts messages by — that each side derives
+*locally* from messages and announcements it has already processed, never
+transmitted. Two independent stamps, both `Option<u64>` pairs on
+`store::Contact`, `#[serde(default)]` so an already-persisted `Contact`
+from before this feature decodes as "no boundary ever recorded" rather
+than failing to decode:
+
+- `peer_wipe_boundary_timestamp`/`_sequence` — this side's own position
+  the moment it finished processing an incoming `ConversationWipePolicyAnnounce`
+  from that peer (`Db::record_peer_wipe_policy`). Gates this side's own
+  compliance with a future `ConversationWipeRequest` from that peer
+  (`Db::wipe_conversation_since`): every message stored before this
+  instant is protected; every message stored from this instant forward is
+  in scope. A fresh announcement always overwrites it — last one wins, no
+  history of prior boundaries kept.
+- `wipe_boundary_timestamp`/`_sequence` — the mirror image: this side's
+  own position the moment its *own* `ConversationWipePolicyAnnounce`
+  finished sending (acked by the server). Read only locally, by
+  `preview_conversation_wipe`, to estimate how much of this side's own
+  history the peer likely still has before this side sends a wipe
+  request — an estimate, not a guarantee, for the same no-delivery-receipt
+  reason as above.
+
+`sequence` breaks same-second ties the same way `Message::sequence`
+already does elsewhere in this schema (§7a) — it resets to 0 on every
+`Db::create`/`open`, so it can't anchor a boundary by itself across a
+restart, but the pair as a whole compares safely lexicographically
+(`timestamp` first) since a restart always advances the wall clock past
+whatever second it stopped at.
+
+**No boundary ever recorded → the original v1 behavior, unchanged.** A
+conversation where neither side has ever called `announce_wipe_policy`
+has nothing to scope a wipe request against, so `wipe_conversation_since`
+is never reached — `Db::wipe_conversation` (full, unconditional) still
+runs, on both sides, exactly as documented above. Additive by
+construction: no existing wire format, merge function, or previously-
+observed behavior changed.
+
+**The requester's own local wipe is unaffected by any of this** — always
+the full, unconditional `Db::wipe_conversation`, on the requester's own
+device, regardless of whether they've ever announced anything. Only the
+*recipient's* side of an incoming wipe request is ever scoped.
+
 ## 11. Profile announce (CBOR) — `ARCHITECTURE.md` §6.1
 
 A single message behind the restart/reclaim notification mechanism: when

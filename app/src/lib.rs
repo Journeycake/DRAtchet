@@ -555,6 +555,10 @@ pub async fn add_contact_by_username(
         wipe_include_session: false,
         peer_wipe_include_session: None,
         wipe_request_pending: false,
+        wipe_boundary_timestamp: None,
+        wipe_boundary_sequence: None,
+        peer_wipe_boundary_timestamp: None,
+        peer_wipe_boundary_sequence: None,
     };
     db.save_contact(&contact)?;
     db.save_ratchet(conv_id, &ratchet)?;
@@ -723,6 +727,10 @@ fn try_accept_first_contact(
         wipe_include_session: false,
         peer_wipe_include_session: None,
         wipe_request_pending: false,
+        wipe_boundary_timestamp: None,
+        wipe_boundary_sequence: None,
+        peer_wipe_boundary_timestamp: None,
+        peer_wipe_boundary_sequence: None,
     };
     db.save_contact(&contact)?;
     db.save_ratchet(conv_id, &ratchet)?;
@@ -1102,7 +1110,7 @@ fn apply_entry(
             } else {
                 let include_session =
                     contact.effective_wipe_include_session() || requested.include_session;
-                db.wipe_conversation(conv_id, include_session)?;
+                wipe_conversation_scoped(db, conv_id, contact, include_session)?;
                 Ok(EntryEffect::WipeActivity {
                     session_wiped: include_session,
                 })
@@ -1273,7 +1281,68 @@ pub async fn announce_wipe_policy(
     }
 
     db.save_ratchet(conv_id, &ratchet)?;
+
+    // Stamp this side's own wipe boundary now that the announce is
+    // actually acked — "how far this side had gotten the moment the peer
+    // was told about the new policy," read back later by
+    // `preview_conversation_wipe` to estimate how much of this side's
+    // history the peer likely still has. Deliberately stamped after the
+    // ack, not at the top of this function alongside the preference save:
+    // if the send fails, no boundary should be recorded either.
+    let (boundary_timestamp, boundary_sequence) = db.current_wipe_boundary();
+    updated.wipe_boundary_timestamp = Some(boundary_timestamp);
+    updated.wipe_boundary_sequence = Some(boundary_sequence);
+    db.save_contact(&updated)?;
+
     Ok(updated)
+}
+
+/// A preview of what a [`request_conversation_wipe`] call would do right
+/// now, without sending anything — read-only, no network access, safe to
+/// call freely from the UI before the user commits to a wipe.
+///
+/// `peer_likely_keeps` is an estimate, never a guarantee: no mailbox
+/// message in this protocol ever gets a delivery receipt, so this side
+/// can only know its own `announce_wipe_policy` call was *sent*, not that
+/// the peer actually received and processed it. `0` whenever this side
+/// has never announced a wipe policy to this contact for this
+/// conversation (`contact.wipe_boundary_timestamp.is_none()`) — with no
+/// boundary recorded, a wipe request is unambiguous: everything goes.
+pub struct WipePreview {
+    /// How many messages `request_conversation_wipe` would remove from
+    /// this side's own store — always everything, unconditionally.
+    pub will_remove_locally: usize,
+    /// How many of those same messages were saved before this side's own
+    /// last-acked wipe-policy announce, and so likely still remain on the
+    /// peer's device after they comply with the wipe request.
+    pub peer_likely_keeps: usize,
+}
+
+pub fn preview_conversation_wipe(
+    db: &Db,
+    account: &Account,
+    contact: &Contact,
+) -> Result<WipePreview> {
+    let conv_id = conversation_id_for(account, contact);
+    let messages = db.list_messages(conv_id)?;
+    let will_remove_locally = messages.len();
+    let peer_likely_keeps = match (
+        contact.wipe_boundary_timestamp,
+        contact.wipe_boundary_sequence,
+    ) {
+        (Some(ts), seq) => {
+            let boundary = (ts, seq.unwrap_or(0));
+            messages
+                .iter()
+                .filter(|m| (m.timestamp, m.sequence) < boundary)
+                .count()
+        }
+        (None, _) => 0,
+    };
+    Ok(WipePreview {
+        will_remove_locally,
+        peer_likely_keeps,
+    })
 }
 
 /// `docs/ARCHITECTURE.md` §11.9a's per-conversation wipe, the requesting
@@ -1333,12 +1402,38 @@ pub async fn request_conversation_wipe(
 pub fn confirm_pending_wipe(db: &Db, account: &Account, contact: &Contact) -> Result<usize> {
     let conv_id = conversation_id_for(account, contact);
     let include_session = contact.effective_wipe_include_session();
-    let removed = db.wipe_conversation(conv_id, include_session)?;
+    let removed = wipe_conversation_scoped(db, conv_id, contact, include_session)?;
 
     let mut updated = contact.clone();
     updated.wipe_request_pending = false;
     db.save_contact(&updated)?;
     Ok(removed)
+}
+
+/// Complying with an *incoming* wipe request: scoped to
+/// `contact.peer_wipe_boundary_timestamp`/`_sequence` when this side has
+/// ever recorded one (`Db::record_peer_wipe_policy`, run whenever a
+/// `ConversationWipePolicyAnnounce` from this peer was processed) — full,
+/// unconditional `Db::wipe_conversation` otherwise, which is also exactly
+/// today's behavior for a conversation where no policy was ever announced.
+/// Shared by `apply_entry`'s auto-comply branch and `confirm_pending_wipe`'s
+/// ask-before-delete branch so both read the same persisted boundary,
+/// however long a pending confirmation sat unanswered.
+fn wipe_conversation_scoped(
+    db: &Db,
+    conv_id: [u8; 16],
+    contact: &Contact,
+    include_session: bool,
+) -> Result<usize> {
+    match (
+        contact.peer_wipe_boundary_timestamp,
+        contact.peer_wipe_boundary_sequence,
+    ) {
+        (Some(ts), seq) => {
+            Ok(db.wipe_conversation_since(conv_id, (ts, seq.unwrap_or(0)), include_session)?)
+        }
+        (None, _) => Ok(db.wipe_conversation(conv_id, include_session)?),
+    }
 }
 
 /// The declining counterpart to [`confirm_pending_wipe`]: clears

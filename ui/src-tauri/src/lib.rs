@@ -156,6 +156,17 @@ struct PairingCodeDto {
     expires_at: u64,
 }
 
+/// A preview of a not-yet-sent wipe request — how many messages this
+/// side's own history has (always fully removed locally) and how many of
+/// those the peer likely still keeps, given this side's last-acked wipe-
+/// policy announce (an estimate, never a guarantee — see
+/// `dratchet_app::preview_conversation_wipe`'s doc comment).
+#[derive(Serialize)]
+struct WipePreviewDto {
+    will_remove_locally: usize,
+    peer_likely_keeps: usize,
+}
+
 /// This device's own `username#NNNN` changed without the user asking —
 /// `reconcile_own_profile` found the stored discriminator taken and had
 /// to pick a new one. Surfaced once, on startup.
@@ -291,6 +302,29 @@ async fn set_wipe_policy(
     .await
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Read-only preview of what `request_conversation_wipe` would do right
+/// now — no network access, safe to call on every click of the "clear
+/// conversation" confirm step before the user commits.
+#[tauri::command]
+async fn preview_conversation_wipe(
+    state: State<'_, AppState>,
+    fingerprint: String,
+) -> Result<WipePreviewDto, String> {
+    let fp = hex::decode(&fingerprint)?;
+    let contact = state
+        .db
+        .load_contact(&fp)
+        .map_err(|e| e.to_string())?
+        .ok_or("no such contact")?;
+    let account = state.account.lock().await;
+    let preview = dratchet_app::preview_conversation_wipe(&state.db, &account, &contact)
+        .map_err(|e| e.to_string())?;
+    Ok(WipePreviewDto {
+        will_remove_locally: preview.will_remove_locally,
+        peer_likely_keeps: preview.peer_likely_keeps,
+    })
 }
 
 /// `docs/ARCHITECTURE.md` §11.9a's per-conversation wipe, the requesting
@@ -794,6 +828,7 @@ pub fn run() {
             list_messages,
             send_message,
             set_wipe_policy,
+            preview_conversation_wipe,
             request_conversation_wipe,
             confirm_pending_wipe,
             decline_pending_wipe,

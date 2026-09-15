@@ -16,7 +16,8 @@ use std::sync::Arc;
 
 use dratchet_app::{
     announce_routing_id, announce_wipe_policy, list_messages, mark_pending_sends_uncertain,
-    receive_pending, record_verification_result, request_conversation_wipe, send_message,
+    preview_conversation_wipe, receive_pending, record_verification_result,
+    request_conversation_wipe, send_message,
 };
 use dratchet_client::net::Connection;
 use dratchet_core::account::Account;
@@ -201,6 +202,10 @@ async fn pair() -> Paired {
         wipe_include_session: false,
         peer_wipe_include_session: None,
         wipe_request_pending: false,
+        wipe_boundary_timestamp: None,
+        wipe_boundary_sequence: None,
+        peer_wipe_boundary_timestamp: None,
+        peer_wipe_boundary_sequence: None,
     };
     db_alice.save_contact(&alice_contact).unwrap();
     db_alice.save_ratchet(conv_id, &alice_ratchet).unwrap();
@@ -221,6 +226,10 @@ async fn pair() -> Paired {
         wipe_include_session: false,
         peer_wipe_include_session: None,
         wipe_request_pending: false,
+        wipe_boundary_timestamp: None,
+        wipe_boundary_sequence: None,
+        peer_wipe_boundary_timestamp: None,
+        peer_wipe_boundary_sequence: None,
     };
     db_bob.save_contact(&bob_contact).unwrap();
     db_bob.save_ratchet(conv_id, &bob_ratchet).unwrap();
@@ -631,5 +640,160 @@ async fn include_session_wipe_syncs_correctly_when_announced_first() {
         db_bob.load_ratchet(bob_conv_id).unwrap().is_none(),
         "ACTUAL: with the announcement landed first, bob's ratchet is gone too — \
          both sides genuinely agree this time, unlike the un-announced case above"
+    );
+}
+
+/// The exact scenario from the feature request this test was written for:
+/// Bob and Alice exchange messages under the default "no remote wipe"
+/// policy, Bob changes his wipe policy for this conversation and
+/// announces it, they keep messaging, and Bob initiates a wipe. **Expected**:
+/// Bob's own chat goes to zero (his own local wipe is still full and
+/// unconditional — that's his own device). Alice keeps every message from
+/// *before* she processed Bob's policy announcement and loses every
+/// message from *after* it — not because of when the wipe itself fires,
+/// but because of when the policy change was communicated and received.
+/// Also proves `preview_conversation_wipe`, the local read-only estimate
+/// Bob gets before he ever sends the request: `peer_likely_keeps` should
+/// name exactly the pre-announce count.
+#[tokio::test]
+async fn boundary_scoped_wipe_protects_alices_pre_announce_history() {
+    let Paired {
+        db_alice,
+        alice,
+        mut alice_contact,
+        mut alice_conn,
+        db_bob,
+        bob,
+        mut bob_contact,
+        mut bob_conn,
+    } = pair().await;
+
+    // Bob and Alice exchange messages under "no remote wipe" — default
+    // policy, neither side has announced anything yet.
+    for text in [&b"pre-announce 1"[..], &b"pre-announce 2"[..]] {
+        send_message(&db_bob, &mut bob_conn, &bob, &bob_contact, text)
+            .await
+            .unwrap();
+        receive_pending(&db_alice, &mut alice_conn, &alice, &alice_contact)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        list_messages(&db_alice, &alice, &alice_contact)
+            .unwrap()
+            .len(),
+        2,
+        "alice genuinely has both pre-announce messages before any of this starts"
+    );
+
+    // Bob changes his wipe policy for this conversation and the
+    // notification is sent to Alice.
+    bob_contact = announce_wipe_policy(&db_bob, &mut bob_conn, &bob, &bob_contact, false, false)
+        .await
+        .unwrap();
+    assert!(
+        bob_contact.wipe_boundary_timestamp.is_some(),
+        "ACTUAL: bob's own boundary is stamped the moment his announce is acked"
+    );
+
+    // Alice actually receives and processes the announcement — this is
+    // what sets *her* record of bob's boundary, gating her own future
+    // compliance with a wipe request from him.
+    receive_pending(&db_alice, &mut alice_conn, &alice, &alice_contact)
+        .await
+        .unwrap();
+    alice_contact = db_alice
+        .load_contact(&alice_contact.fingerprint)
+        .unwrap()
+        .unwrap();
+    assert!(
+        alice_contact.peer_wipe_boundary_timestamp.is_some(),
+        "ACTUAL: alice recorded bob's boundary the moment she processed his announcement"
+    );
+
+    // Bob and Alice continue messaging.
+    for text in [&b"post-announce 1"[..], &b"post-announce 2"[..]] {
+        send_message(&db_bob, &mut bob_conn, &bob, &bob_contact, text)
+            .await
+            .unwrap();
+        receive_pending(&db_alice, &mut alice_conn, &alice, &alice_contact)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        list_messages(&db_alice, &alice, &alice_contact)
+            .unwrap()
+            .len(),
+        4,
+        "alice now has all 4 messages, 2 from before and 2 from after the policy change"
+    );
+
+    // Bob previews the wipe before sending it — a local, read-only
+    // estimate of how much of his own history alice likely still keeps.
+    let preview = preview_conversation_wipe(&db_bob, &bob, &bob_contact).unwrap();
+    assert_eq!(
+        preview.will_remove_locally, 4,
+        "bob's own local wipe still removes everything, unconditionally"
+    );
+    assert_eq!(
+        preview.peer_likely_keeps, 2,
+        "ACTUAL: the preview correctly estimates alice keeps the 2 pre-announce messages"
+    );
+
+    // Bob initiates the wipe.
+    let removed = request_conversation_wipe(&db_bob, &mut bob_conn, &bob, &bob_contact)
+        .await
+        .unwrap();
+    assert_eq!(
+        removed, 4,
+        "bob's own side is still a full, unconditional local wipe"
+    );
+    assert!(
+        list_messages(&db_bob, &bob, &bob_contact)
+            .unwrap()
+            .is_empty(),
+        "ACTUAL: bob's own chat is fully cleared, exactly as before this feature"
+    );
+
+    receive_pending(&db_alice, &mut alice_conn, &alice, &alice_contact)
+        .await
+        .unwrap();
+    let alice_remaining = list_messages(&db_alice, &alice, &alice_contact).unwrap();
+    assert_eq!(
+        alice_remaining.len(),
+        2,
+        "ACTUAL: alice keeps exactly the 2 pre-announce messages, loses the 2 post-announce ones"
+    );
+    assert!(
+        alice_remaining
+            .iter()
+            .all(|m| m.content == b"pre-announce 1" || m.content == b"pre-announce 2"),
+        "ACTUAL: the surviving messages are specifically the pre-announce ones, \
+         all other messages in alice's client prior to the policy change remain, \
+         nothing extra survived by accident"
+    );
+
+    // The session itself is untouched by a messages-only wipe — proof the
+    // conversation is still usable, on both sides, after this.
+    send_message(
+        &db_alice,
+        &mut alice_conn,
+        &alice,
+        &alice_contact,
+        b"still works after the boundary-scoped wipe",
+    )
+    .await
+    .unwrap();
+    let bob_contact = db_bob
+        .load_contact(&bob_contact.fingerprint)
+        .unwrap()
+        .unwrap();
+    let received = receive_pending(&db_bob, &mut bob_conn, &bob, &bob_contact)
+        .await
+        .unwrap();
+    assert_eq!(received.messages.len(), 1);
+    assert_eq!(
+        received.messages[0].content,
+        b"still works after the boundary-scoped wipe"
     );
 }

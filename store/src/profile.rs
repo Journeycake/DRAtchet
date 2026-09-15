@@ -143,6 +143,10 @@ mod tests {
             wipe_include_session: false,
             peer_wipe_include_session: None,
             wipe_request_pending: false,
+            wipe_boundary_timestamp: None,
+            wipe_boundary_sequence: None,
+            peer_wipe_boundary_timestamp: None,
+            peer_wipe_boundary_sequence: None,
         }
     }
 

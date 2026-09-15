@@ -12,10 +12,12 @@
 //! device-seizure threat model, not ordinary per-conversation
 //! housekeeping.
 
+use std::sync::atomic::Ordering;
+
 use crate::contacts::Contact;
 use crate::db::Db;
 use crate::error::Result;
-use crate::messages::message_key_prefix;
+use crate::messages::{message_key_prefix, now_unix};
 
 impl Contact {
     /// Effective "ask before deleting" policy for this conversation:
@@ -39,10 +41,30 @@ impl Contact {
 }
 
 impl Db {
+    /// This side's current `(timestamp, sequence)` position in
+    /// `crate::messages`' own tie-break ordering — "the boundary a message
+    /// saved right now would get." Exposed so callers outside this crate
+    /// (`dratchet_app::announce_wipe_policy`) can stamp their own
+    /// `Contact::wipe_boundary_timestamp`/`_sequence` without reaching into
+    /// `Db::message_sequence`, which stays `pub(crate)`.
+    pub fn current_wipe_boundary(&self) -> (u64, u64) {
+        (now_unix(), self.message_sequence.load(Ordering::Relaxed))
+    }
+
     /// Record the peer's just-arrived wipe-policy announcement —
     /// reload-mutate-save, mirroring `routing::record_peer_routing_id`'s
     /// shape exactly. Idempotent-safe: repeating the same announcement is
     /// a harmless no-op write.
+    ///
+    /// Also stamps `peer_wipe_boundary_timestamp`/`_sequence` to *this
+    /// side's own* current `(now_unix(), message_sequence)` — the moment
+    /// this side actually processed the announcement, not whenever the
+    /// peer happened to send it. This is what later gates this side's own
+    /// compliance with an incoming wipe request from that peer
+    /// (`wipe_conversation_since`): everything already stored before this
+    /// instant is protected; everything saved from this instant forward
+    /// is in scope. A fresh announcement always overwrites it — last one
+    /// wins, no history kept.
     pub fn record_peer_wipe_policy(
         &self,
         fingerprint: &[u8],
@@ -56,6 +78,8 @@ impl Db {
                 ))?;
         contact.peer_wipe_ask_before_delete = Some(ask_before_delete);
         contact.peer_wipe_include_session = Some(include_session);
+        contact.peer_wipe_boundary_timestamp = Some(now_unix());
+        contact.peer_wipe_boundary_sequence = Some(self.message_sequence.load(Ordering::Relaxed));
         self.save_contact(&contact)?;
         Ok(contact)
     }
@@ -73,6 +97,40 @@ impl Db {
         for key in self.keys_with_prefix(&message_key_prefix(conversation_id))? {
             self.delete(&key)?;
             removed += 1;
+        }
+        if include_session {
+            let key = Db::ratchet_key(conversation_id);
+            if self
+                .get_encrypted(crate::db::Scope::Content, &key)?
+                .is_some()
+            {
+                self.delete(&key)?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Like `wipe_conversation`, but only removes messages at or after
+    /// `boundary` — `(timestamp, sequence)`, the same tie-break pair
+    /// `list_messages` already sorts by. Messages strictly before the
+    /// boundary are left untouched. `include_session`, if true, still
+    /// removes the ratchet/session state unconditionally — session state
+    /// is a single blob, not a timeline, so "since a boundary" has no
+    /// meaning for it. Returns how many messages (and, if applicable, the
+    /// ratchet) were removed.
+    pub fn wipe_conversation_since(
+        &self,
+        conversation_id: [u8; 16],
+        boundary: (u64, u64),
+        include_session: bool,
+    ) -> Result<usize> {
+        let mut removed = 0;
+        for message in self.list_messages(conversation_id)? {
+            if (message.timestamp, message.sequence) >= boundary {
+                self.delete_message(conversation_id, &message.id)?;
+                removed += 1;
+            }
         }
         if include_session {
             let key = Db::ratchet_key(conversation_id);
@@ -122,6 +180,10 @@ mod tests {
             wipe_include_session,
             peer_wipe_include_session,
             wipe_request_pending: false,
+            wipe_boundary_timestamp: None,
+            wipe_boundary_sequence: None,
+            peer_wipe_boundary_timestamp: None,
+            peer_wipe_boundary_sequence: None,
         }
     }
 
@@ -252,6 +314,84 @@ mod tests {
 
         assert!(db.list_messages(conv).unwrap().is_empty());
         assert!(db.load_ratchet(conv).unwrap().is_none());
+    }
+
+    fn sample_message_at(id: u8, timestamp: u64, sequence: u64) -> Message {
+        Message {
+            id: vec![id; 16],
+            sender_is_local: true,
+            content: b"hello".to_vec(),
+            timestamp,
+            sequence,
+            send_n: None,
+            send_dh_pub: None,
+            delivered: false,
+            uncertain: false,
+        }
+    }
+
+    #[test]
+    fn wipe_conversation_since_leaves_messages_before_the_boundary() {
+        let db = temp_db();
+        let conv = [5u8; 16];
+
+        db.save_message(conv, &sample_message_at(1, 100, 0))
+            .unwrap();
+        db.save_message(conv, &sample_message_at(2, 200, 0))
+            .unwrap();
+        db.save_message(conv, &sample_message_at(3, 300, 0))
+            .unwrap();
+
+        let removed = db.wipe_conversation_since(conv, (200, 0), false).unwrap();
+        assert_eq!(removed, 2, "messages at and after the boundary");
+
+        let remaining = db.list_messages(conv).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].timestamp, 100, "pre-boundary message survives");
+    }
+
+    #[test]
+    fn wipe_conversation_since_removes_messages_at_and_after_the_boundary() {
+        let db = temp_db();
+        let conv = [6u8; 16];
+
+        // Same-second tie broken by sequence, matching list_messages' sort key.
+        db.save_message(conv, &sample_message_at(1, 500, 0))
+            .unwrap();
+        db.save_message(conv, &sample_message_at(2, 500, 1))
+            .unwrap();
+        db.save_message(conv, &sample_message_at(3, 500, 2))
+            .unwrap();
+
+        let removed = db.wipe_conversation_since(conv, (500, 1), false).unwrap();
+        assert_eq!(removed, 2);
+
+        let remaining = db.list_messages(conv).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].sequence, 0);
+    }
+
+    #[test]
+    fn wipe_conversation_since_still_removes_the_ratchet_unconditionally_when_include_session() {
+        let db = temp_db();
+        let conv = [7u8; 16];
+
+        db.save_message(conv, &sample_message_at(1, 100, 0))
+            .unwrap();
+        db.save_message(conv, &sample_message_at(2, 900, 0))
+            .unwrap();
+        db.save_ratchet(conv, &sample_ratchet(conv)).unwrap();
+
+        let removed = db.wipe_conversation_since(conv, (900, 0), true).unwrap();
+        assert_eq!(removed, 2, "one post-boundary message + the ratchet");
+
+        let remaining = db.list_messages(conv).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].timestamp, 100, "pre-boundary message survives");
+        assert!(
+            db.load_ratchet(conv).unwrap().is_none(),
+            "include_session removes the ratchet regardless of the boundary"
+        );
     }
 
     #[test]

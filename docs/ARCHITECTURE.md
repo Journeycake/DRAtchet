@@ -1907,6 +1907,56 @@ request carry the requester's own preference directly
 (`MESSAGE_SCHEMA.md` §10), so most-restrictive-wins applies correctly to
 that one wipe without depending on announce-then-wait ordering at all.
 
+**Boundary-scoped wipe on the peer's side — v1.1 — implemented:** the
+behavior above (every message, unconditionally, on both sides) was the
+original v1 shape. It has an asymmetric follow-up: the *requester's own*
+device still gets the same full, unconditional local wipe described
+above — that's their own device, their own call — but a wipe request now
+only removes messages on the *peer's* side from at-or-after the moment
+the peer locally processed the requester's last `ConversationWipePolicyAnnounce`
+for that conversation. Concretely: Bob and Alice message under "no remote
+wipe," Bob changes his policy and announces it, they keep messaging, Bob
+wipes — Bob's own chat goes to zero; Alice keeps everything from before
+she processed Bob's announcement and loses everything from after, with no
+special-casing for when the wipe request itself happens to arrive.
+
+- **The boundary is derived locally, on each side, from events already
+  processed — nothing new travels on the wire.** Two independent
+  `(timestamp, sequence)` stamps (`MESSAGE_SCHEMA.md` §10's own
+  `(m.timestamp, m.sequence)` tie-break pair, reused rather than
+  reinvented): the side that *receives* an announcement stamps its own
+  local position the moment it finishes processing it
+  (`peer_wipe_boundary_timestamp`/`_sequence` on `store::Contact`) — this
+  is what later gates that side's own compliance with a wipe request from
+  that peer; the side that *sends* an announcement stamps its own
+  position the moment the send is acked (`wipe_boundary_timestamp`/
+  `_sequence`) — used only locally, to preview how much of its own
+  history the peer likely still has.
+- **`preview_conversation_wipe`, called before the request is ever
+  sent**: read-only, no network access, returns `will_remove_locally`
+  (always everything — the local wipe is unconditional) and
+  `peer_likely_keeps` (messages saved before this side's own last-acked
+  announce to that peer). The UI's "clear conversation" confirm step
+  shows this inline once armed, before the user commits — Bob sees, in
+  advance, how many messages will likely remain on Alice's device.
+- **An estimate, never a guarantee** — the same "no delivery receipt"
+  limitation the rest of this section already documents applies here too:
+  this side only knows its announce was *sent*, not that the peer
+  actually received and processed it before the wipe fires.
+- **Purely additive — a conversation where neither side has ever
+  announced a wipe policy keeps the original v1 behavior unchanged on
+  both sides**: with no boundary ever recorded, a wipe request has nothing
+  to scope against and falls back to the full, unconditional wipe
+  documented above. Both boundary fields are `Option`, `None` until the
+  first announce is sent or processed.
+- **A peer who never actually received the announcement** (lost in
+  transit, offline the whole time) never got a boundary stamped either —
+  their `peer_wipe_boundary_timestamp` stays `None`, so a wipe request
+  from that requester still falls back to the old, unscoped full wipe on
+  their side. Accepted as an inherent consequence of the boundary being
+  local and receipt-triggered rather than a guaranteed cross-device
+  handshake, not treated as a bug to work around.
+
 ## 12. Deployment models: pure peer-to-peer vs. server-based
 
 Everything above frames Tier 0/1/2 as layered, composable choices. This

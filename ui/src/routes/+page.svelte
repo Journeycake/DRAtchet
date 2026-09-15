@@ -34,6 +34,14 @@
     expires_at: number;
   };
 
+  // Preview of a not-yet-sent "clear conversation" — see
+  // `dratchet_app::preview_conversation_wipe`'s doc comment for what
+  // `peer_likely_keeps` does and doesn't guarantee.
+  type WipePreviewDto = {
+    will_remove_locally: number;
+    peer_likely_keeps: number;
+  };
+
   // §6.1: surfaced once at startup when `reconcile_own_profile` had to
   // fall back to a new discriminator because the directory forgot this
   // device owned its old one (a server restart) and someone else claimed
@@ -127,6 +135,8 @@
   let clearBusy = $state(false);
   let clearResult = $state("");
   let clearError = $state("");
+  let clearPreview: WipePreviewDto | null = $state(null);
+  let clearPreviewError = $state("");
   let policyBusy = $state(false);
   let policyError = $state("");
   let pendingWipeBusy = $state(false);
@@ -140,6 +150,8 @@
     clearArmed = false;
     clearResult = "";
     clearError = "";
+    clearPreview = null;
+    clearPreviewError = "";
     policyError = "";
     pendingWipeError = "";
     if (!contact.verified) return;
@@ -192,6 +204,8 @@
     clearArmed = false;
     clearResult = "";
     clearError = "";
+    clearPreview = null;
+    clearPreviewError = "";
     policyError = "";
   }
 
@@ -221,11 +235,24 @@
   }
 
   // §11.9a's "delete for everyone" — same two-click armed-confirm pattern
-  // as the Danger Zone's quick wipe, for UI consistency.
+  // as the Danger Zone's quick wipe, for UI consistency. The moment it
+  // becomes armed, also fetch a preview of how much of this side's
+  // history the peer will likely still keep after complying (an estimate
+  // — see `preview_conversation_wipe`'s doc comment) and show it inline;
+  // the existing second click becomes "confirm despite this warning."
   async function clearConversation() {
     if (!selected) return;
     if (!clearArmed) {
       clearArmed = true;
+      clearPreview = null;
+      clearPreviewError = "";
+      try {
+        clearPreview = await invoke<WipePreviewDto>("preview_conversation_wipe", {
+          fingerprint: selected.fingerprint,
+        });
+      } catch (e) {
+        clearPreviewError = String(e);
+      }
       return;
     }
     clearBusy = true;
@@ -237,6 +264,7 @@
       });
       clearResult = `Cleared ${removed} record${removed === 1 ? "" : "s"}.`;
       clearArmed = false;
+      clearPreview = null;
       await selectContact(selected);
     } catch (e) {
       clearError = String(e);
@@ -587,6 +615,16 @@
                 <div class="menu-error">{policyError}</div>
               {/if}
               <div class="menu-divider"></div>
+              {#if clearArmed && clearPreview && clearPreview.peer_likely_keeps > 0}
+                <div class="menu-warning">
+                  {clearPreview.peer_likely_keeps} message{clearPreview.peer_likely_keeps === 1
+                    ? ""
+                    : "s"} from before your last policy change may remain on their device.
+                </div>
+              {/if}
+              {#if clearArmed && clearPreviewError}
+                <div class="menu-error">{clearPreviewError}</div>
+              {/if}
               <button
                 class="menu-clear-button"
                 class:armed={clearArmed}
@@ -1184,6 +1222,13 @@
     color: var(--red);
     font-size: 12px;
     margin-top: 6px;
+  }
+
+  .menu-warning {
+    color: var(--amber);
+    font-size: 12px;
+    margin-top: 6px;
+    margin-bottom: 6px;
   }
 
   .toast-stack {

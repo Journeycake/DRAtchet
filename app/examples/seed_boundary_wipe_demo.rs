@@ -1,37 +1,38 @@
-//! Dev-only utility: creates two real, mutually-paired `Db` files an
-//! operator can point two separate `ui/` (Tauri) instances at to manually
-//! test live send/receive networking against each other. Requires a real
-//! `dratchetd` already running on `ws://127.0.0.1:8787/v1/ws` (`cargo run
-//! --bin dratchetd` from the repo root).
+//! Dev-only demo/verification tool for the boundary-scoped remote wipe
+//! feature (`ARCHITECTURE.md` §11.9a's "Boundary-scoped wipe on the
+//! peer's side" note): seeds two real, verified, paired `Db` files with
+//! the exact scenario the feature was built for — bob and alice exchange
+//! messages under the default policy, bob announces a wipe-policy change,
+//! they keep messaging, and bob is left one click away from a wipe whose
+//! preview should show alice keeping the 2 pre-announce messages.
 //!
-//! Reuses the exact real X3DH-via-directory setup
-//! `app/tests/pairing_and_chat.rs` already proves works end-to-end, then
-//! completes the routing-id exchange for real through `dratchet_app`'s
-//! own `announce_routing_id`/`receive_pending` — dogfooding the same
-//! functions the UI calls, not hand-rolled protocol code. Both contacts
-//! are left `Pending` (not `Verified`) on purpose, so the app's
-//! verification-gate UI stays exercisable against real data too.
+//! Reuses `seed_dev_pair.rs`'s exact real X3DH + routing-id-exchange
+//! setup, then layers the wipe-policy scenario on top with real
+//! `send_message`/`receive_pending`/`announce_wipe_policy` calls — no
+//! hand-rolled protocol state.
 //!
-//! Run once per fresh pair of DB files:
+//! Run once per fresh pair, with `dratchetd` already running:
 //! ```sh
-//! cargo run -p dratchet-app --example seed_dev_pair
+//! cargo run -p dratchet-app --example seed_boundary_wipe_demo
 //! ```
 //!
-//! Pass `--verified` to additionally mark both sides `Verified` right
-//! after the routing-id exchange (skipping the app's verification-gate
-//! UI) — useful for testing live send/receive directly without also
-//! exercising the (separately-tested) verification flow. Default (no
-//! flag) behavior is unchanged: both sides stay `Pending`.
-//!
-//! Then point two `ui/` instances at the two output files, e.g.:
+//! Then point two `ui/` instances at the two output files (from
+//! `ui/src-tauri`):
 //! ```sh
-//! DRATCHET_DEV_DB=/tmp/dratchet-dev-a.redb cargo run   # from ui/src-tauri
-//! DRATCHET_DEV_DB=/tmp/dratchet-dev-b.redb cargo run   # a second instance
+//! DRATCHET_DEV_DB=/tmp/dratchet-wipe-demo-bob.redb cargo run
+//! DRATCHET_DEV_DB=/tmp/dratchet-wipe-demo-alice.redb cargo run
 //! ```
+//! Open bob's conversation with alice, open the conversation menu, and
+//! click "Clear conversation" once (arming it) — the inline warning
+//! should read "2 messages from before your last policy change may
+//! remain on their device."
 
 use std::sync::Arc;
 
-use dratchet_app::{announce_routing_id, receive_pending, record_verification_result};
+use dratchet_app::{
+    announce_routing_id, announce_wipe_policy, receive_pending, record_verification_result,
+    send_message,
+};
 use dratchet_client::net::Connection;
 use dratchet_core::account::Account;
 use dratchet_core::prekey::{OneTimePrekeyPublic, PrekeyBundle, SignedPrekeyPublic};
@@ -75,15 +76,14 @@ fn to_core_bundle(wire: &FetchedBundleWire) -> PrekeyBundle {
 
 #[tokio::main]
 async fn main() {
-    let verified = std::env::args().any(|a| a == "--verified");
-    let path_a = std::env::temp_dir().join("dratchet-dev-a.redb");
-    let path_b = std::env::temp_dir().join("dratchet-dev-b.redb");
+    let path_bob = std::env::temp_dir().join("dratchet-wipe-demo-bob.redb");
+    let path_alice = std::env::temp_dir().join("dratchet-wipe-demo-alice.redb");
 
-    if path_a.exists() || path_b.exists() {
+    if path_bob.exists() || path_alice.exists() {
         eprintln!(
             "{} or {} already exists — delete both first if you want a fresh pair.",
-            path_a.display(),
-            path_b.display()
+            path_bob.display(),
+            path_alice.display()
         );
         std::process::exit(1);
     }
@@ -92,20 +92,7 @@ async fn main() {
         "Connecting to {SERVER_URL} (start `cargo run --bin dratchetd` first if this hangs)..."
     );
 
-    // --- Real X3DH via the directory, exactly as
-    // app/tests/pairing_and_chat.rs proves works. ---
-    //
-    // Username is randomized per run: `dratchetd` keeps its directory
-    // in-memory for as long as the process lives, so a fixed "bob#5001"
-    // would collide with whatever identity claimed it on a previous run
-    // against the same long-lived server — and since `PublishBundle` has
-    // no server->client acknowledgment, a rejected (UsernameTaken)
-    // publish fails *silently*: the fetch below would then return the
-    // *other* run's stale bundle instead of this run's, and the ratchet
-    // this run constructs from its own fresh private keys would never
-    // match it (a real bug this exact way, caught while first running
-    // this tool).
-    let username = format!("bobdev{:04x}", OsRng.next_u32() as u16);
+    let username = format!("wipedemo{:04x}", OsRng.next_u32() as u16);
     let discriminator = (OsRng.next_u32() % 10_000) as u16;
 
     let mut bob = Account::generate().expect("generate bob");
@@ -152,14 +139,6 @@ async fn main() {
     let mut fetcher = Connection::connect(SERVER_URL).await.expect("connect");
     let (_, _challenge): (_, AuthChallenge) = fetcher.recv().await.expect("recv auth challenge");
 
-    // PublishBundle has no server->client acknowledgment (by design — see
-    // ws.rs), so there's no way to know from the wire alone that the
-    // publish above has actually landed in the directory yet before
-    // fetching it back. A real client would only ever fetch a contact's
-    // *existing* bundle, never one it just published itself in the same
-    // breath, so this race is specific to this seeding tool — worked
-    // around here with a short bounded retry rather than by touching the
-    // protocol.
     let fetched = 'fetch: {
         for attempt in 0..20 {
             fetcher
@@ -219,14 +198,12 @@ async fn main() {
     )
     .expect("bob ratchet init");
 
-    // --- Each side saves its account, Pending contact, and ratchet to a
-    // real db file. ---
     let alice_fp = alice.identity.fingerprint().as_bytes().to_vec();
     let bob_fp = bob.identity.fingerprint().as_bytes().to_vec();
     let alice_routing_id = random_routing_id();
     let bob_routing_id = random_routing_id();
 
-    let db_alice = Arc::new(Db::create(&path_a, DEV_PASSPHRASE).expect("create db a"));
+    let db_alice = Arc::new(Db::create(&path_alice, DEV_PASSPHRASE).expect("create alice db"));
     db_alice.save_account(&alice).expect("save alice account");
     let mut alice_contact = Contact {
         fingerprint: bob_fp.clone(),
@@ -254,7 +231,7 @@ async fn main() {
         .save_ratchet(conv_id, &alice_ratchet)
         .expect("save alice's ratchet");
 
-    let db_bob = Arc::new(Db::create(&path_b, DEV_PASSPHRASE).expect("create db b"));
+    let db_bob = Arc::new(Db::create(&path_bob, DEV_PASSPHRASE).expect("create bob db"));
     db_bob.save_account(&bob).expect("save bob account");
     let mut bob_contact = Contact {
         fingerprint: alice_fp.clone(),
@@ -282,10 +259,6 @@ async fn main() {
         .save_ratchet(conv_id, &bob_ratchet)
         .expect("save bob's ratchet");
 
-    // --- Routing-id exchange for real, through dratchet_app's own
-    // functions — sequential, since the X3DH responder (bob) has no
-    // sending chain until it decrypts something (see announce_routing_id's
-    // doc). ---
     let mut alice_conn = Connection::connect(SERVER_URL).await.expect("connect");
     alice_conn
         .authenticate(&alice)
@@ -324,29 +297,60 @@ async fn main() {
         .expect("load alice's contact")
         .expect("alice's contact should exist");
 
-    assert_eq!(
-        alice_contact.mailbox_id, bob_contact.mailbox_id,
-        "both sides should have converged on the identical mailbox"
-    );
+    alice_contact = record_verification_result(&db_alice, alice_contact, true)
+        .expect("mark alice's contact verified");
+    bob_contact = record_verification_result(&db_bob, bob_contact, true)
+        .expect("mark bob's contact verified");
 
-    if verified {
-        record_verification_result(&db_alice, alice_contact, true)
-            .expect("mark alice's contact verified");
-        record_verification_result(&db_bob, bob_contact, true)
-            .expect("mark bob's contact verified");
+    // --- The boundary-scoped wipe scenario itself. ---
+    for text in [&b"pre-announce message 1"[..], &b"pre-announce message 2"[..]] {
+        send_message(&db_bob, &mut bob_conn, &bob, &bob_contact, text)
+            .await
+            .expect("bob send pre-announce message");
+        receive_pending(&db_alice, &mut alice_conn, &alice, &alice_contact)
+            .await
+            .expect("alice receive pre-announce message");
     }
 
-    let state_label = if verified { "Verified" } else { "Pending" };
-    println!("\nSeeded two real, paired ({state_label}) contacts:");
+    bob_contact = announce_wipe_policy(&db_bob, &mut bob_conn, &bob, &bob_contact, false, false)
+        .await
+        .expect("bob announce wipe policy change");
+
+    receive_pending(&db_alice, &mut alice_conn, &alice, &alice_contact)
+        .await
+        .expect("alice receive bob's wipe policy announce");
+    alice_contact = db_alice
+        .load_contact(&bob_fp)
+        .expect("load alice's contact")
+        .expect("alice's contact should exist");
+
+    for text in [
+        &b"post-announce message 1"[..],
+        &b"post-announce message 2"[..],
+    ] {
+        send_message(&db_bob, &mut bob_conn, &bob, &bob_contact, text)
+            .await
+            .expect("bob send post-announce message");
+        receive_pending(&db_alice, &mut alice_conn, &alice, &alice_contact)
+            .await
+            .expect("alice receive post-announce message");
+    }
+
+    println!("\nSeeded two real, verified, paired contacts with the boundary-scoped-wipe demo:");
     println!(
-        "  alice's db: {} (contact: {username}#{discriminator:04})",
-        path_a.display()
+        "  bob's db:   {} (contact: alice — this is the requester)",
+        path_bob.display()
     );
     println!(
-        "  bob's db:   {} (contact: alice, no directory registration)",
-        path_b.display()
+        "  alice's db: {} (contact: {username}#{discriminator:04} — this is the peer)",
+        path_alice.display()
     );
     println!("\nPoint two ui/ instances at these, e.g. from ui/src-tauri:");
-    println!("  DRATCHET_DEV_DB={} cargo run", path_a.display());
-    println!("  DRATCHET_DEV_DB={} cargo run", path_b.display());
+    println!("  DRATCHET_DEV_DB={} cargo run", path_bob.display());
+    println!("  DRATCHET_DEV_DB={} cargo run", path_alice.display());
+    println!(
+        "\nOn bob's client: open the conversation menu, click \"Clear conversation\" once to \
+         arm it. The inline warning should read \"2 messages from before your last policy \
+         change may remain on their device.\""
+    );
 }
