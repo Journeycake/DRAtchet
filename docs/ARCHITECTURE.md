@@ -578,6 +578,20 @@ keepalive/heartbeat traffic; it's the same class of gap §4.5's outbox
 retention already documents ("permanently undelivered … a chronically
 flaky connection, or a recipient who never comes back").
 
+**A false-positive-delivery bug in the first cut, found and fixed via this
+feature's own live two-instance UI testing:** the cumulative `highest_n`
+must mean "every message `0..=highest_n` was actually decrypted," not
+merely "the receive chain's position has passed `highest_n`" — those two
+diverge exactly when a message is skipped (out-of-order arrival, or
+genuinely lost, which `docs/DELIVERY_FAILURE_FINDINGS.md`'s server-crash
+testing already established as real). The first implementation conflated
+them, so a permanently-lost message could flip to `delivered: true` on the
+sender's side purely because a *later* message on the same chain was
+piggyback-acked — a real message the recipient never received, silently
+shown as confirmed. Fixed at the source
+(`RatchetState::content_delivered_contiguous`, `MESSAGE_SCHEMA.md` §7a's
+implementation note) rather than papered over above it.
+
 ## 5. Client / platform architecture
 
 **Decided:** one stack, one codebase, for all three target platforms —

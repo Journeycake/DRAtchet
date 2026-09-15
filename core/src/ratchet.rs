@@ -94,6 +94,20 @@ pub struct RatchetState {
     /// already removed from `skipped` via a cache hit; those are harmless no-ops when
     /// popped, since eviction only ever removes-if-present.
     skipped_order: VecDeque<(DhPubBytes, u32)>,
+
+    /// Highest `n` such that every message `0..=n` on the *current* receiving chain
+    /// has genuinely had its content decrypted (as opposed to merely skipped-and-
+    /// cached, per `skipped` above) — the basis for [`RatchetState::receiving_progress`].
+    /// Deliberately distinct from `recv_n`, which also advances past skipped,
+    /// not-yet-received positions: conflating the two let a cumulative piggyback ack
+    /// falsely claim a skipped-and-never-arrived message as delivered, since `recv_n`
+    /// alone can't tell "decrypted" apart from "skipped over." Reset to `None` on
+    /// every DH ratchet step — a fresh chain starts with nothing delivered.
+    content_delivered_contiguous: Option<u32>,
+    /// `n`s beyond `content_delivered_contiguous` that have already been decrypted
+    /// out of order (arrived ahead of a still-missing earlier message) — folded into
+    /// `content_delivered_contiguous` once the gap closes via [`Self::record_content_delivered`].
+    content_delivered_out_of_order: std::collections::BTreeSet<u32>,
 }
 
 impl RatchetState {
@@ -129,6 +143,8 @@ impl RatchetState {
             prev_chain_len: 0,
             skipped: HashMap::new(),
             skipped_order: VecDeque::new(),
+            content_delivered_contiguous: None,
+            content_delivered_out_of_order: std::collections::BTreeSet::new(),
         })
     }
 
@@ -160,6 +176,8 @@ impl RatchetState {
             prev_chain_len: 0,
             skipped: HashMap::new(),
             skipped_order: VecDeque::new(),
+            content_delivered_contiguous: None,
+            content_delivered_out_of_order: std::collections::BTreeSet::new(),
         })
     }
 
@@ -227,6 +245,14 @@ impl RatchetState {
             let plaintext =
                 aead_decrypt(message_key, &envelope.header_bytes(), &envelope.ciphertext)?;
             self.skipped.remove(&skipped_id);
+            // Only fold into the current chain's contiguous-delivery tracker if this
+            // skipped key actually belonged to the *current* chain — a stale skipped
+            // key from a chain that's since been superseded by a DH ratchet step
+            // (still in cache until evicted) is irrelevant to the current chain's
+            // progress.
+            if self.dh_remote.map(|r| r.to_bytes()) == Some(envelope.dh_pub) {
+                self.record_content_delivered(envelope.n);
+            }
             return Ok(plaintext);
         }
 
@@ -308,6 +334,10 @@ impl RatchetState {
             self.prev_chain_len = self.send_n;
             self.send_n = 0;
             self.sending_chain_key = Some(Zeroizing::new(step.new_sending_chain_key));
+            // A fresh chain starts with nothing delivered yet — see
+            // `content_delivered_contiguous`'s doc.
+            self.content_delivered_contiguous = None;
+            self.content_delivered_out_of_order.clear();
         }
         self.receiving_chain_key = Some(Zeroizing::new(final_receiving_chain_key));
         self.recv_n = envelope.n + 1;
@@ -316,8 +346,38 @@ impl RatchetState {
             self.skipped_order.push_back(id);
         }
         self.evict_oldest_skipped_beyond_lifetime_bound();
+        self.record_content_delivered(envelope.n);
 
         Ok(plaintext)
+    }
+
+    /// Fold a just-decrypted `n` into the current chain's contiguous-delivery
+    /// frontier (`content_delivered_contiguous`), pulling in any already-delivered
+    /// out-of-order entries the gap's closure now makes contiguous too. Called for
+    /// every successful decrypt on the *current* chain — both the fast (cached
+    /// skipped-key) and slow paths in [`Self::decrypt_raw`] — never for a stale
+    /// chain's skipped key or before a DH step's reset has already run.
+    fn record_content_delivered(&mut self, n: u32) {
+        let expected_next = self.content_delivered_contiguous.map_or(0, |c| c + 1);
+        match n.cmp(&expected_next) {
+            std::cmp::Ordering::Equal => {
+                let mut new_contig = n;
+                while self
+                    .content_delivered_out_of_order
+                    .remove(&(new_contig + 1))
+                {
+                    new_contig += 1;
+                }
+                self.content_delivered_contiguous = Some(new_contig);
+            }
+            std::cmp::Ordering::Greater => {
+                self.content_delivered_out_of_order.insert(n);
+            }
+            // Already covered by the contiguous frontier (a duplicate/retransmit) —
+            // decrypt_raw's skipped-key removal and AEAD authentication already
+            // prevent this from happening in practice; harmless no-op if it ever did.
+            std::cmp::Ordering::Less => {}
+        }
     }
 
     /// Enforce [`SKIPPED_CACHE_LIFETIME_MULTIPLIER`] `* max_skip` as a hard cap on the
@@ -355,26 +415,27 @@ impl RatchetState {
     }
 
     /// The current receiving chain's identity (`dh_pub`) and the highest
-    /// message index successfully decrypted on it so far — used to build
-    /// a TCP-style cumulative "next expected sequence" ack piggybacked on
-    /// outgoing chat messages (`dratchet_core::payload::ChatContent`'s
-    /// `piggyback_ack`), on top of the existing dedicated per-message
-    /// `DeliveryAck`. `None` until at least one message has actually been
-    /// decrypted on the current chain — `dh_remote`/`recv_n` are both
-    /// already meaningful immediately after `init_as_initiator`/
-    /// `init_as_responder` (needed to decrypt the *first* message), but
-    /// `recv_n == 0` at that point means "nothing received yet on this
-    /// chain," not "message 0 was received," so it must not be reported
-    /// as an ack. Deliberately scoped to only the *current* chain, not
-    /// every historical one this ratchet has ever stepped through — the
-    /// same "next expected in the current stream" scope TCP's cumulative
-    /// ack has, not a full historical ledger.
+    /// message index such that *every* message `0..=n` on it has genuinely
+    /// had its content decrypted — used to build a TCP-style cumulative
+    /// "next expected sequence" ack piggybacked on outgoing chat messages
+    /// (`dratchet_core::payload::ChatContent`'s `piggyback_ack`), on top of
+    /// the existing dedicated per-message `DeliveryAck`. `None` until
+    /// message `0` on the current chain has actually been decrypted —
+    /// deliberately **not** the same as "`recv_n` advanced past it": `recv_n`
+    /// also advances past a *skipped* position (out-of-order delivery, or a
+    /// message that never arrives at all), which only caches a key for
+    /// later, decrypting nothing. Reporting `recv_n`'s position here would
+    /// let a cumulative ack falsely claim a still-undelivered skipped
+    /// message as received — see `content_delivered_contiguous`'s doc and
+    /// `tests::receiving_progress_never_claims_a_permanently_skipped_message_as_delivered`.
+    /// Deliberately scoped to only the *current* chain, not every
+    /// historical one this ratchet has ever stepped through — the same
+    /// "next expected in the current stream" scope TCP's cumulative ack
+    /// has, not a full historical ledger.
     pub fn receiving_progress(&self) -> Option<(Vec<u8>, u32)> {
-        if self.recv_n == 0 {
-            return None;
-        }
         let dh_remote = self.dh_remote?;
-        Some((dh_remote.to_bytes().to_vec(), self.recv_n - 1))
+        let highest = self.content_delivered_contiguous?;
+        Some((dh_remote.to_bytes().to_vec(), highest))
     }
 
     /// Serialize this ratchet's full live state to bytes — CBOR-encoded,
@@ -443,6 +504,18 @@ struct ExportedRatchetState {
     prev_chain_len: u32,
     skipped: Vec<ExportedSkippedEntry>,
     skipped_order: Vec<ExportedSkippedOrderEntry>,
+    /// Added after the initial `receiving_progress` shipped conflating
+    /// "skipped past" with "delivered" (the bug this field's introduction
+    /// fixed) — defaults to "nothing delivered yet" on an older export
+    /// that predates it. That's a conservative, safe default: it can only
+    /// under-report an already-delivered message as not-yet-confirmed
+    /// (never the reverse), and self-heals the moment this chain's next DH
+    /// ratchet step resets it fresh — same as any other still-genuinely-
+    /// mid-chain gap.
+    #[serde(default)]
+    content_delivered_contiguous: Option<u32>,
+    #[serde(default)]
+    content_delivered_out_of_order: Vec<u32>,
 }
 
 impl From<&RatchetState> for ExportedRatchetState {
@@ -475,6 +548,12 @@ impl From<&RatchetState> for ExportedRatchetState {
                     dh_pub: dh.0.to_vec(),
                     n: *n,
                 })
+                .collect(),
+            content_delivered_contiguous: r.content_delivered_contiguous,
+            content_delivered_out_of_order: r
+                .content_delivered_out_of_order
+                .iter()
+                .copied()
                 .collect(),
         }
     }
@@ -550,6 +629,8 @@ impl TryFrom<ExportedRatchetState> for RatchetState {
             prev_chain_len: e.prev_chain_len,
             skipped,
             skipped_order,
+            content_delivered_contiguous: e.content_delivered_contiguous,
+            content_delivered_out_of_order: e.content_delivered_out_of_order.into_iter().collect(),
         })
     }
 }
@@ -878,6 +959,125 @@ mod tests {
         // the DH ratchet boundary to still make sense of a1 once it arrives.
         assert_eq!(read_chat(&bob.decrypt_raw(&a2).unwrap()), "a2");
         assert_eq!(read_chat(&bob.decrypt_raw(&a1).unwrap()), "a1");
+    }
+
+    #[test]
+    fn receiving_progress_is_none_until_message_zero_is_actually_decrypted() {
+        let (mut alice, mut bob) = matched_pair();
+        assert_eq!(
+            bob.receiving_progress(),
+            None,
+            "nothing decrypted yet on this chain"
+        );
+
+        let e0 = alice.encrypt(&chat("zero")).unwrap();
+        let e1 = alice.encrypt(&chat("one")).unwrap();
+
+        // Deliver message 1 first, skipping over message 0 — bob's `recv_n`
+        // advances past 0, but 0's *content* hasn't been decrypted, only its key
+        // cached for later. `receiving_progress` must not claim 0 as delivered.
+        bob.decrypt_raw(&e1).unwrap();
+        assert_eq!(
+            bob.receiving_progress(),
+            None,
+            "message 0 was skipped, not decrypted — nothing contiguous from the start yet"
+        );
+
+        // Once 0 actually arrives and decrypts, the gap closes and both are
+        // correctly reported as delivered.
+        bob.decrypt_raw(&e0).unwrap();
+        let (dh_pub, highest) = bob.receiving_progress().expect("now delivered");
+        assert_eq!(highest, 1);
+        assert_eq!(
+            dh_pub,
+            alice.dh_self.as_ref().unwrap().1.as_bytes().to_vec()
+        );
+    }
+
+    /// The bug this whole mechanism exists to close, found via this session's own
+    /// live UI testing: a cumulative "next expected sequence" ack must never claim a
+    /// message as delivered when it was only ever skipped-and-cached, not actually
+    /// decrypted — otherwise a sender sees a false "delivered" confirmation for a
+    /// message the recipient never really got and never will (its skipped key just
+    /// sits in the cache, unused, since no later copy of it is ever going to arrive).
+    #[test]
+    fn receiving_progress_never_claims_a_permanently_skipped_message_as_delivered() {
+        let (mut alice, mut bob) = matched_pair();
+        let e0 = alice.encrypt(&chat("lost forever")).unwrap();
+        let e1 = alice.encrypt(&chat("arrives fine")).unwrap();
+        let _ = e0; // simulates message 0 never reaching bob at all (permanent loss)
+
+        bob.decrypt_raw(&e1).unwrap();
+        assert_eq!(
+            bob.receiving_progress(),
+            None,
+            "message 1 decrypted, but message 0 — still skipped, never delivered — \
+             must not be reported as received just because the chain moved past it"
+        );
+
+        // Bob's own next message must therefore carry no piggyback ack at all yet —
+        // the app layer (`dratchet_app::send_message`) maps `None` here to "omit
+        // `piggyback_ack`", so this is the exact guarantee that closes the false-
+        // positive-delivery bug at its source.
+    }
+
+    #[test]
+    fn receiving_progress_catches_up_once_an_out_of_order_gap_closes() {
+        let (mut alice, mut bob) = matched_pair();
+        let e0 = alice.encrypt(&chat("zero")).unwrap();
+        let e1 = alice.encrypt(&chat("one")).unwrap();
+        let e2 = alice.encrypt(&chat("two")).unwrap();
+
+        bob.decrypt_raw(&e2).unwrap();
+        assert_eq!(bob.receiving_progress(), None, "0 and 1 both still missing");
+        bob.decrypt_raw(&e1).unwrap();
+        assert_eq!(
+            bob.receiving_progress(),
+            None,
+            "1 arrived, but 0 is still missing — 1 alone can't be reported \
+             without 0, since the ack is cumulative, not per-message"
+        );
+        bob.decrypt_raw(&e0).unwrap();
+        let (_, highest) = bob
+            .receiving_progress()
+            .expect("0 closes the gap, pulling in the already-delivered 1 and 2");
+        assert_eq!(highest, 2);
+    }
+
+    #[test]
+    fn receiving_progress_resets_on_a_dh_ratchet_step_not_carried_over_from_the_old_chain() {
+        let (mut alice, mut bob) = matched_pair();
+        let a0 = alice.encrypt(&chat("a0")).unwrap();
+        let a1 = alice.encrypt(&chat("a1")).unwrap();
+        let a2 = alice.encrypt(&chat("a2")).unwrap();
+        bob.decrypt_raw(&a0).unwrap();
+        bob.decrypt_raw(&a1).unwrap();
+        bob.decrypt_raw(&a2).unwrap();
+        assert_eq!(
+            bob.receiving_progress().unwrap().1,
+            2,
+            "bob has genuinely decrypted three messages on alice's first chain"
+        );
+
+        // Alice's reply-to-bob's-reply ratchets *her* sending chain onto a new
+        // key (triggered when she processes bob's own reply below) — so this
+        // next message from alice arrives on a brand-new chain from bob's
+        // point of view, restarting at n=0 on that chain.
+        let b0 = bob.encrypt(&chat("b0")).unwrap();
+        alice.decrypt_raw(&b0).unwrap();
+        let a3 = alice.encrypt(&chat("a3")).unwrap();
+        assert_ne!(
+            a3.dh_pub, a0.dh_pub,
+            "a3 really is on a different chain than a0/a1/a2"
+        );
+
+        bob.decrypt_raw(&a3).unwrap();
+        assert_eq!(
+            bob.receiving_progress().unwrap().1,
+            0,
+            "the new chain starts fresh at 0 — bob's progress must not still \
+             report 2 from the old, now-superseded chain"
+        );
     }
 
     #[test]
@@ -1218,6 +1418,8 @@ mod tests {
             prev_chain_len: r.prev_chain_len,
             skipped: r.skipped.clone(),
             skipped_order: r.skipped_order.clone(),
+            content_delivered_contiguous: r.content_delivered_contiguous,
+            content_delivered_out_of_order: r.content_delivered_out_of_order.clone(),
         }
     }
 

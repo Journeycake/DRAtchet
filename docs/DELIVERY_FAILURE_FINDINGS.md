@@ -604,3 +604,64 @@ is transparent to the ordinary, non-colliding case.
    ambiguity for real send-latency/backpressure complexity, and Double
    Ratchet's whole design point is *not* forcing turn-taking to be
    strictly synchronous.
+
+## Piggyback ack (found building and testing the TCP-style cumulative ack, `ARCHITECTURE.md` §4.6a)
+
+### 29. `PiggybackAck.highest_n` could claim a permanently-skipped message as delivered — **fixed**
+
+**Severity: high** — a false *positive* delivery confirmation, not a false
+negative. Every other finding in this document is some form of "a genuinely
+delivered message reads as undelivered" (annoying, but the sender still
+knows to be skeptical). This one is the opposite and worse for an E2E
+messenger: the sender sees `delivered: true` — full confidence — for a
+message the recipient never actually received and never will.
+
+Found live, not by code review: a two-real-instance Xvfb UI test built to
+demonstrate `4.6a`'s "uncertain" indicator and its piggyback resolution
+(this session's own verification of that feature) killed the relay server
+between a recipient's genuine decrypt of one message and their dedicated
+`DeliveryAck` reaching the sender — deliberately reproducing the exact
+race `4.6a` exists to cover. A *second*, unrelated message from the same
+sender had been silently lost before the recipient ever saw its envelope
+at all (the same in-memory-mailbox loss finding #27's neighbors already
+established). Once the recipient's next real reply resolved the *first*
+message via its `PiggybackAck`, the *second, genuinely never-received*
+message also flipped to `delivered: true` on the sender's screen —
+confirmed at the local-database level, not just the UI. See the session
+transcript's three screenshots: the recipient's own window proves it never
+received that message's content, while the sender's window shows it
+double-checkmarked anyway.
+
+**Root cause**: `RatchetState::receiving_progress()` reported `recv_n - 1`
+as `highest_n` — the receive chain's raw cryptographic position, which
+advances past a *skipped* message (out-of-order arrival, or permanent
+loss) exactly the same way it advances past one whose content was
+genuinely decrypted. `MESSAGE_SCHEMA.md` §7a's own contract for
+`highest_n` ("I have successfully decrypted every message from `n = 0`
+through `highest_n`, inclusive") was correct as written; the code just
+didn't live up to it, since `recv_n` alone can't distinguish "decrypted"
+from "skipped over."
+
+**Fixed**: `RatchetState` now tracks `content_delivered_contiguous`
+(`core/src/ratchet.rs`) separately from `recv_n` — advanced only by a
+message whose content was actually decrypted, and only contiguously from
+`0`; an out-of-order arrival ahead of a still-missing message is held in
+`content_delivered_out_of_order` until the gap closes, never reported
+early. `receiving_progress()` now reports this instead of `recv_n - 1`,
+and resets to "nothing yet" on every DH ratchet step, same as `recv_n`
+conceptually always should have for this purpose. Five new unit tests in
+`core/src/ratchet.rs` (`receiving_progress_never_claims_a_permanently_skipped_message_as_delivered`
+chief among them) lock in the corrected contract; the existing
+`app/tests/uncertain_delivery_piggyback.rs` continued passing unchanged,
+confirming the fix is transparent to the ordinary, non-skipped case it
+already covered.
+
+**A real consequence of the fix, not a limitation to work around**: a
+permanently-skipped message now correctly blocks *every* later message on
+that chain from being piggyback-resolvable too, not just the skipped one
+— matching genuine TCP cumulative-ack semantics, where a gap in the byte
+stream can't be acked around either. `DeliveryAck` (§7, unaffected by this
+fix) still resolves each of those later messages individually and
+immediately in the ordinary case; only the piggyback backstop is scoped
+this strictly, and only for the remainder of that one chain's lifetime
+(a fresh DH ratchet step starts the tracking over).

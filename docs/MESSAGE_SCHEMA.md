@@ -329,6 +329,34 @@ also clears `uncertain` on every message it marks delivered) — there is no
 separate manual dismissal, since resolution is exactly what both ack paths
 already exist to do.
 
+**Implementation note — a false-positive-delivery bug, found and fixed via
+this feature's own live UI testing (`core::ratchet::RatchetState`):**
+`receiving_progress()`'s first cut reported `recv_n - 1` — the ratchet's
+raw receive-chain position — as `highest_n`. That position advances past a
+*skipped* message (one whose key was cached for later because a
+later-numbered message arrived first, or, worse, one that's permanently
+lost and will never arrive) exactly the same way it advances past a
+genuinely-decrypted one; the two are indistinguishable from `recv_n`
+alone. A live two-instance test that killed the server between a
+recipient's real decrypt and their `DeliveryAck` reaching the sender (the
+exact scenario this feature exists to cover) caught the consequence
+directly: a message the recipient had *never actually received* — its
+envelope was gone before they could fetch it, only a later message's
+`n` was ever decrypted — still flipped to `delivered: true` on the
+sender's side, because the cumulative ack's `highest_n` had skipped past
+it. **Fixed**: `RatchetState` now tracks `content_delivered_contiguous`
+separately from `recv_n` — advanced only by a message whose content was
+*actually decrypted*, and only contiguously from `0`, exactly matching
+this table's own "every message from `n = 0` through `highest_n`,
+inclusive" contract that the code hadn't actually lived up to. A
+permanently-skipped message now correctly blocks `receiving_progress()`
+(and so every downstream `PiggybackAck`) from reporting *anything* past
+it on that chain — matching real TCP cumulative-ack semantics, where a
+gap can't be skipped either — until the next DH ratchet step starts a
+fresh chain. See `core/src/ratchet.rs`'s
+`receiving_progress_never_claims_a_permanently_skipped_message_as_delivered`
+test.
+
 ## 8. Recovery profile negotiation (CBOR) — §7.2/§7.3/§7.5 of `ARCHITECTURE.md`
 
 | Field | Type | Notes |
