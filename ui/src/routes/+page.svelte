@@ -137,6 +137,18 @@
   let clearError = $state("");
   let clearPreview: WipePreviewDto | null = $state(null);
   let clearPreviewError = $state("");
+  // A plain (non-reactive) flag, deliberately *not* `$state`: checked and
+  // set synchronously, with no dependency on a reactive re-render ever
+  // landing. `clearBusy`'s `disabled` binding already blocks a second
+  // click under any realistic double-click timing (confirmed live — a
+  // real double-click's actual mousedown/mouseup interval always leaves
+  // enough time for Svelte to flush the disabled state first), but two
+  // click events dispatched back-to-back with literally zero delay
+  // between them — not achievable by a real mouse, but not something to
+  // leave unguarded either — can still both start running before either
+  // one's `clearBusy = true` reactive update has painted. This flag has
+  // no such gap: it's a plain synchronous variable.
+  let clearInFlight = false;
   let policyBusy = $state(false);
   let policyError = $state("");
   let pendingWipeBusy = $state(false);
@@ -255,6 +267,12 @@
       }
       return;
     }
+    // Checked and set synchronously, before the reactive `clearBusy`
+    // assignment below — closes the zero-delay-double-click gap
+    // `clearBusy`'s `disabled` binding alone doesn't cover (see
+    // `clearInFlight`'s own doc comment).
+    if (clearInFlight) return;
+    clearInFlight = true;
     clearBusy = true;
     clearError = "";
     clearResult = "";
@@ -270,6 +288,7 @@
       clearError = String(e);
     } finally {
       clearBusy = false;
+      clearInFlight = false;
     }
   }
 

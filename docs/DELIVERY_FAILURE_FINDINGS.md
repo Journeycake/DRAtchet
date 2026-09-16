@@ -1051,3 +1051,47 @@ invariant has a named, characterized failure mode to consult rather than
 rediscovering it from scratch. A real per-conversation lock is worth
 building the day a second call site is added — named here as a follow-up,
 not implemented speculatively.
+
+## UI double-fire on the "Confirm clear" wipe button (item 4 of the same edge-case sweep — confirmed narrow, fixed)
+
+`clearConversation` (`ui/src/routes/+page.svelte`)'s second click — the
+one that actually calls `request_conversation_wipe` — guarded against a
+double-fire with `disabled={clearBusy}`, a reactive `$state` binding set
+synchronously at the top of that branch. Reasoning alone couldn't settle
+whether that's actually enough: Svelte's reactive DOM updates flush on a
+microtask, not necessarily before a second, already-dispatched click
+event is processed, so the real question was purely empirical.
+
+Tested live in a real Chromium instance (not jsdom, not a mock DOM)
+against the actual, unmodified `+page.svelte` served by a real Vite dev
+server — only the Tauri native IPC bridge was stubbed
+(`window.__TAURI_INTERNALS__.invoke`), the standard way to exercise
+Tauri frontend code outside the native shell. Two click scenarios:
+
+- **Playwright's native `dblclick`** (real mousedown/mouseup pairs at a
+  realistic OS double-click interval — the actual mechanism a human
+  double-clicking a mouse produces): the guard held. Exactly one
+  `request_conversation_wipe` call, every run.
+- **Two raw `click` events dispatched back-to-back with zero delay
+  between dispatch calls** — tighter than any real mouse or OS input
+  queue can produce, but not provably unreachable (a macro mouse,
+  scripted input, or a future automated-test harness could do this):
+  **confirmed real** — two `request_conversation_wipe` calls, both
+  landing before `clearBusy`'s reactive update had painted.
+
+**Fixed**: added `clearInFlight`, a plain (deliberately non-`$state`)
+module-scope boolean checked and set synchronously as the very first
+statement of the confirm branch, before the reactive `clearBusy`
+assignment. A plain variable has no reactive-flush lag to race — closes
+the zero-delay gap outright, with no dependency on Svelte's render
+timing. Re-ran both scenarios against the fixed code: both now show
+exactly one call. `npm run check` clean.
+
+Not escalated further than this: even before the fix, a double-fire's
+worst-case consequence was contained on both ends — `db.wipe_conversation`/
+`_since` are proven atomic (finding #34's neighbors) so a second local
+wipe is a harmless no-op, and a duplicate `ConversationWipeRequest`
+reaching the peer is likewise a no-op on their side (`apply_entry`'s
+wipe-request arm re-scopes from the same boundary either time). The fix
+here closes the gap because it was cheap and fully proven, not because
+the alternative was unsafe.
