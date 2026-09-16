@@ -792,16 +792,15 @@ but the loop as a whole had no wrapping transaction, so nothing stopped
 a real process death between two iterations.
 
 Confirmed empirically, not just reasoned about, with a self-forking
-experiment (`app/examples/crash_mid_wipe.rs`): a worker process
-reproducing the loop's exact logic was `SIGKILL`ed at a deterministic
-point (synchronized on the worker's own progress output, not a timing
-guess). Reproduced across every run: the on-disk `Db` always reopened
-cleanly afterward (`redb`'s per-transaction durability held — no
-corruption), every pre-boundary message always survived, but the wipe
-itself was left genuinely partially applied — roughly half the
-post-boundary messages that should have been removed were still there,
-with nothing stored to distinguish "not yet processed" from "correctly
-protected."
+experiment: a worker process reproducing the loop's exact logic was
+`SIGKILL`ed at a deterministic point (synchronized on the worker's own
+progress output, not a timing guess). Reproduced across every run: the
+on-disk `Db` always reopened cleanly afterward (`redb`'s per-transaction
+durability held — no corruption), every pre-boundary message always
+survived, but the wipe itself was left genuinely partially applied —
+roughly half the post-boundary messages that should have been removed
+were still there, with nothing stored to distinguish "not yet processed"
+from "correctly protected."
 
 **Fixed**: `Db` gained `delete_many` (`store/src/db.rs`) — every key
 removed in **one** `write_txn` instead of one per key.
@@ -810,10 +809,18 @@ key (messages, and the ratchet if `include_session`) first, then remove
 them all in a single `delete_many` call. A crash can now only land
 before that transaction commits (conversation untouched, exactly its
 pre-wipe state) or after (conversation fully wiped) — never a partial
-result. Re-run against the fixed function (`crash_mid_wipe.rs` v2): 20+
-real `SIGKILL` trials across two message-count scales, sweeping a range
-of kill delays, produced zero partial outcomes — every trial landed on
-exactly one of the two valid states.
+result. Re-run against the fixed function: 30+ real `SIGKILL` trials
+across two message-count scales, sweeping a range of kill delays,
+produced zero partial outcomes — every trial landed on exactly one of
+the two valid states. Landed as a permanent, `#[ignore]`d regression test
+— `app/tests/crash_mid_wipe_atomicity.rs`,
+`cargo test -p dratchet-app --test crash_mid_wipe_atomicity -- --ignored
+--nocapture` — rather than a one-off manual experiment: it re-execs the
+compiled test binary itself as a real subprocess (libtest's own
+`--exact --ignored` selecting just the worker test, parameters passed
+via environment variables, since `#[test]` functions take none) so a
+future regression here would need someone to notice it wasn't run, not
+rediscover the bug from scratch.
 
 ### 33. `Db::message_sequence` resetting to 0 on `open` broke its own tie-break guarantee across a same-second restart — **fixed**
 
