@@ -364,7 +364,10 @@ async fn same_batch_announce_and_wipe_request_when_peer_is_offline_the_whole_tim
         2,
         "sanity: both post-boundary messages really were decrypted and saved during this batch"
     );
-    assert!(outcome.wipe_activity, "sanity: the wipe request really was processed in this same batch");
+    assert!(
+        outcome.wipe_activity,
+        "sanity: the wipe request really was processed in this same batch"
+    );
 
     let bob_contact_after = db_bob
         .load_contact(&bob_contact.fingerprint)
@@ -441,12 +444,25 @@ async fn same_batch_ask_before_delete_announce_and_wipe_request() {
     // From here on, bob does not poll again until the very end. Alice
     // announces her own matching preference *and* sends the wipe
     // request in the same offline stretch.
-    announce_wipe_policy(&db_alice, &mut alice_conn, &alice, &alice_contact, true, false)
-        .await
-        .unwrap();
-    send_message(&db_alice, &mut alice_conn, &alice, &alice_contact, b"one message")
-        .await
-        .unwrap();
+    announce_wipe_policy(
+        &db_alice,
+        &mut alice_conn,
+        &alice,
+        &alice_contact,
+        true,
+        false,
+    )
+    .await
+    .unwrap();
+    send_message(
+        &db_alice,
+        &mut alice_conn,
+        &alice,
+        &alice_contact,
+        b"one message",
+    )
+    .await
+    .unwrap();
     request_conversation_wipe(&db_alice, &mut alice_conn, &alice, &alice_contact)
         .await
         .unwrap();
@@ -536,7 +552,9 @@ async fn boundary_persists_across_a_real_db_restart_when_processed_in_separate_p
         .unwrap()
         .unwrap();
     assert!(
-        bob_contact_before_restart.peer_wipe_boundary_timestamp.is_some(),
+        bob_contact_before_restart
+            .peer_wipe_boundary_timestamp
+            .is_some(),
         "setup sanity: bob's boundary was recorded before the simulated restart"
     );
 
@@ -593,5 +611,8 @@ async fn boundary_persists_across_a_real_db_restart_when_processed_in_separate_p
         "ACTUAL: with the announcement processed in its own poll — even across a real db \
          restart in between — the scoped wipe works exactly as intended"
     );
-    assert_eq!(bob_remaining[0].content, b"pre-boundary, before the restart");
+    assert_eq!(
+        bob_remaining[0].content,
+        b"pre-boundary, before the restart"
+    );
 }
