@@ -829,6 +829,31 @@ pub async fn send_message(
 /// this conversation changed — a peer-requested wipe that auto-complied,
 /// or one that only set `Contact::wipe_request_pending` — even when no
 /// chat message arrived, so it knows to refetch.
+///
+/// **Caller invariant, not enforced by this function's own signature**:
+/// never call this concurrently for the same `(db, conversation)` pair.
+/// `db: &Db` is a shared reference — `Db`'s methods all rely on `redb`'s
+/// own transaction isolation, not exclusive access — and `conn: &mut
+/// Connection` only rules out reusing *one* `Connection` value from two
+/// calls at once, not a second, independently-authenticated `Connection`
+/// for the same account. Nothing here stops two overlapping calls from
+/// each loading the ratchet at the same starting state, each fetching
+/// (and independently processing) the same batch of mailbox entries, and
+/// racing to `db.save_ratchet` at the end — confirmed, not just
+/// reasoned about, by
+/// `app/tests/concurrent_receive_pending_race.rs`: real content
+/// duplication (each entry decrypted and stored twice), though the
+/// ratchet itself was left self-consistent and usable afterward in every
+/// trial, not permanently desynced. The only reason this doesn't happen
+/// in the shipped app is architectural, not type-level: `poll_loop`
+/// (`ui/src-tauri/src/lib.rs`) is the sole production call site, and it
+/// already holds `state.conn`'s single shared `tokio::sync::Mutex`
+/// across the whole call, which incidentally serializes every call in
+/// the app. A future caller (a manual "sync now" command on its own
+/// connection, or a per-contact-parallel rewrite of the poll loop) could
+/// violate this silently — worth an explicit per-conversation lock if
+/// a second call site is ever added, not implemented here since nothing
+/// in the current call graph can actually trigger it.
 pub async fn receive_pending(
     db: &Db,
     conn: &mut Connection,

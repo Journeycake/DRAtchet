@@ -1003,3 +1003,51 @@ after): the reloaded record was always *exactly* one of the seeded
 outcomes shape as finding #32's fix — never a record with fields mixed
 between the two writes, and never a record silently lost. No code change
 was needed; this is a confirmation, not a fix.
+
+## Concurrent `receive_pending` calls (item 3 of the same edge-case sweep — confirmed real, mitigated architecturally rather than fixed in the function itself)
+
+Probed the type-level question directly: does anything about
+`app::receive_pending`'s own signature rule out two overlapping calls for
+the same conversation, the way `&mut Db` would if that were the
+signature? It doesn't — `db: &Db` is a shared reference (`Db`'s methods
+rely on `redb`'s own transaction isolation, not exclusive access), and
+`conn: &mut Connection` only rules out reusing *one* `Connection` value
+twice at once, not a second, independently-authenticated `Connection`
+for the same account calling concurrently.
+
+Proven, not just reasoned about, with a new real end-to-end test,
+`app/tests/concurrent_receive_pending_race.rs`: two separate
+connections for the same account, racing `receive_pending` for the same
+contact via `tokio::join!` against two real queued messages. Confirmed
+outcome: genuine content duplication — both calls each independently
+loaded the ratchet at the same starting state, each fetched and
+processed the same mailbox entries, and each stored its own copy, so 2
+real messages sent produced 4 stored on the receiving side. The ratchet
+itself, however, was left self-consistent in every trial — whichever
+call's `db.save_ratchet` landed last fully determined the persisted
+state, and a message sent afterward still decrypted normally; the race
+duplicates content, it does not permanently desync the conversation.
+
+**Not fixed inside `receive_pending` itself**: unlike findings #32/#34,
+there's no single atomic transaction that would close this — the race
+spans a network round trip (`MailboxFetch`/decrypt/`MailboxDelete`), not
+just a local write. A real fix would need a per-`(db, conversation)`
+lock held across that whole call, and `Db` (the natural place to own
+such a lock) has no async runtime dependency today — adding one, or
+keying a lock registry by `Db`'s address as a workaround, is more
+machinery than a currently-unreachable path justifies. Instead: (a) the
+invariant is now stated explicitly on `receive_pending`'s own doc
+comment as a caller contract, matching the same function's existing
+"known limitation, not solved here" note for the shared-bootstrap-mailbox
+case; (b) confirmed the one production call site,
+`poll_loop` (`ui/src-tauri/src/lib.rs`), already upholds it — it's the
+sole caller, spawned exactly once, and every call already holds
+`state.conn`'s single shared `tokio::sync::Mutex` across the whole
+`.await`, which incidentally serializes every `receive_pending` call in
+the app, not just same-conversation ones; (c) the regression test stays
+in the suite (not `#[ignore]`d — it's a fast, deterministic real-server
+test, no timing tricks needed) so a future caller that violates this
+invariant has a named, characterized failure mode to consult rather than
+rediscovering it from scratch. A real per-conversation lock is worth
+building the day a second call site is added — named here as a follow-up,
+not implemented speculatively.
