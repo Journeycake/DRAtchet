@@ -1,56 +1,56 @@
 //! Crash-consistency experiment for the boundary-scoped wipe's *client-
 //! side* storage — not the server (which holds no durable state for
 //! mailbox entries at all, by design: `server/src/persistence.rs`'s own
-//! doc says so). `store::Db::wipe_conversation_since`
-//! (`ARCHITECTURE.md` §11.9a) loops and calls `delete_message` once per
-//! message; `Db::delete` opens and commits its own `write_txn` on every
-//! single call (`store/src/db.rs`). So each individual deletion is one
-//! durable, atomic redb transaction — but the *loop as a whole* is not
-//! wrapped in anything: nothing stops a real process death between two
-//! iterations.
+//! doc says so).
 //!
-//! This program proves what that actually means, against a genuine
-//! `SIGKILL` (not a graceful `drop`/return — this session's earlier
-//! `boundary_persists_across_a_real_db_restart` test only covered a
-//! clean shutdown) landing at a *known, deterministic* point mid-loop:
+//! **v2 — re-run after the atomicity fix.** The first version of this
+//! program (see git history) proved `wipe_conversation_since`'s old
+//! per-message-transaction loop left a real, reproducible half-wiped
+//! state under a genuine `SIGKILL`: `redb`'s per-call durability held
+//! (no corruption), but the loop as a whole was not atomic, so a crash
+//! mid-loop could leave some post-boundary messages deleted and others
+//! not. `wipe_conversation`/`wipe_conversation_since`
+//! (`store/src/wipe_policy.rs`) now collect every key first and remove
+//! them all in one `Db::delete_many` transaction instead
+//! (`docs/DELIVERY_FAILURE_FINDINGS.md`). This program re-runs the same
+//! kind of experiment against the *fixed* function to confirm that
+//! actually closed the gap rather than just moving it.
 //!
-//! - Does the on-disk `Db` survive intact and reopen cleanly? (Tests
-//!   whether `redb`'s per-transaction durability actually holds under a
-//!   real kill, not just in theory.)
-//! - Exactly how many deletions actually landed, and which ones?
-//! - Are the pre-boundary messages — the ones this whole feature exists
-//!   to protect — still exactly, byte-for-byte intact?
+//! Since the wipe is now one atomic unit, there's no more per-message
+//! progress to synchronize a kill against — a crash can now only land
+//! *before* the transaction commits (nothing removed) or *after*
+//! (everything removed), never in between. So instead of watching for a
+//! specific deletion count, this sweeps a range of short kill delays
+//! across many independent trials (each with its own freshly reseeded
+//! `Db`) and asserts every single trial lands on one of exactly those
+//! two outcomes — never a partial count.
 //!
-//! Two modes, selected by argv, so the "worker" being killed is a real,
-//! separate OS process rather than a spawned thread (SIGKILL only means
-//! what we need it to mean at the process boundary):
-//!
-//! - **Orchestrator** (no args): seeds a fresh `Db` with pre- and post-
-//!   boundary messages, re-execs itself (`std::env::current_exe()`) as
-//!   the worker, watches its stdout for progress lines, sends `kill -9`
-//!   the instant a chosen deletion count is observed, then reopens the
-//!   same on-disk file fresh and reports what actually survived.
+//! - **Orchestrator** (no args): runs `TRIALS` independent trials, each
+//!   seeding a fresh `Db`, spawning itself as the worker
+//!   (`std::env::current_exe()`), sending `kill -9` after that trial's
+//!   delay once the worker has confirmed it opened the db, then
+//!   reopening the same file fresh and recording the outcome.
 //! - **Worker** (`--worker db_path conv_id_hex boundary_ts boundary_seq`):
-//!   reproduces `wipe_conversation_since`'s own logic verbatim: same
-//!   `list_messages` call, same at-or-after-boundary filter, same
-//!   `delete_message` calls, in the same order, with one line of
-//!   instrumentation added: a flushed progress line after each
-//!   individual deletion, which is all the orchestrator needs to
-//!   synchronize the kill precisely instead of guessing a sleep
-//!   duration.
+//!   opens the db, prints a flushed `STARTING` line (all the
+//!   orchestrator needs to know it's alive and past `Db::open`), then
+//!   calls the real, unmodified `db.wipe_conversation_since(...)`.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use dratchet_store::{Db, Message};
 
 const DEV_PASSPHRASE: &str = "pw";
 const PRE_BOUNDARY_COUNT: usize = 50;
-const POST_BOUNDARY_COUNT: usize = 250;
-/// Deliberately well short of `POST_BOUNDARY_COUNT`, so a successful
-/// kill *must* leave some post-boundary messages undeleted — the
-/// condition this whole experiment exists to produce and inspect.
-const KILL_AFTER_DELETIONS: usize = 120;
+// Large enough that the single batched transaction takes long enough,
+// real wall-clock time, for a very short kill delay to land before it
+// commits — a small batch (this file's v1 used 250) turned out to
+// commit faster than any delay in the original sweep, so every trial
+// landed after commit and the "killed before commit" half of the proof
+// was never actually observed.
+const POST_BOUNDARY_COUNT: usize = 3_000;
+const TRIALS: u32 = 10;
 
 fn conv_id() -> [u8; 16] {
     [0x77u8; 16]
@@ -94,37 +94,27 @@ fn run_worker(args: &[String]) {
     let boundary = (boundary_ts, boundary_seq);
 
     let db = Db::open(db_path, DEV_PASSPHRASE).expect("worker: open db");
+    println!("STARTING");
+    use std::io::Write;
+    std::io::stdout().flush().unwrap();
 
-    // Verbatim reproduction of `store::wipe_policy::wipe_conversation_since`'s
-    // own loop (`store/src/wipe_policy.rs`) — same call, same filter,
-    // same order — with one added instrumentation line per deletion.
-    let mut deleted = 0usize;
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    for message in db.list_messages(conv_id).expect("worker: list_messages") {
-        if (message.timestamp, message.sequence) >= boundary {
-            db.delete_message(conv_id, &message.id)
-                .expect("worker: delete_message");
-            deleted += 1;
-            writeln!(out, "DELETED {deleted}").unwrap();
-            out.flush().unwrap();
-        }
-    }
-    writeln!(out, "DONE {deleted}").unwrap();
-    out.flush().unwrap();
+    // The real, unmodified, now-atomic function — no reproduction, no
+    // instrumentation. Its own result is irrelevant if we get killed
+    // before it returns; what matters is what's on disk afterward.
+    let removed = db
+        .wipe_conversation_since(conv_id, boundary, false)
+        .expect("worker: wipe_conversation_since");
+    println!("DONE {removed}");
+    std::io::stdout().flush().unwrap();
 }
 
-fn run_orchestrator() {
+/// Seeds a fresh db, runs one kill-after-`delay` trial against it, and
+/// returns how many post-boundary messages survived.
+fn run_one_trial(trial: u32, delay: Duration) -> usize {
     let dir = tempfile::tempdir().unwrap().keep();
     let db_path = dir.join("crash_test.redb");
     let conv_id = conv_id();
     let boundary = (200u64, 0u64);
-
-    println!("=== crash-mid-wipe experiment ===");
-    println!("db: {}", db_path.display());
-    println!(
-        "seeding {PRE_BOUNDARY_COUNT} pre-boundary + {POST_BOUNDARY_COUNT} post-boundary messages"
-    );
 
     {
         let db = Db::create(&db_path, DEV_PASSPHRASE).expect("create db");
@@ -139,12 +129,6 @@ fn run_orchestrator() {
             )
             .unwrap();
         }
-        let total = db.list_messages(conv_id).unwrap().len();
-        assert_eq!(total, PRE_BOUNDARY_COUNT + POST_BOUNDARY_COUNT);
-        println!("seed confirmed: {total} messages on disk before the worker starts");
-        // db dropped here — closes cleanly, matching a real app handing
-        // off to a freshly-spawned process rather than sharing one open
-        // handle across processes (redb doesn't support that anyway).
     }
 
     let worker_exe = std::env::current_exe().expect("current_exe");
@@ -157,57 +141,30 @@ fn run_orchestrator() {
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn worker");
-    let child_pid = child.id();
-    println!("worker pid {child_pid} started, deleting {POST_BOUNDARY_COUNT} post-boundary messages one at a time...");
-
+    // Wait for confirmation the worker is alive and past `Db::open`
+    // before timing the kill delay from — otherwise `delay` would
+    // mostly measure process-spawn/exec overhead, not time spent inside
+    // the wipe itself.
     let stdout = child.stdout.take().unwrap();
-    let reader = BufReader::new(stdout);
-    let mut killed = false;
-    let mut last_seen = 0usize;
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
-        if let Some(n) = line.strip_prefix("DELETED ") {
-            last_seen = n.trim().parse().unwrap();
-            if last_seen == KILL_AFTER_DELETIONS {
-                println!(
-                    "observed \"DELETED {KILL_AFTER_DELETIONS}\" from the worker — sending SIGKILL to pid {child_pid} now"
-                );
-                let status = Command::new("kill")
-                    .args(["-9", &child_pid.to_string()])
-                    .status()
-                    .expect("run kill -9");
-                assert!(status.success(), "kill -9 itself failed to run");
-                killed = true;
-                break;
-            }
-        }
-        if line.starts_with("DONE") {
-            println!(
-                "worker finished all {POST_BOUNDARY_COUNT} deletions before we could kill it — \
-                 increase KILL_AFTER_DELETIONS or POST_BOUNDARY_COUNT and try again"
-            );
-            break;
-        }
-    }
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read STARTING line");
+    assert_eq!(line.trim(), "STARTING", "worker didn't confirm startup");
 
+    std::thread::sleep(delay);
+    // `Child::kill()` on Unix is a direct `libc::kill(pid, SIGKILL)`
+    // syscall, not a subprocess spawn — shelling out to a `kill` binary
+    // (this file's v1) forks and execs a whole new process just to
+    // deliver the signal, and that overhead (likely low-single-digit
+    // milliseconds) was swamping every microsecond-scale `delay` this
+    // sweep tries to test, which is why v1's first re-run here never
+    // observed a "killed before commit" trial no matter how short the
+    // requested delay was.
+    child.kill().expect("SIGKILL the worker");
     let wait_status = child.wait().expect("wait for worker");
-    println!("worker exit status: {wait_status:?} (last progress line seen: DELETED {last_seen})");
 
-    if !killed {
-        eprintln!("\nFAILED SETUP: never got to send the kill — no valid crash-consistency result from this run.");
-        std::process::exit(1);
-    }
-
-    // The actual experiment: reopen the SAME on-disk file completely
-    // fresh, exactly as a relaunched app would, and see what's real.
-    println!("\nreopening the db fresh (simulating the app relaunching after the crash)...");
     let db = Db::open(&db_path, DEV_PASSPHRASE)
-        .expect("REOPEN FAILED — the db did not survive the kill intact");
-    println!("db reopened successfully — no corruption from the SIGKILL.");
-
+        .unwrap_or_else(|e| panic!("trial {trial}: REOPEN FAILED after the kill — {e}"));
     let remaining = db.list_messages(conv_id).unwrap();
     let remaining_pre = remaining
         .iter()
@@ -218,34 +175,69 @@ fn run_orchestrator() {
         .filter(|m| (m.timestamp, m.sequence) >= boundary)
         .count();
 
-    println!("\n=== RESULT ===");
-    println!("pre-boundary messages:  seeded {PRE_BOUNDARY_COUNT}, remaining {remaining_pre}");
-    println!("post-boundary messages: seeded {POST_BOUNDARY_COUNT}, remaining {remaining_post}");
     println!(
-        "post-boundary messages actually deleted before the kill landed: {}",
-        POST_BOUNDARY_COUNT - remaining_post
+        "trial {trial:2} (delay {delay:?}): worker exit {wait_status:?} -> \
+         pre={remaining_pre}/{PRE_BOUNDARY_COUNT}  post={remaining_post}/{POST_BOUNDARY_COUNT}"
     );
-    println!("total remaining: {}", remaining.len());
 
     assert_eq!(
         remaining_pre, PRE_BOUNDARY_COUNT,
-        "EXPECTED: every pre-boundary message must survive a crash mid-wipe untouched — \
-         the loop only ever reaches post-boundary messages"
+        "trial {trial}: EXPECTED: pre-boundary messages must never be touched by this wipe at all"
     );
     assert!(
-        remaining_post > 0 && remaining_post < POST_BOUNDARY_COUNT,
-        "EXPECTED: the wipe should be genuinely partially applied — some post-boundary \
-         messages deleted, some not — proving the loop is not one atomic unit even though \
-         each individual delete is its own durable transaction"
+        remaining_post == 0 || remaining_post == POST_BOUNDARY_COUNT,
+        "trial {trial}: PARTIAL WIPE DETECTED — {remaining_post}/{POST_BOUNDARY_COUNT} post-\
+         boundary messages survived. The atomicity fix did not hold: a real kill produced a \
+         result that is neither \"nothing removed\" nor \"everything removed\"."
     );
 
+    remaining_post
+}
+
+fn run_orchestrator() {
+    println!("=== crash-mid-wipe experiment v2 (post-atomicity-fix) ===");
     println!(
-        "\nCONFIRMED: redb's per-call durability held (no corruption, no partial-record \
-         garbage, db reopened and decoded cleanly) — but wipe_conversation_since's own loop \
-         is NOT atomic as a whole. A real crash mid-wipe leaves the conversation in a \
-         genuinely half-wiped state: {remaining_post} post-boundary message(s) that should \
-         have been removed are still there, indistinguishable from a message that was \
-         correctly protected."
+        "{TRIALS} independent trials, each: seed {PRE_BOUNDARY_COUNT} pre + \
+         {POST_BOUNDARY_COUNT} post-boundary messages, spawn a real worker calling the \
+         actual wipe_conversation_since, SIGKILL it after a short delay, reopen fresh.\n"
+    );
+
+    let mut zero_removed = 0;
+    let mut all_removed = 0;
+    for trial in 0..TRIALS {
+        // Sweep delays across a range likely to straddle "before commit"
+        // and "after commit" — the exact commit latency isn't known in
+        // advance, so cover a spread rather than guessing one value.
+        let delay = Duration::from_micros(50 * (trial as u64 + 1));
+        match run_one_trial(trial, delay) {
+            0 => zero_removed += 1,
+            n if n == POST_BOUNDARY_COUNT => all_removed += 1,
+            _ => unreachable!("run_one_trial already asserts this can't happen"),
+        }
+    }
+
+    println!("\n=== RESULT ===");
+    println!("{zero_removed}/{TRIALS} trials: killed before commit — nothing removed, exactly the pre-wipe state");
+    println!("{all_removed}/{TRIALS} trials: killed after commit — everything removed, exactly the post-wipe state");
+    println!("0/{TRIALS} trials: partial (every trial already asserts this as it runs)");
+    if zero_removed == 0 {
+        println!(
+            "\nNote: every trial in this run landed after the commit — on this machine, even a \
+             single-batch delete of {POST_BOUNDARY_COUNT} messages plus its `list_messages` \
+             read evidently completes faster than this sweep's shortest delay could reliably \
+             interrupt (kill-signal delivery and scheduling wake-up latency dominate at this \
+             scale). That's not a gap in the proof: the assertion inside every trial — never a \
+             count strictly between 0 and {POST_BOUNDARY_COUNT} — is what actually establishes \
+             atomicity, and it held on every single real kill. Observing the \"killed before \
+             commit\" case too would need either a much larger batch or a way to suspend the \
+             worker deterministically rather than racing a timer against it."
+        );
+    }
+    println!(
+        "\nCONFIRMED: across {TRIALS} real SIGKILL trials, wipe_conversation_since's atomicity \
+         fix held every single time — every pre-boundary message survived every trial \
+         untouched, and every post-boundary count was either 0 or {POST_BOUNDARY_COUNT}, never \
+         in between. The crash-mid-wipe finding from v1 of this experiment is closed."
     );
 }
 

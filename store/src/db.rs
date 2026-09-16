@@ -19,7 +19,7 @@
 //! rather than any DEK) rather than silently producing garbage.
 
 use std::path::Path;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
 use argon2::password_hash::SaltString;
@@ -67,10 +67,12 @@ pub struct Db {
     identity_key: Zeroizing<[u8; 32]>,
     contacts_key: Zeroizing<[u8; 32]>,
     content_key: RwLock<Zeroizing<[u8; 32]>>,
-    // In-memory only, reset to 0 on every `create`/`open` — see
-    // `messages.rs`'s module doc for why that's fine: it only ever needs
-    // to break ties *within* the same `now_unix()` second, and a same-
-    // second collision spanning an app restart isn't a real scenario.
+    // In-memory only. Starts at 0 on `create` (nothing stored yet); on
+    // `open`, `open` itself recovers it from whatever's already on disk
+    // (`messages::recover_message_sequence`) rather than resetting to 0
+    // — a same-second restart *is* a real scenario, and naively
+    // restarting this counter silently broke `(timestamp, sequence)`'s
+    // own tie-break guarantee across one (`docs/DELIVERY_FAILURE_FINDINGS.md`).
     pub(crate) message_sequence: AtomicU64,
 }
 
@@ -152,14 +154,25 @@ impl Db {
         let contacts_key = unwrap_dek(&database, &master_key, CONTACTS_DEK_KEY)?;
         let content_key = unwrap_dek(&database, &master_key, CONTENT_DEK_KEY)?;
 
-        Ok(Db {
+        let db = Db {
             database,
             master_key,
             identity_key,
             contacts_key,
             content_key: RwLock::new(content_key),
             message_sequence: AtomicU64::new(0),
-        })
+        };
+        // Unlike `create` (nothing stored yet, so 0 is correct),
+        // reopening an *existing* database must not let this counter
+        // restart at 0 — `crate::messages::recover_message_sequence`'s
+        // own doc explains why a fresh 0 here can silently break the
+        // `(timestamp, sequence)` tie-break across a restart that lands
+        // in the same wall-clock second as messages saved just before
+        // it.
+        let recovered_sequence = crate::messages::recover_message_sequence(&db)?;
+        db.message_sequence
+            .store(recovered_sequence, Ordering::Relaxed);
+        Ok(db)
     }
 
     /// Encrypt `plaintext` under `scope`'s DEK and store it under `key`,
@@ -203,6 +216,34 @@ impl Db {
         {
             let mut table = write_txn.open_table(RECORDS)?;
             table.remove(key)?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Like [`delete`](Self::delete), but removes every key in `keys` as
+    /// **one** redb transaction instead of one transaction per key.
+    /// `delete`'s per-call durability is real (each call is its own
+    /// committed transaction, so a crash between two `delete` calls never
+    /// corrupts anything already committed) — but a caller that needs to
+    /// remove several keys as a single logical unit (a bulk wipe) still
+    /// needs *this*: `delete` alone gives no all-or-nothing guarantee
+    /// across a loop of calls, so a crash mid-loop leaves a genuinely
+    /// half-applied result with nothing on disk to distinguish "already
+    /// processed" from "correctly skipped." Wrapping the whole batch in
+    /// one `write_txn` closes that gap: a crash before `commit` returns
+    /// leaves every key untouched (exactly the pre-wipe state); a crash
+    /// after leaves every key gone. No partial outcome is possible
+    /// either way. A no-op call (`keys` empty) still opens and commits an
+    /// empty transaction rather than special-casing — cheap, and keeps
+    /// this function's contract simple.
+    pub(crate) fn delete_many(&self, keys: &[String]) -> Result<()> {
+        let write_txn = self.database.begin_write()?;
+        {
+            let mut table = write_txn.open_table(RECORDS)?;
+            for key in keys {
+                table.remove(key.as_str())?;
+            }
         }
         write_txn.commit()?;
         Ok(())

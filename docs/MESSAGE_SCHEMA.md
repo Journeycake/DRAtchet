@@ -501,11 +501,17 @@ than failing to decode:
   reason as above.
 
 `sequence` breaks same-second ties the same way `Message::sequence`
-already does elsewhere in this schema (§7a) — it resets to 0 on every
-`Db::create`/`open`, so it can't anchor a boundary by itself across a
-restart, but the pair as a whole compares safely lexicographically
-(`timestamp` first) since a restart always advances the wall clock past
-whatever second it stopped at.
+already does elsewhere in this schema (§7a). **Originally documented
+here as resetting to 0 on every `Db::create`/`open` "since a restart
+always advances the wall clock past whatever second it stopped at" — that
+claim was wrong, and closed as `docs/DELIVERY_FAILURE_FINDINGS.md`
+finding #33**: a restart landing in the same wall-clock second as
+messages saved just before it is a real scenario (a fast app relaunch,
+not just a contrived test), and a naive reset let a post-restart message
+get a `sequence` lower than a pre-restart boundary's own sequence
+component, wrongly comparing as "before" it. `Db::create` still starts
+this counter at `0` (nothing stored yet); `Db::open` now recovers its
+true prior value from whatever's already on disk instead.
 
 **No boundary ever recorded → the original v1 behavior, unchanged.** A
 conversation where neither side has ever called `announce_wipe_policy`
@@ -519,6 +525,19 @@ observed behavior changed.
 the full, unconditional `Db::wipe_conversation`, on the requester's own
 device, regardless of whether they've ever announced anything. Only the
 *recipient's* side of an incoming wipe request is ever scoped.
+
+**Two more gaps found and fixed auditing this feature, beyond the "peer
+never received the announcement at all" limitation already noted
+above** (`docs/DELIVERY_FAILURE_FINDINGS.md` findings #31–32): a peer who
+*does* receive the announcement, but in the same mailbox poll as the wipe
+request itself, had the boundary silently ignored — `apply_entry` now
+reloads the `Contact` fresh from disk before deciding, rather than
+trusting the snapshot `receive_pending` captured before that batch
+started. And a crash mid-wipe could leave a conversation genuinely
+half-wiped — `wipe_conversation`/`wipe_conversation_since` now remove
+every in-scope key in one atomic transaction instead of one per message,
+so a crash can only land before or after the whole wipe, never partway
+through.
 
 ## 11. Profile announce (CBOR) — `ARCHITECTURE.md` §6.1
 

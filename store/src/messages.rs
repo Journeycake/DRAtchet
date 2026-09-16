@@ -33,10 +33,14 @@ pub struct Message {
     pub timestamp: u64,
     /// Tie-breaks `timestamp` with a real ordering guarantee —
     /// `Db::message_sequence`, an in-memory counter incremented once per
-    /// `save_message_now` call. Resets to 0 on every `create`/`open`,
-    /// which is fine: it only ever needs to disambiguate messages saved
-    /// within the same wall-clock second, and that can only happen
-    /// within one continuous run.
+    /// `save_message_now` call. Starts at `0` on a brand-new `create`,
+    /// but `open` recovers it from whatever's already on disk
+    /// (`recover_message_sequence`) rather than naively resetting to
+    /// `0` — a restart landing in the same wall-clock second as
+    /// existing messages must not risk handing out a `sequence` value
+    /// that collides with, or sorts before, ones already saved (a real
+    /// bug this once was, closed after it broke the `wipe_conversation_since`
+    /// boundary comparison — `docs/DELIVERY_FAILURE_FINDINGS.md`).
     pub sequence: u64,
     /// Only meaningful when `sender_is_local` — the ratchet header `n`
     /// (`docs/MESSAGE_SCHEMA.md` §2) this message was sent with, i.e. its
@@ -104,12 +108,49 @@ impl fmt::Debug for Message {
     }
 }
 
-fn message_key(conversation_id: [u8; 16], message_id: &[u8]) -> String {
+pub(crate) fn message_key(conversation_id: [u8; 16], message_id: &[u8]) -> String {
     format!("message:{}:{}", hex(&conversation_id), hex(message_id))
 }
 
 pub(crate) fn message_key_prefix(conversation_id: [u8; 16]) -> String {
     format!("message:{}:", hex(&conversation_id))
+}
+
+/// The correct starting value for `Db::message_sequence` when *opening*
+/// an existing database: `1 +` the highest `sequence` any already-stored
+/// message, across every conversation, currently has — or `0` if there
+/// are none. `Db::create` correctly starts at `0` (nothing is stored
+/// yet); `Db::open` must not, or this counter's own documented tie-break
+/// contract quietly breaks across a restart.
+///
+/// `Message::sequence`'s doc says a fresh-every-run counter "only ever
+/// needs to disambiguate messages saved within the same wall-clock
+/// second, and that can only happen within one continuous run" — true
+/// for the counter's *original* purpose (`list_messages`' own sort), but
+/// false the moment something *else* durably stores a "sequence value
+/// as of this saved instant" and compares it later, across a restart, to
+/// a **new** counter that has since restarted at `0` —
+/// `Contact::peer_wipe_boundary_sequence`
+/// (`store::wipe_policy::record_peer_wipe_policy`) does exactly that. A
+/// restart landing in the same wall-clock second as both the boundary
+/// being stamped and a subsequent message being saved can then hand that
+/// message `sequence = 0`, which can compare as *before* a boundary
+/// whose own sequence component was stamped pre-restart at a higher
+/// value — silently protecting a message from a scoped wipe that should
+/// have removed it (`docs/DELIVERY_FAILURE_FINDINGS.md`). Recovering the
+/// counter's true prior value on every `open` closes this at the root,
+/// rather than patching each downstream consumer that happens to compare
+/// across a restart.
+pub(crate) fn recover_message_sequence(db: &Db) -> Result<u64> {
+    let mut next = 0u64;
+    for key in db.keys_with_prefix("message:")? {
+        let bytes = db
+            .get_encrypted(Scope::Content, &key)?
+            .ok_or(Error::MalformedRecord("message key listed but not found"))?;
+        let message = decode_message(&bytes)?;
+        next = next.max(message.sequence + 1);
+    }
+    Ok(next)
 }
 
 pub(crate) fn now_unix() -> u64 {
@@ -316,6 +357,11 @@ mod tests {
         Db::create(dir.join("test.redb"), "pw").unwrap()
     }
 
+    fn temp_db_path() -> std::path::PathBuf {
+        let dir = tempfile::tempdir().unwrap().keep();
+        dir.join("test.redb")
+    }
+
     fn random_id() -> Vec<u8> {
         let mut buf = [0u8; 16];
         OsRng.fill_bytes(&mut buf);
@@ -432,6 +478,55 @@ mod tests {
         // Strictly increasing, not just distinct.
         for pair in messages.windows(2) {
             assert!(pair[0].sequence < pair[1].sequence);
+        }
+    }
+
+    /// Regression test for the restart/tie-break bug `recover_message_sequence`
+    /// exists to close: naively resetting `message_sequence` to `0` on
+    /// `open` let a message saved shortly after a restart get a
+    /// `sequence` that collides with (or sorts *before*) one already
+    /// saved in the same wall-clock second, before the restart —
+    /// breaking `list_messages`' own ordering guarantee, the exact
+    /// invariant `sequence` exists for.
+    #[test]
+    fn sequence_survives_a_real_restart_within_the_same_wall_clock_second() {
+        let path = temp_db_path();
+        let conv = [9u8; 16];
+
+        {
+            let db = Db::create(&path, "pw").unwrap();
+            for text in ["one", "two", "three"] {
+                db.save_message_now(conv, text.as_bytes().to_vec(), true, None, None)
+                    .unwrap();
+            }
+        }
+
+        // A real close + reopen, exactly like `boundary_persists_across_a_real_db_restart`
+        // in `app/tests/scoped_wipe_edge_cases.rs` — not just continuity
+        // of one in-memory `Db` handle.
+        let db = Db::open(&path, "pw").unwrap();
+        db.save_message_now(conv, b"four".to_vec(), true, None, None)
+            .unwrap();
+
+        let messages = db.list_messages(conv).unwrap();
+        let contents: Vec<String> = messages
+            .iter()
+            .map(|m| String::from_utf8(m.content.clone()).unwrap())
+            .collect();
+        assert_eq!(
+            contents,
+            vec!["one", "two", "three", "four"],
+            "ACTUAL: the post-restart message sorts strictly after every pre-restart one, \
+             even when both land in the same wall-clock second — its sequence continued \
+             from where the pre-restart counter left off instead of restarting at 0"
+        );
+        for pair in messages.windows(2) {
+            assert!(
+                pair[0].sequence < pair[1].sequence,
+                "strictly increasing across the restart, not just distinct: {:?} then {:?}",
+                pair[0].sequence,
+                pair[1].sequence
+            );
         }
     }
 

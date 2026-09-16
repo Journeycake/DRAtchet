@@ -725,3 +725,143 @@ ask-before-delete in the first place, a much smaller population than the
 default (auto-comply) path finding #30 covers, and the human confirming
 the wipe sees a UI moment where a mismatch could plausibly be caught
 before real harm, unlike the fully automatic auto-comply path.
+
+## Boundary-scoped wipe edge cases (found and fixed auditing `wipe_conversation_since`, `ARCHITECTURE.md` §11.9a's boundary-scoped follow-up to finding #30)
+
+### 31. A policy announcement and the wipe request it gates, landing in the same poll, silently downgraded to the old unscoped behavior — **fixed**
+
+**Severity: high.** The boundary-scoped wipe (protecting messages a peer
+already had before they learned of a policy change) and the older
+ask-before-delete gate both depend on `Contact` fields a
+`ConversationWipePolicyAnnounce` sets. `receive_pending`
+(`app/src/lib.rs`) fetches a batch of mailbox entries and processes each
+one against a single `Contact` snapshot captured *once, before the loop
+starts* — correct for verification state (which genuinely can't change
+mid-batch) but not for wipe policy, since an announcement can itself
+arrive earlier in that same batch and update the persisted record while
+the snapshot the wipe-request arm reads never picks it up. The realistic
+trigger isn't adversarial: a peer who was simply offline for a while and
+catches up in one poll gets an announce, some new messages, and a wipe
+request delivered together — completely ordinary, not a race someone
+has to engineer.
+
+Two concrete consequences, found via real, no-mocks tests
+(`app/tests/scoped_wipe_edge_cases.rs`) built specifically to reproduce
+this same-batch condition rather than reasoning about it from the
+source:
+
+- **Boundary bypass**: a peer with genuine pre-boundary history already
+  stored, who then receives the announce *and* the wipe request in one
+  batch, had that history wiped anyway — the exact protection this
+  feature exists to provide, silently lost the moment the peer happened
+  to be offline when the policy changed.
+- **Ask-before-delete bypass**: with both sides configured to require
+  confirmation, a wipe request arriving in the same batch as the
+  confirming announce auto-applied instead of setting
+  `wipe_request_pending` — deleting content without the confirmation
+  both sides had explicitly opted into. (Pre-existing — this shares
+  `receive_pending`'s stale-snapshot design, not something the boundary
+  feature introduced — but it sits on the same code path this audit was
+  already exercising, and finding #30's own "known, smaller residual
+  gap" note anticipated this exact failure mode without yet having a
+  reproduction.)
+
+**Fixed**: `apply_entry`'s `PAYLOAD_CONVERSATION_WIPE_REQUEST` arm now
+reloads the `Contact` fresh from disk (`db.load_contact`) immediately
+before making its ask-before-delete or boundary decision, instead of
+trusting the batch-stale snapshot — a `ConversationWipePolicyAnnounce`
+processed earlier in the same batch is now visible to the wipe-request
+arm processed later in it. `receive_pending`'s own doc comment, which
+previously (incorrectly) claimed wipe-policy decisions shared
+verification state's "safe to use the stale snapshot" property, is
+corrected to explain why they don't. Both
+`same_batch_announce_and_wipe_request_when_peer_is_offline_the_whole_time`
+and `same_batch_ask_before_delete_announce_and_wipe_request`
+(`app/tests/scoped_wipe_edge_cases.rs`) flip from failing to passing
+under this fix, with no changes to the tests themselves — they were
+written expectation-first, stating the documented behavior before the
+fix existed.
+
+### 32. A crash mid-wipe left conversations genuinely half-wiped, with no signal anything was wrong — **fixed**
+
+**Severity: high.** `wipe_conversation`/`wipe_conversation_since`
+(`store/src/wipe_policy.rs`) looped and called `delete_message` once per
+message. `Db::delete` opens and commits its own `write_txn` per call
+(`store/src/db.rs`), so each individual deletion was genuinely durable —
+but the loop as a whole had no wrapping transaction, so nothing stopped
+a real process death between two iterations.
+
+Confirmed empirically, not just reasoned about, with a self-forking
+experiment (`app/examples/crash_mid_wipe.rs`): a worker process
+reproducing the loop's exact logic was `SIGKILL`ed at a deterministic
+point (synchronized on the worker's own progress output, not a timing
+guess). Reproduced across every run: the on-disk `Db` always reopened
+cleanly afterward (`redb`'s per-transaction durability held — no
+corruption), every pre-boundary message always survived, but the wipe
+itself was left genuinely partially applied — roughly half the
+post-boundary messages that should have been removed were still there,
+with nothing stored to distinguish "not yet processed" from "correctly
+protected."
+
+**Fixed**: `Db` gained `delete_many` (`store/src/db.rs`) — every key
+removed in **one** `write_txn` instead of one per key.
+`wipe_conversation`/`wipe_conversation_since` now collect every in-scope
+key (messages, and the ratchet if `include_session`) first, then remove
+them all in a single `delete_many` call. A crash can now only land
+before that transaction commits (conversation untouched, exactly its
+pre-wipe state) or after (conversation fully wiped) — never a partial
+result. Re-run against the fixed function (`crash_mid_wipe.rs` v2): 20+
+real `SIGKILL` trials across two message-count scales, sweeping a range
+of kill delays, produced zero partial outcomes — every trial landed on
+exactly one of the two valid states.
+
+### 33. `Db::message_sequence` resetting to 0 on `open` broke its own tie-break guarantee across a same-second restart — **fixed**
+
+**Severity: medium**, but a real, reproducible flake, not hypothetical —
+first surfaced as an intermittent failure in
+`boundary_persists_across_a_real_db_restart_when_processed_in_separate_polls`
+(`app/tests/scoped_wipe_edge_cases.rs`), which passed reliably in
+isolation but failed when run alongside other tests in the same process
+(timing-dependent, not test-order-dependent). `Message::sequence`'s own
+doc comment asserted a fresh-every-run counter was fine because "that
+[a same-second collision] can only happen within one continuous run" —
+an assumption `Db::open` resetting the in-memory counter to `0` (same as
+`Db::create`) makes false the moment a real restart lands in the same
+wall-clock second as messages saved just before it, which a fast
+app-relaunch (or, in the failing test, back-to-back operations with no
+real delay) can absolutely do.
+
+Concrete consequence: `Contact::peer_wipe_boundary_sequence`
+(`record_peer_wipe_policy`) persists a sequence value stamped by the
+*pre-restart* counter. A message saved shortly after a same-second
+restart gets a sequence number from the *post-restart* counter,
+restarted at `0` — which can be numerically lower than the persisted
+boundary's sequence component, so `wipe_conversation_since`'s
+`(timestamp, sequence) >= boundary` comparison ties on `timestamp` and
+then wrongly reads the tie-break as "before the boundary," protecting a
+message that should have been in scope for the wipe.
+
+**Fixed**: `Db::open` now recovers the counter's correct starting value
+from what's already on disk (`messages::recover_message_sequence`: `1 +`
+the highest `sequence` any stored message, across every conversation,
+currently has, or `0` if there are none) instead of naively resetting to
+`0` — `Db::create` is untouched, since starting at `0` is correct there
+(nothing stored yet). A new regression test,
+`sequence_survives_a_real_restart_within_the_same_wall_clock_second`
+(`store/src/messages.rs`), saves messages, does a real `Db` close +
+reopen, saves one more, and asserts strict ordering holds across the
+restart. `boundary_persists_across_a_real_db_restart_when_processed_in_separate_polls`
+has since passed cleanly across 5+ consecutive runs, both isolated and
+alongside the rest of its file.
+
+### Verification (findings #31–33)
+
+All three fixes landed together on `explore/wipe-crash-consistency`
+(forked from the tip of the boundary-scoped-wipe work) before folding
+back: full workspace `cargo fmt`/`clippy -D warnings`/`cargo test`
+green, including `ui/src-tauri`'s own clippy pass; the two same-batch
+tests in `scoped_wipe_edge_cases.rs` confirmed flipping from failing to
+passing under the fix; the restart test confirmed stable across repeated
+runs, both isolated and in its full file; and the crash-mid-wipe
+experiment re-run against the fixed, atomic `wipe_conversation_since`
+produced zero partial outcomes across every trial.

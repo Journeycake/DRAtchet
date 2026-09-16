@@ -1957,6 +1957,22 @@ special-casing for when the wipe request itself happens to arrive.
   local and receipt-triggered rather than a guaranteed cross-device
   handshake, not treated as a bug to work around.
 
+**Three real gaps found and fixed auditing this feature past its initial
+5-conversation acceptance pass** — a peer who *does* receive the
+announcement, but in the same poll as the wipe request itself; a crash
+mid-wipe; and a same-second restart — `docs/DELIVERY_FAILURE_FINDINGS.md`
+findings #31–33 have the full detail. In short: `apply_entry` now
+reloads the peer's `Contact` fresh before deciding on an incoming wipe
+request rather than trusting the snapshot `receive_pending` captured
+before that batch started (closing both a boundary-bypass and an
+ask-before-delete bypass at once); `wipe_conversation`/
+`wipe_conversation_since` now remove every in-scope key in one atomic
+`redb` transaction instead of one per message, so a crash can only ever
+land before or after the whole wipe, never partway through; and
+`Db::open` now recovers `message_sequence`'s true prior value from disk
+instead of naively resetting it to `0`, closing a same-second-restart
+tie-break bug the boundary feature's own comparison depends on.
+
 ## 12. Deployment models: pure peer-to-peer vs. server-based
 
 Everything above frames Tier 0/1/2 as layered, composable choices. This

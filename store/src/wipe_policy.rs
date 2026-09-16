@@ -17,7 +17,7 @@ use std::sync::atomic::Ordering;
 use crate::contacts::Contact;
 use crate::db::Db;
 use crate::error::Result;
-use crate::messages::{message_key_prefix, now_unix};
+use crate::messages::{message_key, message_key_prefix, now_unix};
 
 impl Contact {
     /// Effective "ask before deleting" policy for this conversation:
@@ -86,28 +86,33 @@ impl Db {
 
     /// Delete every message stored for `conversation_id`, and — if
     /// `include_session` — the conversation's ratchet/session state too.
-    /// Plain deletion (see module doc for why this isn't a crypto-shred).
-    /// Returns how many records were removed.
+    /// Plain deletion (see module doc for why this isn't a crypto-shred),
+    /// but **atomically**: every key is removed in one redb transaction
+    /// (`Db::delete_many`), not one transaction per key. A crash mid-wipe
+    /// can therefore only ever land before the transaction commits
+    /// (conversation untouched, exactly its pre-wipe state) or after
+    /// (conversation fully wiped) — never a half-applied result with some
+    /// messages gone and others not, which a per-message-transaction loop
+    /// cannot rule out (`docs/DELIVERY_FAILURE_FINDINGS.md`, the
+    /// crash-mid-wipe finding this replaced). Returns how many records
+    /// were removed.
     pub fn wipe_conversation(
         &self,
         conversation_id: [u8; 16],
         include_session: bool,
     ) -> Result<usize> {
-        let mut removed = 0;
-        for key in self.keys_with_prefix(&message_key_prefix(conversation_id))? {
-            self.delete(&key)?;
-            removed += 1;
-        }
+        let mut keys = self.keys_with_prefix(&message_key_prefix(conversation_id))?;
         if include_session {
             let key = Db::ratchet_key(conversation_id);
             if self
                 .get_encrypted(crate::db::Scope::Content, &key)?
                 .is_some()
             {
-                self.delete(&key)?;
-                removed += 1;
+                keys.push(key);
             }
         }
+        let removed = keys.len();
+        self.delete_many(&keys)?;
         Ok(removed)
     }
 
@@ -117,7 +122,12 @@ impl Db {
     /// boundary are left untouched. `include_session`, if true, still
     /// removes the ratchet/session state unconditionally — session state
     /// is a single blob, not a timeline, so "since a boundary" has no
-    /// meaning for it. Returns how many messages (and, if applicable, the
+    /// meaning for it. **Atomic** for the same reason and by the same
+    /// mechanism as `wipe_conversation` above — every in-scope key,
+    /// messages and (if applicable) the ratchet alike, is collected first
+    /// and removed together in one `Db::delete_many` transaction, so a
+    /// crash mid-wipe can never leave some in-scope messages deleted and
+    /// others not. Returns how many messages (and, if applicable, the
     /// ratchet) were removed.
     pub fn wipe_conversation_since(
         &self,
@@ -125,23 +135,23 @@ impl Db {
         boundary: (u64, u64),
         include_session: bool,
     ) -> Result<usize> {
-        let mut removed = 0;
-        for message in self.list_messages(conversation_id)? {
-            if (message.timestamp, message.sequence) >= boundary {
-                self.delete_message(conversation_id, &message.id)?;
-                removed += 1;
-            }
-        }
+        let mut keys: Vec<String> = self
+            .list_messages(conversation_id)?
+            .into_iter()
+            .filter(|m| (m.timestamp, m.sequence) >= boundary)
+            .map(|m| message_key(conversation_id, &m.id))
+            .collect();
         if include_session {
             let key = Db::ratchet_key(conversation_id);
             if self
                 .get_encrypted(crate::db::Scope::Content, &key)?
                 .is_some()
             {
-                self.delete(&key)?;
-                removed += 1;
+                keys.push(key);
             }
         }
+        let removed = keys.len();
+        self.delete_many(&keys)?;
         Ok(removed)
     }
 }

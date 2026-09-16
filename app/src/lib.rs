@@ -871,8 +871,12 @@ pub async fn receive_pending(
     // `contact`'s verification state (used by `decrypt_gated`) doesn't
     // change mid-loop — only its `mailbox_id`, tracked separately above —
     // so gating against the caller's original `contact` for every entry
-    // in this batch is correct. Wipe-policy decisions below use this same
-    // stale-within-the-batch snapshot for the same reason.
+    // in this batch is correct. Wipe-policy decisions, by contrast,
+    // *cannot* safely use this same stale-within-the-batch snapshot — a
+    // `ConversationWipePolicyAnnounce` and the wipe request it's meant to
+    // gate can land in the very same batch (a peer catching up after
+    // being offline), so `apply_entry`'s wipe-request arm reloads
+    // `contact` fresh from `db` itself rather than trusting this one.
     for entry in &entries.entries {
         // Set by a successfully-decrypted chat message below — the ratchet
         // header `n` it arrived with, still needed *after* this entry's
@@ -1092,7 +1096,25 @@ fn apply_entry(
             // Malformed content is per-entry-skippable like any other
             // decode failure here, not fatal to the whole batch.
             let requested = ConversationWipeRequestContent::decode(&content)?;
-            if contact.effective_wipe_ask_before_delete() {
+            // Reload from disk rather than trusting `contact`, the
+            // snapshot `receive_pending` captured once before this whole
+            // batch started. A `ConversationWipePolicyAnnounce` earlier
+            // in this *same* batch already updated the persisted record
+            // (the arm above, `record_peer_wipe_policy`) — the ask-
+            // before-delete gate and the wipe boundary both need to see
+            // that, not the pre-batch snapshot, or a peer who was simply
+            // offline long enough to have an announce and its wipe
+            // request land in one poll gets silently downgraded to the
+            // old unscoped, unconfirmed behavior even though the
+            // announce technically already arrived
+            // (`docs/DELIVERY_FAILURE_FINDINGS.md`, the same-batch
+            // staleness findings). Falls back to the passed-in `contact`
+            // only in the pathological case it vanished entirely between
+            // then and now.
+            let current = db
+                .load_contact(&contact.fingerprint)?
+                .unwrap_or_else(|| contact.clone());
+            if current.effective_wipe_ask_before_delete() {
                 // Not applied to this path: the requester's carried
                 // preference isn't persisted anywhere between now and
                 // `confirm_pending_wipe` running later, so an un-announced
@@ -1101,7 +1123,7 @@ fn apply_entry(
                 // *both* sides to have opted into ask-before-delete in the
                 // first place, a much smaller population) left as a known
                 // limitation rather than expanding this fix's scope.
-                let mut pending = contact.clone();
+                let mut pending = current.clone();
                 pending.wipe_request_pending = true;
                 db.save_contact(&pending)?;
                 Ok(EntryEffect::WipeActivity {
@@ -1109,8 +1131,8 @@ fn apply_entry(
                 })
             } else {
                 let include_session =
-                    contact.effective_wipe_include_session() || requested.include_session;
-                wipe_conversation_scoped(db, conv_id, contact, include_session)?;
+                    current.effective_wipe_include_session() || requested.include_session;
+                wipe_conversation_scoped(db, conv_id, &current, include_session)?;
                 Ok(EntryEffect::WipeActivity {
                     session_wiped: include_session,
                 })
