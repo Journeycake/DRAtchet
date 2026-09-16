@@ -1855,6 +1855,17 @@ migrate).
   covered: a visible button is adequate for "I want to clear my own device"
   but not for the in-person-coercion threat model the decoy-passphrase form
   specifically addresses.
+- **Crash/seizure-mid-wipe ordering, fixed as `docs/DELIVERY_FAILURE_FINDINGS.md`
+  finding #34**: both tiers now do the actual crypto-shred — rotating the
+  content DEK (quick wipe) or destroying the salt and every wrapped DEK
+  (full wipe) — as one atomic first step, before the bulk record-deletion
+  loop that follows it, which is now just best-effort space reclamation.
+  The original ordering did this in the opposite order, so a device
+  seized or killed mid-wipe could leave some content still fully
+  decryptable under a key the wipe hadn't gotten around to destroying yet
+  — the exact failure this feature exists to prevent. Proven against a
+  real `SIGKILL`, not just reasoned about, in
+  `store/tests/duress_wipe_crash_consistency.rs`.
 
 ### 11.9a Per-conversation wipe ("delete for everyone") — **v1 — implemented**
 

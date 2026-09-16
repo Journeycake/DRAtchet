@@ -323,17 +323,25 @@ impl Db {
     /// brand-new contact today.
     ///
     /// Returns how many message/ratchet records were removed.
+    ///
+    /// **Ordering is the security boundary here, not an implementation
+    /// detail**: the content DEK is rotated *first*, as its own single
+    /// atomic write, before anything is deleted. The instant that commits,
+    /// every message/ratchet record already on disk is permanently
+    /// unrecoverable — encrypted under a key that no longer exists
+    /// anywhere, in memory or otherwise — regardless of whether the
+    /// delete loop below ever runs to completion. A device seized or
+    /// killed partway through this call still gets the real guarantee a
+    /// duress wipe exists for. The original implementation rotated the
+    /// key *last*, "belt-and-suspenders" after the deletes — which meant
+    /// a crash partway through that delete loop could leave some
+    /// messages still fully decryptable under the still-live old key,
+    /// the opposite of what this function is for
+    /// (`docs/DELIVERY_FAILURE_FINDINGS.md`). The delete loop is now
+    /// best-effort cleanup (reclaiming space, removing now-permanently-
+    /// undecryptable ciphertext) rather than part of the security
+    /// boundary.
     pub fn quick_wipe(&self) -> Result<usize> {
-        let mut removed = 0;
-        for key in self.keys_with_prefix("message:")? {
-            self.delete(&key)?;
-            removed += 1;
-        }
-        for key in self.keys_with_prefix("ratchet:")? {
-            self.delete(&key)?;
-            removed += 1;
-        }
-
         let fresh_content_key = random_key();
         write_master_encrypted(
             &self.database,
@@ -342,6 +350,11 @@ impl Db {
             &*fresh_content_key,
         )?;
         *self.content_key.write().unwrap() = fresh_content_key;
+
+        let mut keys = self.keys_with_prefix("message:")?;
+        keys.extend(self.keys_with_prefix("ratchet:")?);
+        let removed = keys.len();
+        self.delete_many(&keys)?;
 
         Ok(removed)
     }
@@ -365,7 +378,28 @@ impl Db {
     /// with next time the file is opened). `dratchet_app::full_wipe`
     /// documents and enforces the intended caller shape (drop this
     /// handle, then create a fresh one) at that layer.
+    ///
+    /// **Ordering is the security boundary here too**: the salt and every
+    /// wrapped DEK are destroyed first, together, in one atomic
+    /// `delete_many` transaction, before the full-table cleanup loop
+    /// below even starts. The instant that commits, this file is
+    /// permanently unopenable by any passphrase — `Db::open` needs the
+    /// salt to derive a master key at all, and the wrapped DEKs to
+    /// recover any scope key even if it somehow had one — so a device
+    /// seized or killed immediately after already gets `full_wipe`'s
+    /// real guarantee, regardless of whether the remaining scan-and-
+    /// delete below ever finishes. That loop is then just reclaiming
+    /// space, not part of the security boundary (mirrors `quick_wipe`'s
+    /// same fix, `docs/DELIVERY_FAILURE_FINDINGS.md`).
     pub fn full_wipe(&self) -> Result<()> {
+        self.delete_many(&[
+            SALT_KEY.to_string(),
+            KDF_CHECK_KEY.to_string(),
+            IDENTITY_DEK_KEY.to_string(),
+            CONTACTS_DEK_KEY.to_string(),
+            CONTENT_DEK_KEY.to_string(),
+        ])?;
+
         for key in self.keys_with_prefix("")? {
             self.delete(&key)?;
         }

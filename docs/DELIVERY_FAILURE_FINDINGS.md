@@ -872,3 +872,97 @@ passing under the fix; the restart test confirmed stable across repeated
 runs, both isolated and in its full file; and the crash-mid-wipe
 experiment re-run against the fixed, atomic `wipe_conversation_since`
 produced zero partial outcomes across every trial.
+
+## Duress-wipe atomicity (found probing `Db::quick_wipe`/`full_wipe` for the same class of gap findings #31–33 fixed in the boundary-scoped wipe)
+
+### 34. `quick_wipe`/`full_wipe` rotated or destroyed their keys *last*, so a crash mid-call could leave content still recoverable under the still-live original key — **fixed**
+
+**Severity: high.** Both duress-wipe entry points (`store/src/db.rs`) did
+their bulk deletion first and their actual security-establishing step
+last, "belt-and-suspenders" style:
+
+- `quick_wipe` looped, deleting every message/ratchet record
+  individually, *then* rotated the content DEK.
+- `full_wipe` scan-deleted every key in the database, *then* — as part
+  of that same loop, no earlier — removed the salt and wrapped DEK
+  records that make the file unopenable at all.
+
+Neither loop was wrapped in a single transaction (same shape as finding
+#32), so a real crash partway through either one left exactly the
+opposite of what a duress wipe is for: some content still fully
+decryptable under a key that was never destroyed, because the delete
+loop hadn't reached it yet when the process died — while anything the
+loop *had* already reached was gone. Whether a device seized or killed
+mid-wipe ends up "safe" or "still holds live plaintext" came down to
+which records the loop happened to have reached yet, not anything the
+caller could rely on.
+
+**Fixed**, mirroring #32's "security action first, cleanup second"
+pattern exactly:
+
+- `quick_wipe` now rotates the content DEK — one atomic write — as its
+  very first step. The instant that commits, every message/ratchet
+  record already on disk is permanently unrecoverable, regardless of
+  whether the delete loop that follows ever completes. That loop (now
+  itself batched into one `delete_many` call rather than one
+  transaction per record) is reclaiming space, not establishing the
+  guarantee.
+- `full_wipe` now destroys the salt and all three wrapped DEKs (identity,
+  contacts, content) together in one `delete_many` transaction as its
+  very first step — `Db::open` needs the salt to derive a master key at
+  all, so the instant that commits the file is permanently unopenable by
+  any passphrase. The full-table scan-delete that follows is likewise
+  now just best-effort space reclamation.
+
+All 14 pre-existing wipe-related tests (`cargo test -p dratchet-store
+wipe`) and the full 66-test store suite passed unmodified against the
+reordering — this is a pure ordering fix, not a behavior change any
+existing test observes from the outside.
+
+### A separate, environment-level finding surfaced while proving #34, out of scope for this fix
+
+Building a real-`SIGKILL` regression test for #34
+(`store/tests/duress_wipe_crash_consistency.rs`, same self-re-exec
+technique as `crash_mid_wipe_atomicity.rs`) surfaced something #34's own
+code changes can't address: on this environment, a `SIGKILL` landing
+during an *active* `redb` transaction commit can occasionally leave the
+file unable to reopen at all — a decrypt failure on a record the wipe
+in progress hadn't even touched, not the expected "content now
+unreadable" outcome. Diagnostic isolation (a zero-messages trial
+exercising only the rotation write, with no delete loop at all) confirmed
+this reproduces even for a single, lone record write with no relation to
+`quick_wipe`'s own logic — ruling out its ordering or its delete loop as
+the cause. Batching the delete loop into one `delete_many` transaction
+(applied as part of #34's own fix, independent of this) narrowed the
+window considerably — reproducible at up to ~200ms of kill delay before
+batching, only a much narrower window afterward — but did not eliminate
+it.
+
+This points at a write-barrier/durability question in how this specific
+container's filesystem (or `redb` on it) handles a real `SIGKILL` landing
+exactly mid-commit, not a dratchet code defect — plausibly absent on real
+target hardware, and orthogonal to every wipe-atomicity fix in this
+document, all of which are about crashes landing *between* transactions,
+not *during* one. `duress_wipe_crash_consistency.rs` reports it as its
+own honest outcome category (`TrialOutcome::ReopenFailed`, distinct from
+`RotatedAndSecure`/`NotRotatedYet`) rather than asserting it can't
+happen or hiding it inside a broader pass/fail. A confirmation run (10
+trials, 20–200ms delay sweep) landed 9/10 `RotatedAndSecure`, 1/10
+`ReopenFailed`, 0/10 insecure/partial — consistent with a narrow,
+low-probability window rather than a systemic one. Worth its own
+investigation at the `redb`/filesystem level if it recurs; not blocking
+for #34, which only claims (and only needs to claim) that *whenever* the
+file does reopen after a kill, the security ordering held.
+
+### Verification (finding #34)
+
+`cargo build -p dratchet-store` / `cargo fmt --check` / `cargo clippy -p
+dratchet-store --all-targets -- -D warnings` / full `cargo test -p
+dratchet-store` (66 passed) all clean on the reordered `quick_wipe`/
+`full_wipe`. New regression test `store/tests/duress_wipe_crash_consistency.rs`
+(`#[ignore]`d — real subprocesses, real `SIGKILL`s; run with `cargo test
+-p dratchet-store --test duress_wipe_crash_consistency -- --ignored
+--nocapture`) confirmed: across 10 real-kill trials, every trial where
+the file reopened and the rotation had committed showed content
+permanently unrecoverable — never once a message surviving readable next
+to a rotated key.
