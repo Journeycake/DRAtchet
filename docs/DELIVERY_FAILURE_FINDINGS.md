@@ -966,3 +966,40 @@ dratchet-store` (66 passed) all clean on the reordered `quick_wipe`/
 the file reopened and the rotation had committed showed content
 permanently unrecoverable — never once a message surviving readable next
 to a rotated key.
+
+## Directory persistence atomicity (item 2 of the same edge-case sweep — confirmed already sound, no fix needed)
+
+Probed for the same class of bug findings #32/#34 fixed — a multi-step
+durable write with no wrapping transaction, so a crash partway through
+leaves an inconsistent on-disk state — against `server/src/persistence.rs`'s
+`Persistence::save`, the directory's own durable-write path
+(`docs/ARCHITECTURE.md` §6.1). Reading the code first rather than
+assuming: `try_save` already does its entire write — CBOR-encode, then
+one `begin_write`/`insert`/`commit` — as a single `redb` transaction per
+call, and every call site in `ws.rs` (a publish/rename, or a one-time-
+prekey consumed by `FetchBundle`) mutates exactly one fingerprint's
+record per logical operation. There's no second record that write ever
+needs to stay in sync with: `Inner::username_index` is never itself
+persisted — `AppState::with_persistence` rebuilds it at startup purely
+from each loaded `StoredBundle`'s own `username`/`discriminator` fields
+— so it structurally can't drift out of sync with the one table that is
+persisted. Unlike `quick_wipe`/`full_wipe`, there was never a "which
+step runs first" ordering question here to get wrong.
+
+Not left as an unverified reading of the code, though — this session's
+standing rule has been to prove atomicity claims against a real
+`SIGKILL`, not reason about them from source, so a new test,
+`server/tests/persistence_crash_consistency.rs` (`#[ignore]`d, same
+self-re-exec-subprocess technique as `duress_wipe_crash_consistency.rs`;
+run with `cargo test -p dratchet-server --test
+persistence_crash_consistency -- --ignored --nocapture`), seeds a
+"before" record, overwrites it from a real worker subprocess carrying a
+distinctly-marked "after" record (padded to 20,000 one-time prekeys so
+the encode-plus-commit takes long enough, real wall-clock time, for a
+kill to land inside it), and `SIGKILL`s the worker across a swept range
+of delays. Confirmed over 10 trials (4 landed before the commit, 6
+after): the reloaded record was always *exactly* one of the seeded
+"before" state or the fully-written "after" state — the same two-valid-
+outcomes shape as finding #32's fix — never a record with fields mixed
+between the two writes, and never a record silently lost. No code change
+was needed; this is a confirmation, not a fix.
