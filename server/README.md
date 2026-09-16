@@ -210,8 +210,14 @@ curls `/healthz` from inside the cluster.
 For a copy-paste-able, step-by-step walkthrough of deploying this to an
 actual test RKE2 cluster (build → ship the image → install → verify →
 tear down), including a companion script that automates all of it, see
-[`docs/DEPLOY_RKE2.md`](../docs/DEPLOY_RKE2.md). The rest of this section
-covers the chart's configuration surface in general — not tied to any one
+[`docs/DEPLOY_RKE2.md`](../docs/DEPLOY_RKE2.md). If you don't have a
+cluster yet and want to stand one up from scratch on a Raspberry Pi 5
+running Rocky Linux (ARM64), see
+[`docs/DEPLOY_K3S_PI.md`](../docs/DEPLOY_K3S_PI.md) instead — it bootstraps
+a single-node k3s cluster on the Pi itself, then runs the same
+build/ship/deploy/verify flow locally (no registry or SSH needed, since the
+cluster and the build are the same box). The rest of this section covers
+the chart's configuration surface in general — not tied to any one
 cluster.
 
 ### Before you deploy: this service does not horizontally scale by default
