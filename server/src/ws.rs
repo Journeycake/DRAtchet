@@ -328,6 +328,9 @@ async fn dispatch(
         FrameTag::MailboxWrite => {
             let writer = authenticated.ok_or(Error::AuthRequired)?;
             let req: MailboxWrite = decode_body(body)?;
+            if req.envelope.len() > crate::state::MAX_ENVELOPE_LEN {
+                return Err(Error::EnvelopeTooLarge);
+            }
             let mailbox_id: [u8; 16] = req
                 .mailbox_id
                 .as_slice()
@@ -340,7 +343,12 @@ async fn dispatch(
                 written_by: writer,
             };
             let mut inner = state.inner.write().await;
-            inner.mailboxes.entry(mailbox_id).or_default().push(entry);
+            let entries = inner.mailboxes.entry(mailbox_id).or_default();
+            prune_expired(entries);
+            if entries.len() >= crate::state::MAX_MAILBOX_ENTRIES {
+                return Err(Error::MailboxFull);
+            }
+            entries.push(entry);
             drop(inner);
             let _ = tx.send(encode(FrameTag::Ack, &Ack { ok: true }));
             Ok(())

@@ -1198,3 +1198,62 @@ identity whose fingerprint leaked through some other out-of-band channel
 without ever publishing a bundle is not covered by this specific check;
 that residual case was judged out of scope for this fix since it
 requires a fingerprint leak this protocol doesn't otherwise cause.
+
+## DRA-0015: No per-mailbox entry-count or envelope-size cap (penetration test, priority 2: denial of service; already documented as scenario 5/6, now fixed)
+
+Penetration-test pass, priority 2 (denial of service). This gap was
+already characterized earlier this session as scenario 5/6 (item 5&6
+above): `ws.rs`'s `MailboxWrite` handler pushed to an unbounded `Vec`
+with no check on either the number of entries a mailbox could hold or
+the size of any one envelope — confirmed at the time with a real test
+writing 2,000 entries and a 1 MiB envelope, all accepted. That earlier
+pass stopped at documenting the gap ("worth an explicit cap... not
+implemented here"); this penetration-test pass closes it.
+
+Impact, concretely: since `Inner::mailboxes` is a plain in-memory
+`HashMap<MailboxId, Vec<MailboxEntry>>` with no eviction beyond
+TTL-based pruning on fetch, any authenticated identity (or, combined
+with DRA-0014's now-fixed gap, previously even an uninvolved one against
+someone *else's* bootstrap mailbox) could force the server to hold an
+arbitrarily large amount of memory: an unbounded number of entries in a
+single mailbox, each of unbounded size, with no TTL expiry helping until
+someone actually fetches that mailbox to trigger `prune_expired`. A
+single connection, over a few seconds, could queue gigabytes into one
+mailbox with a target TTL long enough to persist until a real client
+happened to poll it — real resource exhaustion, not just a theoretical
+gap.
+
+**Fixed**: two new constants in `server/src/state.rs`:
+`MAX_ENVELOPE_LEN` (64 KiB — 4x `core::payload::MAX_PADDED_LEN`'s own 16
+KiB ceiling on any real client's padded plaintext, so no legitimate
+envelope is anywhere close) and `MAX_MAILBOX_ENTRIES` (256 — generous for
+real offline-queueing, while bounding one mailbox's worst case to 16
+MiB instead of unbounded). `MailboxWrite` now rejects an oversized
+envelope with `Error::EnvelopeTooLarge` before touching any state, and
+rejects a write to an already-full mailbox with `Error::MailboxFull`
+(checked *after* `prune_expired`, so a mailbox isn't punished for
+entries that would be dropped on the next fetch anyway).
+
+`server/tests/delivery_failures.rs`'s `scenario_05_06` test was rewritten
+from "confirms no cap exists" to "confirms the cap is enforced at exactly
+the right boundary": fills a mailbox to precisely `MAX_MAILBOX_ENTRIES`
+(every one of those writes must still succeed — the cap must not be
+off-by-one in the restrictive direction), confirms the next write is
+rejected, then separately confirms an envelope exactly at
+`MAX_ENVELOPE_LEN` succeeds while one byte over is rejected. Full
+workspace `cargo fmt --check` / `cargo clippy --workspace --all-targets
+-- -D warnings` / `cargo test --workspace` all pass.
+
+**Known residual scope, stated explicitly**: this bounds *one mailbox's*
+worst case, not the server's total memory — nothing yet caps how many
+*distinct* mailbox ids a single identity (or many colluding identities)
+can create, so `Inner::mailboxes`' `HashMap` itself can still grow
+without bound across many different mailbox ids, each individually
+under the new per-mailbox cap. Closing that fully would need either a
+global entry-count budget across the whole server or a per-writer rate
+limit on distinct mailboxes created (mirroring `crate::abuse`'s existing
+per-target/per-requester `FetchRateLimiter` pattern) — named here as a
+follow-up, not implemented in this pass since it's a materially larger
+change (a new abuse-resistance primitive, not a bounds check) and the
+per-mailbox cap already closes the specific, demonstrated worst case
+(one flooded mailbox) at a fraction of the risk.

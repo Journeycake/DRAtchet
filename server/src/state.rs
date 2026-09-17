@@ -20,6 +20,27 @@ use crate::protocol::PrekeyBundleWire;
 pub type Fingerprint = [u8; 32];
 pub type MailboxId = [u8; 16];
 
+/// DRA-0015 (`docs/DELIVERY_FAILURE_FINDINGS.md`) — a hard ceiling on a
+/// single `MailboxWrite`'s envelope, enforced in `ws.rs`. A legitimate
+/// envelope never approaches this: `core::payload::MAX_PADDED_LEN` caps
+/// the *plaintext* a real client ever pads to at 16 KiB, and AEAD/framing
+/// overhead on top of that is on the order of tens of bytes, not
+/// kilobytes. Set to 4x that ceiling — generous headroom for any real
+/// envelope, while still bounding how much memory one malicious
+/// `MailboxWrite` can force the server to hold.
+pub const MAX_ENVELOPE_LEN: usize = 64 * 1024;
+
+/// DRA-0015 — a hard ceiling on how many entries a single mailbox may
+/// hold at once, enforced in `ws.rs`'s `MailboxWrite` handler (after
+/// pruning already-expired entries, so a slow-but-legitimate recipient
+/// isn't punished for entries that would be dropped on the next fetch
+/// anyway). Generous for real offline-queueing use — a real conversation
+/// queuing this many undelivered entries before either side reconnects
+/// is already far outside normal usage — while bounding one flooded
+/// mailbox's worst-case memory to `MAX_MAILBOX_ENTRIES * MAX_ENVELOPE_LEN`
+/// (16 MiB) instead of unbounded.
+pub const MAX_MAILBOX_ENTRIES: usize = 256;
+
 /// A username#NNNN identity, as looked up in the directory.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct UsernameKey {

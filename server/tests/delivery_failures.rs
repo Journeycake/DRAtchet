@@ -217,25 +217,30 @@ async fn scenario_04_concurrent_writers_to_the_same_mailbox_both_survive() {
     );
 }
 
-/// Scenario 5/6 — there is no per-mailbox entry-count cap and no envelope
-/// size cap in `ws.rs`'s `MailboxWrite` handler. Proven, not just read
-/// from source: a burst of writes well past any reasonable per-conversation
-/// volume all succeed with `ok: true`. This is a real resource-exhaustion
-/// gap (the mailbox is in-memory — see scenario 9), demonstrated here at a
-/// moderate scale so the test itself stays fast and doesn't try to actually
-/// exhaust memory.
+/// Scenario 5/6, DRA-0015 (penetration test, priority 2: denial of
+/// service) — `ws.rs`'s `MailboxWrite` handler originally had no
+/// per-mailbox entry-count cap and no envelope size cap: a burst of
+/// writes, or one oversized envelope, well past any reasonable
+/// per-conversation volume all succeeded with `ok: true`, a real
+/// resource-exhaustion gap against the in-memory mailbox store (see
+/// scenario 9). Fixed with `state::MAX_MAILBOX_ENTRIES` (256) and
+/// `state::MAX_ENVELOPE_LEN` (64 KiB, 4x `core::payload::MAX_PADDED_LEN`'s
+/// own 16 KiB ceiling — generous for any real envelope). Proven, not just
+/// read from source: this test drives a real burst past both limits and
+/// confirms the server starts rejecting once each cap is reached, while
+/// legitimate writes up to the cap still succeed.
 #[tokio::test]
-async fn scenario_05_06_no_entry_count_or_size_cap_is_enforced() {
+async fn scenario_05_06_entry_count_and_size_caps_are_enforced() {
     let (url, state) = spawn_server_with_state().await;
     let (account, _) = fresh_account_and_bundle("flooder", 1, 0);
     let mut client = TestClient::connect(&url).await;
     client.authenticate(&account).await;
     let mailbox_id = [5u8; 16];
 
-    // Count: far more entries than any real conversation burst (compare
-    // `client/tests/queue_depth.rs`'s 40-message burst, already considered
-    // a stress case).
-    for _ in 0..2_000 {
+    // Count: fill the mailbox exactly to its cap — every one of these
+    // must still succeed; the cap must not be off-by-one in the
+    // restrictive direction.
+    for i in 0..dratchet_server::state::MAX_MAILBOX_ENTRIES {
         client
             .send(
                 FrameTag::MailboxWrite,
@@ -247,23 +252,70 @@ async fn scenario_05_06_no_entry_count_or_size_cap_is_enforced() {
             )
             .await;
         let (_, ack): (_, Ack) = client.recv().await;
-        assert!(ack.ok, "no count cap rejects this write");
+        assert!(ack.ok, "write {i} within the cap must succeed");
     }
 
-    // Size: one large envelope (1 MiB) — still accepted.
+    // One more, past the cap, must now be rejected rather than silently
+    // growing the mailbox forever.
     client
         .send(
             FrameTag::MailboxWrite,
             &MailboxWrite {
                 mailbox_id: mailbox_id.to_vec(),
-                envelope: vec![0u8; 1_048_576],
+                envelope: vec![0u8; 64],
+                ttl: 60,
+            },
+        )
+        .await;
+    let (tag, err): (_, ErrorFrame) = client.recv().await;
+    assert_eq!(
+        tag,
+        FrameTag::Error,
+        "FIX VERIFIED: a write past MAX_MAILBOX_ENTRIES must be rejected, not silently accepted"
+    );
+    assert!(err.message.to_lowercase().contains("full"));
+
+    let inner = state.inner.read().await;
+    assert_eq!(
+        inner.mailboxes.get(&mailbox_id).map(Vec::len),
+        Some(dratchet_server::state::MAX_MAILBOX_ENTRIES),
+        "the mailbox must be capped at exactly MAX_MAILBOX_ENTRIES, not grown past it"
+    );
+    drop(inner);
+
+    // Size: a fresh mailbox (so the count cap above doesn't interfere) —
+    // an envelope right at the size cap must still succeed...
+    let size_mailbox_id = [6u8; 16];
+    client
+        .send(
+            FrameTag::MailboxWrite,
+            &MailboxWrite {
+                mailbox_id: size_mailbox_id.to_vec(),
+                envelope: vec![0u8; dratchet_server::state::MAX_ENVELOPE_LEN],
                 ttl: 60,
             },
         )
         .await;
     let (_, ack): (_, Ack) = client.recv().await;
-    assert!(ack.ok, "no size cap rejects this write either");
+    assert!(ack.ok, "an envelope exactly at the size cap must succeed");
 
-    let inner = state.inner.read().await;
-    assert_eq!(inner.mailboxes.get(&mailbox_id).map(Vec::len), Some(2_001));
+    // ...but one byte over must now be rejected, not silently accepted
+    // (the pre-fix behavior proved with a 1 MiB envelope).
+    client
+        .send(
+            FrameTag::MailboxWrite,
+            &MailboxWrite {
+                mailbox_id: size_mailbox_id.to_vec(),
+                envelope: vec![0u8; dratchet_server::state::MAX_ENVELOPE_LEN + 1],
+                ttl: 60,
+            },
+        )
+        .await;
+    let (tag, err): (_, ErrorFrame) = client.recv().await;
+    assert_eq!(
+        tag,
+        FrameTag::Error,
+        "FIX VERIFIED: an envelope over MAX_ENVELOPE_LEN must be rejected, not silently accepted"
+    );
+    assert!(err.message.to_lowercase().contains("size"));
 }
