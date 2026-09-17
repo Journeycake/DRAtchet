@@ -1445,3 +1445,67 @@ defense, raising the cost of a burst substantially (500 mailboxes that
 previously cost nothing now costs roughly four hours of sustained
 activity from one identity) without capping the service's honest
 long-term capacity.
+
+## DRA-0019: Unbounded PublishBundle size — permanent, never-pruned server-wide denial of service (penetration test round 2, priority 3: denial of service against all clients; confirmed real, fixed)
+
+Penetration-test round 2, a second, distinct route to the same class of
+harm as DRA-0018 — this time through the directory rather than
+mailboxes, and arguably worse: `pruning.rs`'s own module doc states
+`directory` is "unbounded-but-intentional, not a pruning target" —
+unlike a flooded mailbox (DRA-0015/0017/0018, which self-heals via TTL
+expiry and periodic sweeping), **nothing ever removes a directory
+entry**. A single oversized `PublishBundle` is a permanent resource cost
+for as long as the server runs, not a transient one.
+
+Audited `ws.rs`'s `publish_bundle`/`to_core_bundle` for size or count
+validation on `PublishBundle`'s fields and found none on `username` (an
+arbitrary-length `String`) or `one_time_prekeys` (an arbitrary-length
+`Vec`, each entry's `key` itself an arbitrary-length `Vec<u8>` never
+checked against the 32 bytes a real X25519 public key actually is —
+only checked, lazily, whichever individual key a later `FetchBundle`
+happened to consume). `PublishBundle` deliberately requires no
+authentication at all (self-verified by the bundle's own signature
+chain — `ws.rs`'s own module doc explains why), so this is reachable by
+literally anyone, not even a registered account.
+
+Confirmed with a real test (`server/tests/unbounded_bundle_size.rs`, run
+against the pre-fix code first): a single `PublishBundle` carrying
+10,000 one-time prekeys — 1,000x `app::ONE_TIME_PREKEY_BATCH` (10), the
+real batch size any legitimate client ever publishes at once — was
+accepted and stored in full, permanently, in the directory.
+
+**Fixed**: two new constants in `server/src/state.rs` —
+`MAX_ONE_TIME_PREKEYS_PER_PUBLISH` (100, 10x the real batch size) and
+`MAX_USERNAME_LEN` (64) — checked in `publish_bundle` before any
+signature verification or directory work, so a bloated publish is
+rejected as cheaply as possible. A second, narrower gap closed in the
+same pass: each individual one-time-prekey's byte length is now checked
+against the fixed 32 bytes a real X25519 public key always is — before
+this, an oversized *individual* key could still sit in the directory
+even within a small enough batch, since nothing validated a key's
+length until some later `FetchBundle` happened to consume that exact
+one.
+
+Re-ran `unbounded_bundle_size.rs` against the fix: the 10,000-prekey
+publish is now rejected outright (and, confirmed separately, creates no
+directory entry at all — not even a truncated one), while a batch
+exactly at the new cap still succeeds normally, proving the fix isn't
+overly strict. Full workspace `cargo fmt --check` / `cargo clippy
+--workspace --all-targets -- -D warnings` / `cargo test --workspace`
+all pass, including every existing test that legitimately publishes
+real (small) bundles.
+
+**Known residual scope, stated explicitly**: `identity_key`,
+`identity_dh_signature`, and `signed_prekey_sig` remain unbounded at
+this specific check site — `identity_dh_public` and `signed_prekey`
+already had fixed-size validation before this fix (`to_core_bundle`'s
+existing `try_into::<[u8; 32]>()`), and the three remaining fields are
+validated downstream by `PrekeyBundle::verify()`'s actual signature
+checks, which reject non-conforming lengths as part of normal signature
+verification — but that verification runs *after* deserialization, so
+an attacker could still force the server to deserialize (though not
+permanently store) a single oversized field before rejection. Lower
+severity than the two fixed here (bounded to one request's transient
+processing cost, not permanent directory growth) and left as a
+follow-up rather than expanding this fix's scope further under time
+pressure.

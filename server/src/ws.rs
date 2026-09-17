@@ -504,6 +504,17 @@ fn mailbox_id_belongs_to_someone_else(
 }
 
 async fn publish_bundle(state: &Arc<AppState>, wire: PrekeyBundleWire) -> Result<()> {
+    // DRA-0019: checked before any signature verification or directory
+    // work — `Inner::directory` is never pruned (`pruning.rs`'s module
+    // doc), so an oversized publish is a permanent resource cost, not a
+    // transient one; reject it as cheaply as possible.
+    if wire.username.len() > crate::state::MAX_USERNAME_LEN {
+        return Err(Error::UsernameTooLong);
+    }
+    if wire.one_time_prekeys.len() > crate::state::MAX_ONE_TIME_PREKEYS_PER_PUBLISH {
+        return Err(Error::TooManyOneTimePrekeys);
+    }
+
     let core_bundle = to_core_bundle(&wire, None)?;
     core_bundle
         .verify()
@@ -550,6 +561,17 @@ async fn publish_bundle(state: &Arc<AppState>, wire: PrekeyBundleWire) -> Result
         }
     }
 
+    // DRA-0019: each key's length was previously unchecked at publish
+    // time — only validated lazily, per-key, whichever one a later
+    // `FetchBundle` happened to consume — so a malformed/oversized key
+    // could still sit in the never-pruned directory indefinitely even
+    // with the count cap above. Checked against the same fixed size a
+    // real X25519 public key always is.
+    for otp in &wire.one_time_prekeys {
+        if otp.key.len() != 32 {
+            return Err(Error::InvalidBundle("one-time prekey must be 32 bytes"));
+        }
+    }
     let mut one_time_prekeys = std::collections::HashMap::new();
     for otp in &wire.one_time_prekeys {
         one_time_prekeys.insert(otp.id, otp.key.clone());

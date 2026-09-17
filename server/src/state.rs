@@ -55,6 +55,23 @@ pub const MAX_MAILBOX_ENTRIES: usize = 256;
 /// alone, whatever the other side does with their own half.
 pub const MAX_ENTRIES_PER_WRITER_PER_MAILBOX: usize = MAX_MAILBOX_ENTRIES / 2;
 
+/// DRA-0019 (`docs/DELIVERY_FAILURE_FINDINGS.md`) — a hard ceiling on how
+/// many one-time prekeys a single `PublishBundle` may carry, enforced in
+/// `ws.rs`'s `publish_bundle`. The real batch size any legitimate client
+/// ever publishes is `app::ONE_TIME_PREKEY_BATCH` (10) — this is 10x
+/// that, generous headroom for a future larger batch, while bounding how
+/// much one publish can add to `Inner::directory`, which (unlike
+/// mailboxes) is never pruned — a single oversized publish is permanent,
+/// not a transient flood that self-heals.
+pub const MAX_ONE_TIME_PREKEYS_PER_PUBLISH: usize = 100;
+
+/// DRA-0019 — a hard ceiling on `username`'s length, enforced in
+/// `ws.rs`'s `publish_bundle`. Generous for any real `username#NNNN`
+/// handle (`ARCHITECTURE.md` §6.1 shows short, ordinary handles) while
+/// bounding how much one publish can add to the same never-pruned
+/// directory.
+pub const MAX_USERNAME_LEN: usize = 64;
+
 /// A username#NNNN identity, as looked up in the directory.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct UsernameKey {

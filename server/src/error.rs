@@ -65,6 +65,15 @@ pub enum Error {
     /// brand-new mailbox ids; try again shortly.
     #[error("rate limit exceeded for creating new mailboxes, try again shortly")]
     NewMailboxRateLimited,
+
+    /// DRA-0019 — `PublishBundle.one_time_prekeys` exceeded
+    /// `state::MAX_ONE_TIME_PREKEYS_PER_PUBLISH`.
+    #[error("too many one-time prekeys in a single publish")]
+    TooManyOneTimePrekeys,
+
+    /// DRA-0019 — `PublishBundle.username` exceeded `state::MAX_USERNAME_LEN`.
+    #[error("username exceeds the maximum allowed length")]
+    UsernameTooLong,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
