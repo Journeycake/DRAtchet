@@ -51,6 +51,14 @@ pub enum Error {
     /// unexpired entries.
     #[error("mailbox is full, try again once existing entries are collected")]
     MailboxFull,
+
+    /// DRA-0017 — the caller has already written
+    /// `state::MAX_ENTRIES_PER_WRITER_PER_MAILBOX` unexpired entries of
+    /// their own into this mailbox. Distinct from `MailboxFull` (the
+    /// mailbox as a whole is at capacity) so a client can tell "the other
+    /// side is flooding, not me" apart from an ordinary full mailbox.
+    #[error("you have already written your share of this mailbox's capacity")]
+    WriterQuotaExceeded,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

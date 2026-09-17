@@ -217,9 +217,9 @@ async fn scenario_04_concurrent_writers_to_the_same_mailbox_both_survive() {
     );
 }
 
-/// Scenario 5/6, DRA-0015 (penetration test, priority 2: denial of
-/// service) — `ws.rs`'s `MailboxWrite` handler originally had no
-/// per-mailbox entry-count cap and no envelope size cap: a burst of
+/// Scenario 5/6, DRA-0015/DRA-0017 (penetration test, priority 2/3:
+/// denial of service) — `ws.rs`'s `MailboxWrite` handler originally had
+/// no per-mailbox entry-count cap and no envelope size cap: a burst of
 /// writes, or one oversized envelope, well past any reasonable
 /// per-conversation volume all succeeded with `ok: true`, a real
 /// resource-exhaustion gap against the in-memory mailbox store (see
@@ -229,20 +229,30 @@ async fn scenario_04_concurrent_writers_to_the_same_mailbox_both_survive() {
 /// read from source: this test drives a real burst past both limits and
 /// confirms the server starts rejecting once each cap is reached, while
 /// legitimate writes up to the cap still succeed.
+///
+/// The count-cap portion uses **two** distinct writers, each filling
+/// exactly their own `MAX_ENTRIES_PER_WRITER_PER_MAILBOX` share —
+/// `single_conversation_mailbox_starvation.rs`'s DRA-0017 fix means a
+/// single writer alone can no longer reach the total `MAX_MAILBOX_ENTRIES`
+/// cap by themselves, so proving the *total* cap now genuinely needs two
+/// participants, matching the mailbox's own bidirectional design.
 #[tokio::test]
 async fn scenario_05_06_entry_count_and_size_caps_are_enforced() {
     let (url, state) = spawn_server_with_state().await;
     let (account, _) = fresh_account_and_bundle("flooder", 1, 0);
     let mut client = TestClient::connect(&url).await;
     client.authenticate(&account).await;
+    let (account2, _) = fresh_account_and_bundle("flooder2", 1, 0);
+    let mut client2 = TestClient::connect(&url).await;
+    client2.authenticate(&account2).await;
     let mailbox_id = [5u8; 16];
 
-    // Count: fill the mailbox exactly to its cap — every one of these
-    // must still succeed; the cap must not be off-by-one in the
-    // restrictive direction.
-    for i in 0..dratchet_server::state::MAX_MAILBOX_ENTRIES {
-        client
-            .send(
+    // Count: two writers each fill exactly their own share of the
+    // mailbox — every one of these must still succeed; the cap must not
+    // be off-by-one in the restrictive direction.
+    for i in 0..dratchet_server::state::MAX_ENTRIES_PER_WRITER_PER_MAILBOX {
+        for c in [&mut client, &mut client2] {
+            c.send(
                 FrameTag::MailboxWrite,
                 &MailboxWrite {
                     mailbox_id: mailbox_id.to_vec(),
@@ -251,12 +261,16 @@ async fn scenario_05_06_entry_count_and_size_caps_are_enforced() {
                 },
             )
             .await;
-        let (_, ack): (_, Ack) = client.recv().await;
-        assert!(ack.ok, "write {i} within the cap must succeed");
+            let (_, ack): (_, Ack) = c.recv().await;
+            assert!(
+                ack.ok,
+                "write {i} within each writer's own share must succeed"
+            );
+        }
     }
 
-    // One more, past the cap, must now be rejected rather than silently
-    // growing the mailbox forever.
+    // One more, past the total cap, must now be rejected rather than
+    // silently growing the mailbox forever.
     client
         .send(
             FrameTag::MailboxWrite,
@@ -273,7 +287,9 @@ async fn scenario_05_06_entry_count_and_size_caps_are_enforced() {
         FrameTag::Error,
         "FIX VERIFIED: a write past MAX_MAILBOX_ENTRIES must be rejected, not silently accepted"
     );
-    assert!(err.message.to_lowercase().contains("full"));
+    assert!(
+        err.message.to_lowercase().contains("full") || err.message.to_lowercase().contains("share")
+    );
 
     let inner = state.inner.read().await;
     assert_eq!(

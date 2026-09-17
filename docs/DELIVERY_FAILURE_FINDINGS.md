@@ -1322,3 +1322,57 @@ first one processed claims it; the second is then correctly seen as a
 collision) rather than any more elaborate arbitration — judged
 sufficient since the attacker in this scenario is choosing the
 colliding handle deliberately, not racing a legitimate rename.
+
+## DRA-0017: One side of a shared mailbox could exhaust the whole entry cap, blocking the other side's own writes (penetration test round 2, priority 3: denial of service for a single conversation; confirmed real, fixed)
+
+Penetration-test round 2, re-examining DRA-0015's own fix rather than a
+fresh area: `MAX_MAILBOX_ENTRIES` closed unbounded growth of one
+mailbox, but the cap is enforced on the mailbox *as a whole*, and a
+mailbox is bidirectional (`ARCHITECTURE.md` §11.1 — both participants in
+a conversation write to and fetch from the identical `mailbox_id`).
+Nothing stopped one side from filling the *entire* cap with their own
+entries, at which point the *other* side's own legitimate `MailboxWrite`
+into that same shared mailbox was rejected too, with the exact same
+`Error::MailboxFull` as if they were the flooder.
+
+Confirmed with a real test (`server/tests/single_conversation_mailbox_starvation.rs`,
+run against the pre-fix code first): Bob, an ordinary already-paired
+contact — not a stranger, not exploiting any other gap — fills the
+shared mailbox to `MAX_MAILBOX_ENTRIES` with his own entries. Alice, who
+has done nothing wrong and has no way to detect the mailbox is already
+full until she tries, then attempts to send Bob one real message. Her
+write is rejected. Bob has unilaterally, silently denied Alice's
+outgoing communication in *this one conversation* — a targeted,
+single-conversation DoS, exactly the "denial of service for a...
+conversation" scenario this round's penetration test was scoped to look
+for. (Not a regression DRA-0015 introduced — before that fix existed at
+all, the equivalent attack was strictly easier, an unbounded flood — but
+a related gap DRA-0015's own fix didn't close.)
+
+**Fixed**: a new `state::MAX_ENTRIES_PER_WRITER_PER_MAILBOX` (half of
+`MAX_MAILBOX_ENTRIES`) caps each *writer's own share* within a mailbox,
+enforced in `MailboxWrite` alongside the existing total cap. Neither of
+the two normal participants in a conversation can ever be locked out of
+writing by the other's volume alone, whatever the other side does with
+their own half. A new, distinct `Error::WriterQuotaExceeded` (rather
+than reusing `MailboxFull`) lets a client eventually tell "I'm the one
+over my own quota" apart from "the mailbox itself is generically full,"
+useful groundwork for a future UI signal.
+
+Since a single writer can no longer reach the *total* cap alone,
+`scenario_05_06`'s count-cap assertion (`server/tests/delivery_failures.rs`,
+DRA-0015) needed updating to use two distinct writers each filling
+exactly their own share — rewritten and re-verified rather than left
+subtly wrong. Full workspace `cargo fmt --check` / `cargo clippy
+--workspace --all-targets -- -D warnings` / `cargo test --workspace`
+all pass.
+
+**Known residual scope, stated explicitly**: this assumes the normal
+two-party mailbox model DRA-0015 was built around. If more than two
+distinct identities ever write to the same `mailbox_id` (only possible
+today via the bootstrap mailbox — and DRA-0014 already restricts who
+can *fetch*/*delete* there, though writes remain intentionally open to
+anyone attempting first contact), a third writer still gets their own
+full `MAX_ENTRIES_PER_WRITER_PER_MAILBOX` share on top of the other
+two's, so the *total* cap (not per-writer) is what ultimately bounds
+that case — already covered by DRA-0015's existing total-cap check.

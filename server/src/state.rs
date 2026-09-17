@@ -41,6 +41,20 @@ pub const MAX_ENVELOPE_LEN: usize = 64 * 1024;
 /// (16 MiB) instead of unbounded.
 pub const MAX_MAILBOX_ENTRIES: usize = 256;
 
+/// DRA-0017 (`docs/DELIVERY_FAILURE_FINDINGS.md`) — a per-*writer* share
+/// of `MAX_MAILBOX_ENTRIES` within one mailbox, enforced alongside the
+/// total cap in `ws.rs`'s `MailboxWrite` handler. A mailbox is
+/// bidirectional (`ARCHITECTURE.md` §11.1: both participants in a
+/// conversation write to and fetch from the identical `mailbox_id`), so
+/// a total-only cap let one side unilaterally consume the *entire*
+/// budget with their own entries, silently blocking the other side's own
+/// legitimate writes into that same shared conversation once the total
+/// was reached. Half of `MAX_MAILBOX_ENTRIES`, matching the two-party
+/// design this mailbox model assumes: neither of the two normal
+/// participants can ever be locked out of writing by the other's volume
+/// alone, whatever the other side does with their own half.
+pub const MAX_ENTRIES_PER_WRITER_PER_MAILBOX: usize = MAX_MAILBOX_ENTRIES / 2;
+
 /// A username#NNNN identity, as looked up in the directory.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct UsernameKey {

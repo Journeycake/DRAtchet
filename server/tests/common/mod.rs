@@ -144,7 +144,13 @@ impl TestClient {
 
 /// A real generated account plus its bundle already converted to the
 /// *published* wire form (`MESSAGE_SCHEMA.md` §1's batch shape) — the
-/// fixture every test starts from.
+/// fixture every test starts from. Unused by tests that only need bare
+/// `Account::generate()` accounts with no published directory entry
+/// (e.g. `single_conversation_mailbox_starvation.rs`) — see `send_raw`'s
+/// doc above for why that's expected: each test binary compiles this
+/// module separately, so it shows as unused dead code from that binary's
+/// point of view.
+#[allow(dead_code)]
 pub fn fresh_account_and_bundle(
     username: &str,
     discriminator: u16,

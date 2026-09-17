@@ -348,6 +348,15 @@ async fn dispatch(
             if entries.len() >= crate::state::MAX_MAILBOX_ENTRIES {
                 return Err(Error::MailboxFull);
             }
+            // DRA-0017: a total-only cap let one side of a bidirectional
+            // mailbox consume the whole budget with their own entries,
+            // blocking the other side's own writes. Each writer gets
+            // their own share of the total, so neither of the two normal
+            // participants can be locked out by the other's volume alone.
+            let writer_entries = entries.iter().filter(|e| e.written_by == writer).count();
+            if writer_entries >= crate::state::MAX_ENTRIES_PER_WRITER_PER_MAILBOX {
+                return Err(Error::WriterQuotaExceeded);
+            }
             entries.push(entry);
             drop(inner);
             let _ = tx.send(encode(FrameTag::Ack, &Ack { ok: true }));
