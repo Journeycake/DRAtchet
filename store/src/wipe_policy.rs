@@ -281,6 +281,8 @@ mod tests {
             sequence: 0,
             send_n: None,
             send_dh_pub: None,
+            recv_n: None,
+            recv_dh_pub: None,
             delivered: false,
             uncertain: false,
         }
@@ -335,6 +337,8 @@ mod tests {
             sequence,
             send_n: None,
             send_dh_pub: None,
+            recv_n: None,
+            recv_dh_pub: None,
             delivered: false,
             uncertain: false,
         }

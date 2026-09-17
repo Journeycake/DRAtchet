@@ -1004,53 +1004,75 @@ outcomes shape as finding #32's fix — never a record with fields mixed
 between the two writes, and never a record silently lost. No code change
 was needed; this is a confirmation, not a fix.
 
-## Concurrent `receive_pending` calls (item 3 of the same edge-case sweep — confirmed real, mitigated architecturally rather than fixed in the function itself)
+## DRA-0012: Concurrent `receive_pending` calls (item 3 of the same edge-case sweep — confirmed real, now fixed in two layers)
 
 Probed the type-level question directly: does anything about
 `app::receive_pending`'s own signature rule out two overlapping calls for
 the same conversation, the way `&mut Db` would if that were the
-signature? It doesn't — `db: &Db` is a shared reference (`Db`'s methods
+signature? It didn't — `db: &Db` is a shared reference (`Db`'s methods
 rely on `redb`'s own transaction isolation, not exclusive access), and
 `conn: &mut Connection` only rules out reusing *one* `Connection` value
 twice at once, not a second, independently-authenticated `Connection`
 for the same account calling concurrently.
 
-Proven, not just reasoned about, with a new real end-to-end test,
+Proven, not just reasoned about, with a real end-to-end test,
 `app/tests/concurrent_receive_pending_race.rs`: two separate
 connections for the same account, racing `receive_pending` for the same
 contact via `tokio::join!` against two real queued messages. Confirmed
-outcome: genuine content duplication — both calls each independently
-loaded the ratchet at the same starting state, each fetched and
-processed the same mailbox entries, and each stored its own copy, so 2
-real messages sent produced 4 stored on the receiving side. The ratchet
-itself, however, was left self-consistent in every trial — whichever
-call's `db.save_ratchet` landed last fully determined the persisted
-state, and a message sent afterward still decrypted normally; the race
-duplicates content, it does not permanently desync the conversation.
+outcome (pre-fix): genuine content duplication — both calls each
+independently loaded the ratchet at the same starting state, each
+fetched and processed the same mailbox entries, and each stored its own
+copy, so 2 real messages sent produced 4 stored on the receiving side.
+The ratchet itself, however, was left self-consistent in every trial —
+whichever call's `db.save_ratchet` landed last fully determined the
+persisted state, and a message sent afterward still decrypted normally;
+the race duplicated content, it did not permanently desync the
+conversation.
 
-**Not fixed inside `receive_pending` itself**: unlike findings #32/#34,
-there's no single atomic transaction that would close this — the race
-spans a network round trip (`MailboxFetch`/decrypt/`MailboxDelete`), not
-just a local write. A real fix would need a per-`(db, conversation)`
-lock held across that whole call, and `Db` (the natural place to own
-such a lock) has no async runtime dependency today — adding one, or
-keying a lock registry by `Db`'s address as a workaround, is more
-machinery than a currently-unreachable path justifies. Instead: (a) the
-invariant is now stated explicitly on `receive_pending`'s own doc
-comment as a caller contract, matching the same function's existing
-"known limitation, not solved here" note for the shared-bootstrap-mailbox
-case; (b) confirmed the one production call site,
-`poll_loop` (`ui/src-tauri/src/lib.rs`), already upholds it — it's the
-sole caller, spawned exactly once, and every call already holds
-`state.conn`'s single shared `tokio::sync::Mutex` across the whole
-`.await`, which incidentally serializes every `receive_pending` call in
-the app, not just same-conversation ones; (c) the regression test stays
-in the suite (not `#[ignore]`d — it's a fast, deterministic real-server
-test, no timing tricks needed) so a future caller that violates this
-invariant has a named, characterized failure mode to consult rather than
-rediscovering it from scratch. A real per-conversation lock is worth
-building the day a second call site is added — named here as a follow-up,
-not implemented speculatively.
+**Fixed, in two independent layers, rather than left as a documented
+caller invariant:**
+
+1. **`Db::receive_lock(conversation_id)`** (`store/src/db.rs`) — a
+   per-conversation `tokio::sync::Mutex`, created on first use and never
+   removed, backed by a `HashMap` guarded by a plain `std::sync::Mutex`
+   (held only for the instant it takes to look up/clone the `Arc`, never
+   across an `.await`). `receive_pending` (`app/src/lib.rs`) now acquires
+   this lock for its entire body, immediately after computing `conv_id`.
+   A second overlapping call for the *same* conversation now blocks on
+   `.lock().await` until the first call finishes — including its own
+   `MailboxDelete`/ack round trips — rather than racing it. A call for a
+   *different* conversation is unaffected (a distinct `Arc<Mutex<()>>`
+   per `conv_id`), so this doesn't serialize unrelated traffic. This
+   turns the invariant `receive_pending`'s doc comment used to just
+   *state* into one the function actually enforces, regardless of
+   caller — closing exactly the gap this finding's "Not fixed inside
+   `receive_pending` itself" note used to describe.
+2. **`Db::save_received_message_idempotent`** (`store/src/messages.rs`)
+   — a second, independent backstop behind the lock. Received chat
+   messages now record the ratchet header they arrived with
+   (`Message::recv_dh_pub`/`recv_n`, mirroring the existing
+   `send_dh_pub`/`send_n` pair already used for sent messages). Before
+   inserting a new message, this checks whether one already exists for
+   the same `(conversation_id, recv_dh_pub, recv_n)` — a ratchet header
+   is never legitimately reused for different content, the same property
+   `send_dh_pub`/`send_n` already relied on — and returns the existing
+   record instead of storing a duplicate if so. This guards against any
+   future caller that bypasses the in-process lock entirely (e.g. a
+   second OS process against the same on-disk `Db` file, which a
+   `tokio::sync::Mutex` can't reach), and incidentally also closes the
+   already-accepted crash-recovery duplicate case (an undeleted mailbox
+   entry reprocessed on the next `receive_pending` call after a crash
+   mid-batch) for free.
+
+Re-run of `app/tests/concurrent_receive_pending_race.rs` against the fix
+confirms the exact outcome the lock predicts: call A (whichever wins the
+race) delivers both real messages, call B's own `MailboxFetch` — which
+now runs only after call A's `MailboxFetch`/decrypt/`MailboxDelete` cycle
+has already completed — sees an empty mailbox and delivers 0. Exactly 2
+messages stored, never 4, and a message sent afterward still decrypts
+normally. Full workspace `cargo fmt --check` / `cargo clippy --workspace
+--all-targets -- -D warnings` / `cargo test --workspace` all pass with
+this change.
 
 ## UI double-fire on the "Confirm clear" wipe button (item 4 of the same edge-case sweep — confirmed narrow, fixed)
 

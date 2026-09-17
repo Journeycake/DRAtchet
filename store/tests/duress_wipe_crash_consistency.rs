@@ -65,6 +65,8 @@ fn sample_message(id: u32) -> Message {
         sequence: id as u64,
         send_n: None,
         send_dh_pub: None,
+        recv_n: None,
+        recv_dh_pub: None,
         delivered: false,
         uncertain: false,
     }

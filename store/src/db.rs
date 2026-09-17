@@ -18,9 +18,10 @@
 //! once at `open()` time, itself encrypted directly with the master key
 //! rather than any DEK) rather than silently producing garbage.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{Arc, Mutex, RwLock};
 
 use argon2::password_hash::SaltString;
 use argon2::Argon2;
@@ -74,6 +75,13 @@ pub struct Db {
     // restarting this counter silently broke `(timestamp, sequence)`'s
     // own tie-break guarantee across one (`docs/DELIVERY_FAILURE_FINDINGS.md`).
     pub(crate) message_sequence: AtomicU64,
+    // Backs `receive_lock` (DRA-0012, `docs/DELIVERY_FAILURE_FINDINGS.md`):
+    // one `tokio::sync::Mutex` per conversation, created on first use and
+    // never removed. A `std::sync::Mutex` guards the registry itself —
+    // held only for the instant it takes to look up/insert an `Arc`
+    // clone, never across an `.await`, so it can't itself deadlock or
+    // block an async task.
+    receive_locks: Mutex<HashMap<[u8; 16], Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl Db {
@@ -110,6 +118,7 @@ impl Db {
             contacts_key,
             content_key: RwLock::new(content_key),
             message_sequence: AtomicU64::new(0),
+            receive_locks: Mutex::new(HashMap::new()),
         })
     }
 
@@ -161,6 +170,7 @@ impl Db {
             contacts_key,
             content_key: RwLock::new(content_key),
             message_sequence: AtomicU64::new(0),
+            receive_locks: Mutex::new(HashMap::new()),
         };
         // Unlike `create` (nothing stored yet, so 0 is correct),
         // reopening an *existing* database must not let this counter
@@ -173,6 +183,26 @@ impl Db {
         db.message_sequence
             .store(recovered_sequence, Ordering::Relaxed);
         Ok(db)
+    }
+
+    /// The per-conversation async lock a caller must hold across an
+    /// entire `receive_pending` call for `conversation_id`
+    /// (`docs/DELIVERY_FAILURE_FINDINGS.md` DRA-0012). Created on first
+    /// use, shared by every caller holding this same `Db` (however it's
+    /// wrapped — `Arc<Db>` in tests, `tauri::State<AppState>` in the
+    /// shipped app), and never removed — turns "never call
+    /// `receive_pending` concurrently for the same conversation" from a
+    /// caller-side invariant the type system didn't enforce into an
+    /// actual guarantee: a second overlapping call for the same
+    /// conversation now blocks on `.lock().await` until the first
+    /// finishes, rather than racing it.
+    pub fn receive_lock(&self, conversation_id: [u8; 16]) -> Arc<tokio::sync::Mutex<()>> {
+        self.receive_locks
+            .lock()
+            .unwrap()
+            .entry(conversation_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Encrypt `plaintext` under `scope`'s DEK and store it under `key`,
@@ -736,6 +766,8 @@ mod tests {
                 sequence: 0,
                 send_n: None,
                 send_dh_pub: None,
+                recv_n: None,
+                recv_dh_pub: None,
                 delivered: false,
                 uncertain: false,
             },
@@ -794,6 +826,8 @@ mod tests {
                 sequence: 0,
                 send_n: None,
                 send_dh_pub: None,
+                recv_n: None,
+                recv_dh_pub: None,
                 delivered: false,
                 uncertain: false,
             },

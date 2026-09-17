@@ -71,6 +71,8 @@ fn sample_message(id: u32, timestamp: u64, sequence: u64) -> Message {
         sequence,
         send_n: None,
         send_dh_pub: None,
+        recv_n: None,
+        recv_dh_pub: None,
         delivered: false,
         uncertain: false,
     }

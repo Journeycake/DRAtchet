@@ -1,36 +1,46 @@
 //! Item 3 of the wipe-atomicity edge-case sweep (see
 //! `docs/DELIVERY_FAILURE_FINDINGS.md`'s finding #34 and item-2
-//! confirmation): does anything actually stop two overlapping
-//! `receive_pending` calls for the *same* conversation from racing each
-//! other, or is that only true by accident of how `poll_loop` happens to
-//! call it today?
+//! confirmation), later tracked as DRA-0012: does anything actually stop
+//! two overlapping `receive_pending` calls for the *same* conversation
+//! from racing each other?
 //!
-//! **The type system does not rule this out.** `receive_pending` takes
-//! `db: &Db` (a shared reference — `Db`'s own methods all take `&self`
-//! and rely on `redb`'s internal transaction isolation, not exclusive
-//! access) and `conn: &mut Connection` (exclusive, but only over *one*
-//! `Connection` value — nothing stops a second, independently-
-//! authenticated `Connection` for the same account from existing and
-//! being used concurrently). The only reason this doesn't happen in the
-//! shipped app is architectural, not a type-level guarantee:
-//! `ui/src-tauri/src/lib.rs`'s `poll_loop` is the sole production call
-//! site, it's spawned exactly once, and every call already runs inside a
-//! `for` loop holding `state.conn`'s single shared `tokio::sync::Mutex`
-//! across the whole `.await` — which incidentally serializes every
-//! `receive_pending` call in the app, not just same-conversation ones.
-//! That's a caller-side invariant, not something `receive_pending`'s own
-//! signature enforces — a future caller (a manual "sync now" command on
-//! its own connection, or a per-contact-parallel rewrite of the poll
-//! loop) could violate it silently.
+//! **Originally, no — confirmed here, not just reasoned about.**
+//! `receive_pending` used to take `db: &Db` (a shared reference — `Db`'s
+//! own methods all take `&self` and rely on `redb`'s internal
+//! transaction isolation, not exclusive access) and `conn: &mut
+//! Connection` (exclusive, but only over *one* `Connection` value —
+//! nothing stopped a second, independently-authenticated `Connection`
+//! for the same account from existing and being used concurrently). The
+//! only reason this didn't happen in the shipped app was architectural,
+//! not a type-level guarantee: `ui/src-tauri/src/lib.rs`'s `poll_loop`
+//! is the sole production call site, it's spawned exactly once, and
+//! every call already runs inside a `for` loop holding `state.conn`'s
+//! single shared `tokio::sync::Mutex` across the whole `.await` — which
+//! incidentally serialized every `receive_pending` call in the app, not
+//! just same-conversation ones. That was a caller-side invariant, not
+//! something `receive_pending`'s own signature enforced — a future
+//! caller (a manual "sync now" command on its own connection, or a
+//! per-contact-parallel rewrite of the poll loop) could have violated it
+//! silently.
 //!
-//! This test proves what actually happens when that invariant is
-//! violated, rather than leaving it as a hypothetical: two independent,
-//! separately-authenticated `Connection`s for the same account
-//! (`bob`/`bob2`) both call `receive_pending` for the *same* contact at
-//! the *same* time via `tokio::join!`, racing against two real messages
-//! sitting in the mailbox. No mocks — a real server, real ratchet state,
-//! a real race via genuine concurrent `.await`s, not an artificial delay
-//! or a mutex forced open.
+//! **Fixed in two layers**: `receive_pending` now acquires
+//! `Db::receive_lock(conv_id)` — a per-conversation `tokio::sync::Mutex`
+//! — for the whole call, so a second overlapping call for the same
+//! conversation blocks until the first finishes, regardless of caller.
+//! Behind that, `Db::save_received_message_idempotent` also refuses to
+//! store a second message for the same `(recv_dh_pub, recv_n)` ratchet
+//! position, as a backstop against any caller that bypasses the
+//! in-process lock entirely (a second OS process against the same
+//! on-disk `Db` file, for instance).
+//!
+//! This test proves the fix holds under the exact scenario that used to
+//! duplicate content: two independent, separately-authenticated
+//! `Connection`s for the same account (`bob`/`bob2`) both call
+//! `receive_pending` for the *same* contact at the *same* time via
+//! `tokio::join!`, racing against two real messages sitting in the
+//! mailbox. No mocks — a real server, real ratchet state, a real
+//! concurrent `.await` race, not an artificial delay or a mutex forced
+//! open.
 
 use std::sync::Arc;
 
@@ -57,12 +67,10 @@ fn temp_db() -> Db {
     Db::create(dir.join("test.redb"), "pw").unwrap()
 }
 
-/// Confirms the race is real and characterizes exactly what it does:
-/// whether messages get lost, duplicated, or merely reordered, and —the
-/// question that actually matters for the app's own health— whether the
-/// ratchet survives usable enough that a message sent *after* the race
-/// still decrypts normally, or the conversation is left permanently
-/// wedged.
+/// Confirms the fix: two overlapping `receive_pending` calls for the
+/// same conversation no longer lose, duplicate, or reorder content, and
+/// the conversation remains fully usable afterward (a message sent after
+/// the race still decrypts normally).
 #[tokio::test]
 async fn two_connections_racing_receive_pending_for_the_same_conversation() {
     let url = spawn_server().await;
@@ -159,35 +167,28 @@ async fn two_connections_racing_receive_pending_for_the_same_conversation() {
         stored_incoming.len(),
     );
 
-    // The two messages must not simply vanish — every worthwhile outcome
-    // here still requires content survival, whatever else the race does
-    // to the bookkeeping around it.
-    assert!(
-        total_delivered >= 2 || stored_incoming.len() >= 2,
-        "SEVERE: the race lost content — neither call's return value nor the store shows both \
-         'one' and 'two' anywhere after two overlapping receive_pending calls"
+    // DRA-0012, fixed: `receive_lock` serializes the two calls for this
+    // conversation (call B blocks until call A's `MailboxFetch` has
+    // already consumed and deleted both entries, so call B's own fetch
+    // sees an empty mailbox and delivers 0), and
+    // `save_received_message_idempotent` would refuse a duplicate even
+    // if it didn't. Exactly 2 messages, no more, no fewer, either way.
+    assert_eq!(
+        total_delivered, 2,
+        "the two calls' return values should together account for exactly the 2 real messages \
+         sent, no loss and no duplication, now that receive_lock serializes them"
+    );
+    assert_eq!(
+        stored_incoming.len(),
+        2,
+        "the store should hold exactly 2 incoming messages — a regression here would mean \
+         either receive_lock or save_received_message_idempotent stopped doing its job"
     );
 
-    if total_delivered > 2 || stored_incoming.len() > 2 {
-        println!(
-            "CONFIRMED FINDING: two overlapping receive_pending calls for the same conversation \
-             duplicate content — {total_delivered} total delivered across both calls' return \
-             values, {} persisted in the store, for only 2 real messages sent. This is the \
-             concrete failure this test exists to characterize, not a test bug: see this file's \
-             module doc for why the type system permits it and why it doesn't happen in the \
-             shipped app today.",
-            stored_incoming.len()
-        );
-    }
-
-    // The health check that actually matters: is the conversation still
-    // usable afterward, or did the race leave the ratchet in a state
-    // where legitimate future messages stop decrypting? A last-write-wins
-    // `db.save_ratchet` at the end of each call means whichever call
-    // finishes last fully determines the persisted state — if that
-    // state is internally self-consistent (even if it discarded the
-    // other call's in-memory progress), a subsequent message should
-    // still round-trip normally.
+    // Belt-and-suspenders: confirms the conversation is still usable
+    // afterward — a subsequent message from Alice should decrypt
+    // normally against whatever `receive_lock`-serialized state call A
+    // and call B left behind.
     send_message(
         &db_alice,
         &mut alice_conn,
@@ -207,22 +208,23 @@ async fn two_connections_racing_receive_pending_for_the_same_conversation() {
                 .any(|m| m.content == b"after the race") =>
         {
             println!(
-                "CONFIRMED: the conversation survived the race — a message sent afterward still \
-                 decrypts normally, so whichever call's save_ratchet won left a self-consistent, \
-                 still-usable ratchet state (data may have been duplicated above, but the \
-                 conversation itself was not permanently wedged)."
+                "CONFIRMED: the conversation is fully healthy after the once-racing calls — a \
+                 message sent afterward decrypts normally, with no data loss or duplication \
+                 anywhere in this run."
             );
         }
-        Ok(outcome) => panic!(
-            "SEVERE: a message sent after the race did not decrypt as expected (got {} message(s), \
-             none matching) — the race left the ratchet desynced from Alice's side, not just \
-             duplicated: {:?}",
+        Ok(outcome) => {
+            panic!(
+            "SEVERE REGRESSION: a message sent after the race did not decrypt as expected (got \
+             {} message(s), none matching) — receive_lock/save_received_message_idempotent no \
+             longer keep the ratchet in sync: {:?}",
             outcome.messages.len(),
             outcome.messages.iter().map(|m| &m.content).collect::<Vec<_>>()
-        ),
+        )
+        }
         Err(e) => panic!(
-            "SEVERE: receive_pending itself now fails after the race ({e}) — the conversation is \
-             permanently wedged, not just duplicated"
+            "SEVERE REGRESSION: receive_pending itself now fails after the race ({e}) — the \
+             conversation is permanently wedged"
         ),
     }
 }

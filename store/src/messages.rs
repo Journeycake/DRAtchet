@@ -65,6 +65,24 @@ pub struct Message {
     /// documents and this field closes.
     #[serde(with = "serde_bytes")]
     pub send_dh_pub: Option<Vec<u8>>,
+    /// Only meaningful for a *received* message — the ratchet header `n`
+    /// (`docs/MESSAGE_SCHEMA.md` §2) this message arrived with. `None`
+    /// for a locally-sent message and for any received message predating
+    /// this field (`#[serde(default)]`). Paired with `recv_dh_pub`,
+    /// mirroring `send_n`/`send_dh_pub`'s own reasoning: a ratchet header
+    /// is never legitimately reused for different content, so
+    /// `(recv_dh_pub, recv_n)` is a genuinely unique identifier for one
+    /// specific *incoming* message — what
+    /// `Db::save_received_message_idempotent` checks before inserting, to
+    /// close DRA-0012 (`docs/DELIVERY_FAILURE_FINDINGS.md`): two
+    /// overlapping `receive_pending` calls each decrypting the same
+    /// mailbox entry must not produce two stored messages.
+    #[serde(default)]
+    pub recv_n: Option<u32>,
+    /// Only meaningful for a *received* message — the ratchet header
+    /// `dh_pub` this message arrived with. See `recv_n`'s doc.
+    #[serde(default, with = "serde_bytes")]
+    pub recv_dh_pub: Option<Vec<u8>>,
     /// Only meaningful when `sender_is_local` — whether a `DeliveryAck`
     /// or a cumulative `PiggybackAck` for this message has been received
     /// (`ARCHITECTURE.md` §4.6). Always `false` for a received message;
@@ -102,6 +120,8 @@ impl fmt::Debug for Message {
             .field("sequence", &self.sequence)
             .field("send_n", &self.send_n)
             .field("send_dh_pub", &self.send_dh_pub.as_deref().map(hex))
+            .field("recv_n", &self.recv_n)
+            .field("recv_dh_pub", &self.recv_dh_pub.as_deref().map(hex))
             .field("delivered", &self.delivered)
             .field("uncertain", &self.uncertain)
             .finish()
@@ -208,6 +228,63 @@ impl Db {
             sequence: self.message_sequence.fetch_add(1, Ordering::Relaxed),
             send_n,
             send_dh_pub,
+            recv_n: None,
+            recv_dh_pub: None,
+            delivered: false,
+            uncertain: false,
+        };
+        self.save_message(conversation_id, &message)?;
+        Ok(message)
+    }
+
+    /// Save an incoming chat message exactly once per `(recv_dh_pub,
+    /// recv_n)` — the second, independent layer of DRA-0012's fix
+    /// (`docs/DELIVERY_FAILURE_FINDINGS.md`), behind `receive_lock`'s
+    /// per-conversation lock in `app::receive_pending`. A ratchet header
+    /// is never legitimately reused for different content (the same
+    /// property `send_dh_pub`/`send_n` already relies on), so finding an
+    /// existing received message with this exact `(recv_dh_pub, recv_n)`
+    /// means this is a duplicate decrypt of an already-stored message —
+    /// returned as-is, not re-inserted and not consuming a fresh
+    /// `message_sequence` value. Scans every message currently stored for
+    /// `conversation_id`, same cost shape as `list_messages`; acceptable
+    /// here since this is a backstop against a race that should already
+    /// be rare (`receive_lock` normally prevents it entirely), not the
+    /// hot path.
+    pub fn save_received_message_idempotent(
+        &self,
+        conversation_id: [u8; 16],
+        content: Vec<u8>,
+        recv_dh_pub: Vec<u8>,
+        recv_n: u32,
+    ) -> Result<Message> {
+        for key in self.keys_with_prefix(&message_key_prefix(conversation_id))? {
+            let bytes = self
+                .get_encrypted(Scope::Content, &key)?
+                .ok_or(Error::MalformedRecord("message key listed but not found"))?;
+            let existing = decode_message(&bytes)?;
+            if !existing.sender_is_local
+                && existing.recv_n == Some(recv_n)
+                && existing.recv_dh_pub.as_deref() == Some(recv_dh_pub.as_slice())
+            {
+                tracing::debug!(
+                    conversation = %hex(&conversation_id),
+                    message_id = %hex(&existing.id),
+                    "duplicate receive_pending decrypt suppressed (DRA-0012 idempotency check)",
+                );
+                return Ok(existing);
+            }
+        }
+        let message = Message {
+            id: random_message_id(),
+            sender_is_local: false,
+            content,
+            timestamp: now_unix(),
+            sequence: self.message_sequence.fetch_add(1, Ordering::Relaxed),
+            send_n: None,
+            send_dh_pub: None,
+            recv_n: Some(recv_n),
+            recv_dh_pub: Some(recv_dh_pub),
             delivered: false,
             uncertain: false,
         };
@@ -381,6 +458,8 @@ mod tests {
             sequence,
             send_n: None,
             send_dh_pub: None,
+            recv_n: None,
+            recv_dh_pub: None,
             delivered: false,
             uncertain: false,
         }
@@ -479,6 +558,47 @@ mod tests {
         for pair in messages.windows(2) {
             assert!(pair[0].sequence < pair[1].sequence);
         }
+    }
+
+    /// DRA-0012's storage-layer backstop (`docs/DELIVERY_FAILURE_FINDINGS.md`):
+    /// a second `save_received_message_idempotent` call for the exact same
+    /// `(recv_dh_pub, recv_n)` must not insert a second message — this is
+    /// what a duplicate decrypt (from a race that somehow slipped past
+    /// `receive_lock`, or a crash-recovery reprocess of an undeleted
+    /// mailbox entry) now hits.
+    #[test]
+    fn save_received_message_idempotent_does_not_duplicate_the_same_ratchet_position() {
+        let db = temp_db();
+        let conv = [1u8; 16];
+        let dh_pub = vec![3u8; 32];
+
+        let first = db
+            .save_received_message_idempotent(conv, b"hello".to_vec(), dh_pub.clone(), 5)
+            .unwrap();
+        let second = db
+            .save_received_message_idempotent(conv, b"hello".to_vec(), dh_pub.clone(), 5)
+            .unwrap();
+
+        assert_eq!(
+            first.id, second.id,
+            "the second call for the same (recv_dh_pub, recv_n) must return the same, \
+             already-stored message, not create a new one"
+        );
+        let stored = db.list_messages(conv).unwrap();
+        assert_eq!(
+            stored.len(),
+            1,
+            "exactly one message should be stored despite two idempotent-save calls"
+        );
+
+        // A genuinely different ratchet position — same dh_pub, different
+        // n — must still save as a distinct message; the dedup key is the
+        // pair, not either half alone.
+        let third = db
+            .save_received_message_idempotent(conv, b"world".to_vec(), dh_pub, 6)
+            .unwrap();
+        assert_ne!(third.id, first.id);
+        assert_eq!(db.list_messages(conv).unwrap().len(), 2);
     }
 
     /// Regression test for the restart/tie-break bug `recover_message_sequence`

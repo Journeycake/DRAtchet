@@ -830,30 +830,28 @@ pub async fn send_message(
 /// or one that only set `Contact::wipe_request_pending` — even when no
 /// chat message arrived, so it knows to refetch.
 ///
-/// **Caller invariant, not enforced by this function's own signature**:
-/// never call this concurrently for the same `(db, conversation)` pair.
-/// `db: &Db` is a shared reference — `Db`'s methods all rely on `redb`'s
-/// own transaction isolation, not exclusive access — and `conn: &mut
-/// Connection` only rules out reusing *one* `Connection` value from two
-/// calls at once, not a second, independently-authenticated `Connection`
-/// for the same account. Nothing here stops two overlapping calls from
-/// each loading the ratchet at the same starting state, each fetching
-/// (and independently processing) the same batch of mailbox entries, and
-/// racing to `db.save_ratchet` at the end — confirmed, not just
-/// reasoned about, by
-/// `app/tests/concurrent_receive_pending_race.rs`: real content
-/// duplication (each entry decrypted and stored twice), though the
-/// ratchet itself was left self-consistent and usable afterward in every
-/// trial, not permanently desynced. The only reason this doesn't happen
-/// in the shipped app is architectural, not type-level: `poll_loop`
-/// (`ui/src-tauri/src/lib.rs`) is the sole production call site, and it
-/// already holds `state.conn`'s single shared `tokio::sync::Mutex`
-/// across the whole call, which incidentally serializes every call in
-/// the app. A future caller (a manual "sync now" command on its own
-/// connection, or a per-contact-parallel rewrite of the poll loop) could
-/// violate this silently — worth an explicit per-conversation lock if
-/// a second call site is ever added, not implemented here since nothing
-/// in the current call graph can actually trigger it.
+/// **Concurrency (DRA-0012, `docs/DELIVERY_FAILURE_FINDINGS.md`)**: two
+/// overlapping calls for the same `(db, conversation)` pair used to be
+/// able to race — each loading the ratchet at the same starting state,
+/// each fetching (and independently processing) the same batch of
+/// mailbox entries, and racing to `db.save_ratchet` at the end,
+/// confirmed by `app/tests/concurrent_receive_pending_race.rs`: real
+/// content duplication (each entry decrypted and stored twice), though
+/// the ratchet itself was left self-consistent and usable afterward in
+/// every trial, not permanently desynced. Previously this was purely
+/// architectural — `poll_loop` (`ui/src-tauri/src/lib.rs`) happened to be
+/// the sole call site and happened to hold `state.conn`'s mutex across
+/// the whole call — not something this function's own signature
+/// enforced. It now is: the `db.receive_lock(conv_id).lock().await`
+/// below serializes every call for the same conversation regardless of
+/// caller, so a second call site (a manual "sync now" command on its own
+/// connection, a per-contact-parallel poll loop) can no longer violate
+/// this silently. `save_message_now`'s `(conv_id, recv_dh_pub, recv_n)`
+/// dedup (`store/src/messages.rs`) is a second, independent layer behind
+/// this one — belt-and-suspenders against any future caller that
+/// bypasses this lock (a second process against the same on-disk `Db`
+/// file, for instance, which an in-process `tokio::sync::Mutex` can't
+/// reach).
 pub async fn receive_pending(
     db: &Db,
     conn: &mut Connection,
@@ -861,6 +859,8 @@ pub async fn receive_pending(
     contact: &Contact,
 ) -> Result<Received> {
     let conv_id = conversation_id_for(account, contact);
+    let receive_lock = db.receive_lock(conv_id);
+    let _receive_guard = receive_lock.lock().await;
     let mut ratchet = db.load_ratchet(conv_id)?.ok_or(Error::NoSession)?;
     // Captured once so every delete in this pass targets the address the
     // entries were actually fetched from, even if a `RoutingIdAnnounce`
@@ -1078,10 +1078,25 @@ fn apply_entry(
                 }
                 None => Vec::new(),
             };
+            // DRA-0012 (`docs/DELIVERY_FAILURE_FINDINGS.md`): idempotent on
+            // `(recv_dh_pub, recv_n)` — the second, independent layer
+            // behind `receive_pending`'s per-conversation lock. A
+            // duplicate decrypt of the same mailbox entry (from a race
+            // that slipped past the lock, or a crash-recovery reprocess
+            // of a not-yet-deleted entry) returns the already-stored
+            // message instead of inserting a second one.
+            let recv_dh_pub = envelope.dh_pub.to_vec();
+            let recv_n = envelope.n;
+            let message = db.save_received_message_idempotent(
+                conv_id,
+                chat.text,
+                recv_dh_pub.clone(),
+                recv_n,
+            )?;
             Ok(EntryEffect::Message(
-                db.save_message_now(conv_id, chat.text, false, None, None)?,
-                envelope.dh_pub.to_vec(),
-                envelope.n,
+                message,
+                recv_dh_pub,
+                recv_n,
                 piggyback_delivered,
             ))
         }
