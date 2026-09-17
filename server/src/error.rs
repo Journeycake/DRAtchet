@@ -59,6 +59,12 @@ pub enum Error {
     /// side is flooding, not me" apart from an ordinary full mailbox.
     #[error("you have already written your share of this mailbox's capacity")]
     WriterQuotaExceeded,
+
+    /// DRA-0018 — the caller has exhausted their
+    /// `crate::abuse::NewMailboxRateLimiter` budget for originating
+    /// brand-new mailbox ids; try again shortly.
+    #[error("rate limit exceeded for creating new mailboxes, try again shortly")]
+    NewMailboxRateLimited,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

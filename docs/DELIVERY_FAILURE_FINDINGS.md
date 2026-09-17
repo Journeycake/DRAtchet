@@ -1376,3 +1376,72 @@ anyone attempting first contact), a third writer still gets their own
 full `MAX_ENTRIES_PER_WRITER_PER_MAILBOX` share on top of the other
 two's, so the *total* cap (not per-writer) is what ultimately bounds
 that case — already covered by DRA-0015's existing total-cap check.
+
+## DRA-0018: Unbounded distinct mailbox creation — server-wide denial of service (penetration test round 2, priority 3: denial of service against all clients; confirmed real, fixed)
+
+Penetration-test round 2, closing the residual scope DRA-0015 already
+named but didn't fix: `MAX_MAILBOX_ENTRIES`/`MAX_ENTRIES_PER_WRITER_PER_MAILBOX`
+(DRA-0015/DRA-0017) bound how much one *existing* mailbox can hold, but
+nothing bounded how many *distinct* mailbox ids `Inner::mailboxes`
+could ever grow to at once. `MailboxWrite` requires no pre-existing
+relationship with its target — any authenticated identity can write to
+any 16-byte `mailbox_id`, and a not-yet-seen id was inserted via
+`.entry(mailbox_id).or_default()` with no check on the total number of
+keys already tracked.
+
+Confirmed with a real test (`server/tests/unbounded_mailbox_creation.rs`,
+run against the pre-fix code first): a single connection, looping
+`MailboxWrite` with a fresh random `mailbox_id` each time, made the
+server accept 500 entirely distinct mailboxes in one unthrottled burst
+with zero resistance — no rate limit, no per-identity cap, nothing.
+Unlike DRA-0015/DRA-0017 (bounded to one conversation), this is a real
+"all clients" denial of service: scaled up, a single attacker forces
+unbounded server memory allocation, degrading or crashing the service
+for every other client, not just one conversation. Exactly the
+"denial of service... for all clients" scenario this round's
+penetration test was scoped to look for.
+
+**Fixed**: a new `abuse::NewMailboxRateLimiter`, mirroring the existing
+`FetchRateLimiter` token-bucket pattern exactly (Phase 1.2's directory
+abuse resistance, `ARCHITECTURE.md` §11.8) rather than inventing a new
+mechanism. Keyed by the caller's real authenticated `Fingerprint`
+(`MailboxWrite` already requires authentication, unlike `FetchBundle`,
+so there's a stable identity to key by directly). Burst capacity 20,
+refill one every 30 seconds — deliberately much slower than the fetch
+limiter's, since this gates *creating* new server-side state, not
+reading already-bounded directory data. Consumed only when the target
+`mailbox_id` doesn't already exist in `Inner::mailboxes`, checked in
+`ws.rs`'s `MailboxWrite` handler before the `.entry(...).or_default()`
+call that would otherwise unconditionally create the key — ordinary
+traffic within an already-established conversation (the overwhelming
+majority of real usage) never touches this budget at all. A new,
+distinct `Error::NewMailboxRateLimited` lets a client tell this apart
+from `MailboxFull`/`WriterQuotaExceeded`. Stale buckets are swept
+alongside the existing `FetchRateLimiter` ones in
+`pruning::sweep_once`.
+
+Re-ran `unbounded_mailbox_creation.rs` against the fix: a burst up to
+the limiter's own capacity still succeeds immediately (so adding
+several new contacts at once is never throttled), the next brand-new
+mailbox is rejected, and — the important negative case — a write into
+an *already-existing* mailbox still succeeds even after the new-mailbox
+budget is fully exhausted, proving ordinary conversation traffic is
+unaffected. New unit tests in `abuse.rs` cover the limiter directly
+(burst-then-reject, independent per-writer budgets, stale-bucket
+sweeping), mirroring `FetchRateLimiter`'s own test coverage. Full
+workspace `cargo fmt --check` / `cargo clippy --workspace --all-targets
+-- -D warnings` / `cargo test --workspace` all pass.
+
+**Known residual scope, stated explicitly**, matching `FetchRateLimiter`'s
+own accepted limitation (`abuse.rs`'s module doc): this is a per-identity
+budget, not a global one — many distinct registered identities (or one
+attacker registering many identities, itself gated by the existing
+registration proof-of-work) could still collectively create a large
+number of mailboxes, each within their own individual rate limit. A
+global ceiling on `Inner::mailboxes.len()` would close that fully but
+risks rejecting legitimate growth once a real server has many genuine
+users; the per-identity throttle was judged the right first line of
+defense, raising the cost of a burst substantially (500 mailboxes that
+previously cost nothing now costs roughly four hours of sustained
+activity from one identity) without capping the service's honest
+long-term capacity.

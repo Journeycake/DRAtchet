@@ -26,6 +26,7 @@ pub struct SweepSummary {
     pub mailbox_entries_pruned: usize,
     pub mailboxes_emptied: usize,
     pub rate_limit_buckets_pruned: usize,
+    pub new_mailbox_rate_limit_buckets_pruned: usize,
 }
 
 /// One pruning pass: expire mailbox entries past their TTL (reusing
@@ -52,11 +53,15 @@ pub async fn sweep_once(state: &AppState, rate_limit_bucket_stale_after: Duratio
     let rate_limit_buckets_pruned = inner
         .fetch_rate_limiter
         .sweep_stale(rate_limit_bucket_stale_after, Instant::now());
+    let new_mailbox_rate_limit_buckets_pruned = inner
+        .new_mailbox_rate_limiter
+        .sweep_stale(rate_limit_bucket_stale_after, Instant::now());
 
     SweepSummary {
         mailbox_entries_pruned,
         mailboxes_emptied,
         rate_limit_buckets_pruned,
+        new_mailbox_rate_limit_buckets_pruned,
     }
 }
 
@@ -79,6 +84,8 @@ pub fn spawn_pruning_sweep(
                 mailbox_entries_pruned = summary.mailbox_entries_pruned,
                 mailboxes_emptied = summary.mailboxes_emptied,
                 rate_limit_buckets_pruned = summary.rate_limit_buckets_pruned,
+                new_mailbox_rate_limit_buckets_pruned =
+                    summary.new_mailbox_rate_limit_buckets_pruned,
                 "pruning sweep completed"
             );
         }

@@ -343,6 +343,17 @@ async fn dispatch(
                 written_by: writer,
             };
             let mut inner = state.inner.write().await;
+            // DRA-0018: originating a brand-new mailbox id costs a token;
+            // writing into one that already exists (the overwhelming
+            // majority of real traffic) never touches this budget at
+            // all. Checked before `.entry(...).or_default()` below, which
+            // would otherwise unconditionally create the key regardless
+            // of the outcome here.
+            if !inner.mailboxes.contains_key(&mailbox_id)
+                && !inner.new_mailbox_rate_limiter.allow(writer)
+            {
+                return Err(Error::NewMailboxRateLimited);
+            }
             let entries = inner.mailboxes.entry(mailbox_id).or_default();
             prune_expired(entries);
             if entries.len() >= crate::state::MAX_MAILBOX_ENTRIES {

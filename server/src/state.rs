@@ -119,6 +119,9 @@ pub struct Inner {
     /// Directory abuse resistance (Phase 1.2, `ARCHITECTURE.md` §11.8) —
     /// see `crate::abuse` for what each of these gates.
     pub fetch_rate_limiter: crate::abuse::FetchRateLimiter,
+    /// DRA-0018 — gates how fast one identity can originate brand-new
+    /// mailbox ids via `MailboxWrite`. See `crate::abuse::NewMailboxRateLimiter`.
+    pub new_mailbox_rate_limiter: crate::abuse::NewMailboxRateLimiter,
     /// target fingerprint -> count of `FetchBundle` calls that found its
     /// one-time-prekey pool already empty — logged past a threshold as a
     /// "someone keeps hitting this account's exhausted pool" signal
