@@ -1117,3 +1117,84 @@ reaching the peer is likewise a no-op on their side (`apply_entry`'s
 wipe-request arm re-scopes from the same boundary either time). The fix
 here closes the gap because it was cheap and fully proven, not because
 the alternative was unsafe.
+
+## DRA-0014: Any registered identity could read and delete another identity's pending first-contact mail (penetration test, priority 1: access; confirmed real, fixed)
+
+Penetration-test pass, priority 1 ("gaining access to individual messages
+or entire conversations"). Audited `server/src/ws.rs`'s `MailboxWrite`/
+`MailboxFetch`/`MailboxDelete` handlers directly for an ownership check —
+found none. All three require only `authenticated.ok_or(Error::AuthRequired)?`:
+*some* identity must have completed the connection-level auth handshake,
+but nothing ties the caller to the specific `mailbox_id` they name. The
+implicit security model is that `mailbox_id` itself is an unguessable
+capability — true for the post-transition, routing-id-derived id
+(`store::routing::compute_mailbox_id`, an HKDF output over private
+material only the two participants ever learn), **not** true for
+`bootstrap_mailbox_id` (`core::x3dh`): deliberately
+`SHA256("dratchet-x3dh-bootstrap-v1" || recipient_fingerprint)`, so the
+*intended* recipient's own client can compute it before any relationship
+exists — but a recipient's fingerprint is public (needed for X3DH,
+discoverable via `FetchBundle`/the username directory), so *anyone* can
+compute the same id for *any* registered user.
+
+`bootstrap_mailbox_id`'s own doc already named a narrower version of this
+as a bounded, intentional trade-off: "a relay can observe someone wrote
+to this recipient." What it didn't cover — and what a new real,
+no-mocks test (`server/tests/mailbox_ownership_gap.rs`) proved against
+the pre-fix server — is that the exposure wasn't limited to the server
+operator observing linkability metadata. With no ownership check on the
+handlers themselves, **any other registered account** got full read
+*and delete* access to a third party's queued first-contact attempts:
+
+1. Attacker looks up the victim's username via the ordinary, intended
+   `FetchBundle` directory lookup — gets their public fingerprint.
+2. Attacker computes `bootstrap_mailbox_id(victim_fingerprint)` locally —
+   the exact same value any real sender's client would compute — and
+   calls `MailboxFetch` on it directly. No pairing, no prior contact,
+   no special privilege: confirmed receiving a real sender's genuine
+   pending first-contact envelope, verbatim ciphertext.
+3. Attacker calls `MailboxDelete` on that entry. Confirmed: the real
+   sender's pairing attempt is now permanently gone. There is no
+   delivery-ack at the pre-pairing stage, so neither the sender nor the
+   victim is ever notified — a silent, targeted denial-of-service against
+   any specific relationship trying to form, repeatable at will by any
+   registered account against any other, with zero prior relationship
+   required.
+
+Message *content* was never at risk — everything read was still AEAD
+ciphertext, consistent with the server-breach guarantee `breach.rs`
+already proves — so this doesn't break end-to-end confidentiality. The
+real impact is unauthorized read access to routing/existence metadata
+(who is attempting to contact whom) plus a genuine, low-effort,
+repeatable denial-of-service primitive against the pairing flow
+specifically, exercisable by anyone with an account on the server.
+
+**Fixed**: `mailbox_id_belongs_to_someone_else` (`server/src/ws.rs`)
+rejects `MailboxFetch`/`MailboxDelete` with a new `Error::NotMailboxOwner`
+whenever the requested `mailbox_id` matches a *different* registered
+identity's `bootstrap_mailbox_id` — scanning the in-memory directory
+(`O(directory size)` per call, accepted as a small self-hosted service's
+reasonable tradeoff over adding a separate reverse-index cache; worth
+revisiting if the directory ever grows large). `MailboxWrite` is
+deliberately left unrestricted (first-contact delivery must still work
+for anyone), and a genuine post-transition `mailbox_id` is unaffected —
+it's an HKDF output over private routing-id material, astronomically
+unlikely to collide with any registered identity's `bootstrap_mailbox_id`.
+
+Re-ran `mailbox_ownership_gap.rs` against the fix in the same test: the
+attacker's `FetchBundle`-based discovery still works (expected — that's
+the intended directory feature), but the follow-on `MailboxFetch`/
+`MailboxDelete` against the victim's bootstrap mailbox are now both
+rejected with `NotMailboxOwner`, while the real sender's write and the
+real victim's own fetch/delete continue to work exactly as before. Full
+workspace `cargo fmt --check` / `cargo clippy --workspace --all-targets
+-- -D warnings` / `cargo test --workspace` all pass.
+
+**Known residual scope, stated explicitly rather than left implicit**:
+this fix only protects identities that are in the in-memory directory at
+check time (i.e., have called `PublishBundle`) — the same population an
+attacker would need the directory lookup for in the first place. An
+identity whose fingerprint leaked through some other out-of-band channel
+without ever publishing a bundle is not covered by this specific check;
+that residual case was judged out of scope for this fix since it
+requires a fingerprint leak this protocol doesn't otherwise cause.

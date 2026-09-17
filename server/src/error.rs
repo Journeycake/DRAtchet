@@ -28,6 +28,19 @@ pub enum Error {
 
     #[error("not found")]
     NotFound,
+
+    /// A `MailboxFetch`/`MailboxDelete` named a mailbox id that matches
+    /// another registered identity's bootstrap mailbox
+    /// (`dratchet_core::x3dh::bootstrap_mailbox_id`) — deliberately a
+    /// deterministic hash of a public fingerprint, so the intended
+    /// recipient's own client can compute it before any relationship
+    /// exists, but that also means anyone who knows the target's
+    /// fingerprint can compute the same id. Read/delete access to a
+    /// bootstrap mailbox is restricted to the identity it actually
+    /// belongs to; write access (first-contact delivery) is intentionally
+    /// unrestricted (docs/DELIVERY_FAILURE_FINDINGS.md, DRA-0014).
+    #[error("this mailbox belongs to a different identity")]
+    NotMailboxOwner,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

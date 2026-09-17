@@ -45,6 +45,7 @@ use dratchet_core::identity;
 use dratchet_core::prekey::{
     OneTimePrekeyPublic, PrekeyBundle as CorePrekeyBundle, SignedPrekeyPublic,
 };
+use dratchet_core::x3dh::bootstrap_mailbox_id;
 
 use crate::abuse::{self, ConnectionId};
 use crate::error::{Error, Result};
@@ -354,6 +355,9 @@ async fn dispatch(
                 .try_into()
                 .map_err(|_| Error::MalformedFrame("mailbox_id must be 16 bytes"))?;
             let mut inner = state.inner.write().await;
+            if mailbox_id_belongs_to_someone_else(&inner, &mailbox_id, &fetcher) {
+                return Err(Error::NotMailboxOwner);
+            }
             let entries = inner.mailboxes.entry(mailbox_id).or_default();
             prune_expired(entries);
             // `ARCHITECTURE.md` §11.1: this mailbox is bidirectional — both
@@ -381,7 +385,7 @@ async fn dispatch(
         }
 
         FrameTag::MailboxDelete => {
-            authenticated.ok_or(Error::AuthRequired)?;
+            let deleter = authenticated.ok_or(Error::AuthRequired)?;
             let req: MailboxDelete = decode_body(body)?;
             let mailbox_id: [u8; 16] = req
                 .mailbox_id
@@ -394,6 +398,9 @@ async fn dispatch(
                 .try_into()
                 .map_err(|_| Error::MalformedFrame("entry_id must be 16 bytes"))?;
             let mut inner = state.inner.write().await;
+            if mailbox_id_belongs_to_someone_else(&inner, &mailbox_id, &deleter) {
+                return Err(Error::NotMailboxOwner);
+            }
             if let Some(entries) = inner.mailboxes.get_mut(&mailbox_id) {
                 entries.retain(|e| e.entry_id != entry_id);
             }
@@ -430,6 +437,42 @@ async fn dispatch(
             "this frame type is server-to-client only",
         )),
     }
+}
+
+/// DRA-0014 (`docs/DELIVERY_FAILURE_FINDINGS.md`): does `mailbox_id`
+/// match another *registered* identity's bootstrap mailbox
+/// (`bootstrap_mailbox_id`, a deterministic hash of that identity's
+/// public fingerprint) while not matching `caller`'s own? If so, this is
+/// someone else's pre-pairing inbox, not a genuine capability the caller
+/// was ever handed — reading or deleting from it is unauthorized access
+/// to (and destruction of) a third party's pending communications, not a
+/// normal mailbox operation.
+///
+/// A post-transition `mailbox_id` (`store::routing::compute_mailbox_id`)
+/// is an HKDF output derived from private routing-id material this
+/// server never sees — astronomically unlikely to collide with any
+/// `bootstrap_mailbox_id(fp)` for a real, registered `fp`, so this check
+/// does not (and cannot meaningfully) restrict ordinary post-transition
+/// mailbox access; it only closes the one case where the id itself is a
+/// public function of already-public data.
+///
+/// Scans the registered directory rather than maintaining a separate
+/// reverse index — O(directory size) per `MailboxFetch`/`MailboxDelete`
+/// call, acceptable for this project's self-hosted, small-to-moderate
+/// user base; worth a cached reverse index (`bootstrap_id -> Fingerprint`,
+/// populated in `publish_bundle`) if that ever becomes a real cost.
+fn mailbox_id_belongs_to_someone_else(
+    inner: &crate::state::Inner,
+    mailbox_id: &[u8; 16],
+    caller: &Fingerprint,
+) -> bool {
+    if *mailbox_id == bootstrap_mailbox_id(caller) {
+        return false;
+    }
+    inner
+        .directory
+        .keys()
+        .any(|fp| fp != caller && bootstrap_mailbox_id(fp) == *mailbox_id)
 }
 
 async fn publish_bundle(state: &Arc<AppState>, wire: PrekeyBundleWire) -> Result<()> {
