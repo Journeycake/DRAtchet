@@ -60,6 +60,35 @@ impl Db {
 
         let changed = contact.username.as_deref() != Some(username.as_str())
             || contact.discriminator != Some(discriminator);
+
+        // DRA-0016 (`docs/DELIVERY_FAILURE_FINDINGS.md`): `ProfileAnnounce`
+        // is protocol metadata, not chat content — `store::gate` never
+        // gates it, and nothing here previously checked the announced
+        // `username#NNNN` against every *other* locally-known contact.
+        // Without this, any contact (verified or not — the gate doesn't
+        // apply here) could announce a handle identical to a different,
+        // already-known contact's, making two distinct fingerprints
+        // display identically in the UI and inviting a user to type a
+        // message into the impostor's thread believing it's the real
+        // contact's. Declined exactly like an unrelated announce that
+        // changes nothing — no error, no batch abort, just refused: the
+        // real party (`existing_owner.fingerprint`) keeps that handle,
+        // and `fingerprint` here keeps whatever it displayed before.
+        let claimed_by_someone_else = self.list_contacts()?.iter().any(|existing_owner| {
+            existing_owner.fingerprint != contact.fingerprint
+                && existing_owner.username.as_deref() == Some(username.as_str())
+                && existing_owner.discriminator == Some(discriminator)
+        });
+        if claimed_by_someone_else {
+            tracing::warn!(
+                fingerprint = %crate::db::hex(fingerprint),
+                username,
+                discriminator,
+                "rejected a ProfileAnnounce claiming a handle another known contact already uses",
+            );
+            return Ok((contact, false));
+        }
+
         // Only a genuine change *from an already-known handle* is worth a
         // caller-visible notice — the very first announce right after
         // pairing just confirms what was already known (e.g. from
@@ -197,5 +226,66 @@ mod tests {
             .record_peer_profile(&contact.fingerprint, "bob".into(), 1490)
             .unwrap();
         assert!(!changed, "re-announcing the same handle is not a change");
+    }
+
+    /// DRA-0016 (penetration test, priority 3: poisoning/corrupting a
+    /// conversation's identity). A distinct contact (a different
+    /// fingerprint entirely — never verified, since `ProfileAnnounce`
+    /// isn't gated by `store::gate` at all) announces the exact same
+    /// `username#discriminator` an already-known, unrelated contact uses.
+    /// Before the fix this silently succeeded, leaving two different
+    /// fingerprints displaying identically in the UI.
+    #[test]
+    fn record_peer_profile_refuses_to_impersonate_an_already_known_contacts_handle() {
+        let db = temp_db();
+
+        let real_bob = sample_contact(Some("bob"), Some(1490));
+        db.save_contact(&real_bob).unwrap();
+
+        let mut impostor = sample_contact(None, None);
+        impostor.fingerprint = vec![2u8; 32]; // a genuinely different identity
+        db.save_contact(&impostor).unwrap();
+
+        let (updated, changed) = db
+            .record_peer_profile(&impostor.fingerprint, "bob".into(), 1490)
+            .unwrap();
+        assert!(
+            !changed,
+            "VULNERABILITY: a distinct contact was allowed to claim another known contact's \
+             exact handle"
+        );
+        assert_eq!(
+            updated.username, None,
+            "the impostor's own contact record must not pick up the claimed handle"
+        );
+
+        // The real bob's handle must be completely untouched.
+        let real_bob_reloaded = db.load_contact(&real_bob.fingerprint).unwrap().unwrap();
+        assert_eq!(real_bob_reloaded.username.as_deref(), Some("bob"));
+        assert_eq!(real_bob_reloaded.discriminator, Some(1490));
+    }
+
+    /// The fix must not block a genuine, non-colliding rename — only an
+    /// announce that collides with a *different* contact's current
+    /// handle.
+    #[test]
+    fn record_peer_profile_still_allows_a_genuine_non_colliding_rename() {
+        let db = temp_db();
+
+        let other = sample_contact(Some("carol"), Some(4242));
+        db.save_contact(&other).unwrap();
+
+        let mut renaming = sample_contact(Some("bob"), Some(1490));
+        renaming.fingerprint = vec![2u8; 32];
+        db.save_contact(&renaming).unwrap();
+
+        let (updated, changed) = db
+            .record_peer_profile(&renaming.fingerprint, "bob".into(), 9999)
+            .unwrap();
+        assert!(
+            changed,
+            "a genuine rename to an unclaimed handle must go through"
+        );
+        assert_eq!(updated.discriminator, Some(9999));
     }
 }

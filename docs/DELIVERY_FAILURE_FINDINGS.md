@@ -1257,3 +1257,68 @@ follow-up, not implemented in this pass since it's a materially larger
 change (a new abuse-resistance primitive, not a bounds check) and the
 per-mailbox cap already closes the specific, demonstrated worst case
 (one flooded mailbox) at a fraction of the risk.
+
+## DRA-0016: A contact could spoof another known contact's exact displayed handle (penetration test, priority 3: poisoning/corrupting a conversation's identity; confirmed real, fixed)
+
+Penetration-test pass, priority 3 (poisoning/corrupting messages or
+conversations) — this time not the ciphertext itself (every AEAD/replay
+path checked this session was already solid: `untag_and_unpad` bounds-
+checks its length prefix, `is_per_entry_content_error` correctly
+classifies every per-entry decode failure as skippable rather than
+batch-aborting, `ChatContent::decode`'s errors round-trip through
+`Error::Core` exactly as needed) but the *identity label* a conversation
+displays under.
+
+`store::profile::record_peer_profile` handles an incoming
+`PAYLOAD_PROFILE_ANNOUNCE` — a rename, per `docs/MESSAGE_SCHEMA.md`.
+Unlike `PAYLOAD_CHAT`, this payload type is never gated by
+`store::gate` (`apply_entry`'s `PAYLOAD_PROFILE_ANNOUNCE` arm calls it
+directly, no verification-state check — correct for its purpose,
+`ARCHITECTURE.md` calls this out as protocol metadata, not chat
+content) — so *any* contact can send one, verified or still Pending.
+`record_peer_profile` itself, though, applied whatever
+`username`/`discriminator` the announce carried to *that one contact's*
+own record with no check against every *other* contact already known
+locally. Confirmed with a real store-level test
+(`store::profile::tests::record_peer_profile_refuses_to_impersonate_an_already_known_contacts_handle`,
+run against the pre-fix code first): a second, entirely distinct,
+never-verified contact announcing the exact same `username#NNNN` an
+already-known, unrelated contact uses succeeded silently — both
+fingerprints then displayed identically in the sidebar
+(`ui/src/routes/+page.svelte` renders `contact.handle` with no
+fingerprint or other disambiguator visible to the user).
+
+Impact: messages are still addressed and encrypted by fingerprint
+internally, never by the displayed handle, so this can't redirect or
+decrypt anyone else's actual conversation. The real risk is social —
+identical labels in the sidebar invite a user to open the *impostor's*
+thread believing it's their real, already-trusted contact, and type
+something sensitive into it. A conversation's *identity*, not its
+content, is what gets poisoned.
+
+**Fixed**: `record_peer_profile` now checks the announced
+`(username, discriminator)` against every other locally-known contact
+(`Db::list_contacts`) before applying it. A collision with a *different*
+fingerprint's current handle is declined exactly like an announce that
+changes nothing — `Ok((contact, false))`, no error, so this needed no
+change to `apply_entry`'s error handling and can't newly wedge a batch
+the way an `Err` here would have. A genuine, non-colliding rename (the
+overwhelmingly common case — someone actually changing their own
+handle) is completely unaffected, proven by a second new test,
+`record_peer_profile_still_allows_a_genuine_non_colliding_rename`.
+
+Full workspace `cargo fmt --check` / `cargo clippy --workspace --all-targets
+-- -D warnings` / `cargo test --workspace` all pass (store crate:
+67 → 69 tests).
+
+**Known residual scope, stated explicitly**: this closes the collision
+at the moment a *new* announce arrives — it does not retroactively
+audit already-stored contacts for a collision that predates this fix
+(not a live threat model change on this branch: this session's own test
+databases are always fresh), and a truly simultaneous pair of
+`ProfileAnnounce`s for the same handle arriving in the same
+`receive_pending` batch is resolved by ordinary first-write-wins (the
+first one processed claims it; the second is then correctly seen as a
+collision) rather than any more elaborate arbitration — judged
+sufficient since the attacker in this scenario is choosing the
+colliding handle deliberately, not racing a legitimate rename.
