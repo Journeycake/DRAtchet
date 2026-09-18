@@ -15,6 +15,30 @@ use x25519_dalek::PublicKey;
 
 use crate::pairing::{OneTimePrekeyWire, PairingBundle, PairingResponse};
 
+/// The exact bytes [`PairingResponse::response_signature`] signs — bound to
+/// `identity_dh_public`, `ephemeral_public`, and `routing_id` together (not
+/// just the two DH values) so a signature can't be spliced from one
+/// pairing exchange onto another with a different routing id. Called by
+/// both the signer (`initiate`) and the verifier (`respond`), so they can
+/// never drift apart on what's actually covered.
+fn signing_payload(
+    identity_dh_public: &[u8],
+    ephemeral_public: &[u8],
+    routing_id: &[u8],
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(
+        4 + identity_dh_public.len() + ephemeral_public.len() + routing_id.len(),
+    );
+    msg.extend_from_slice(b"dratchet-pairing-response-v1");
+    msg.extend_from_slice(&(identity_dh_public.len() as u32).to_be_bytes());
+    msg.extend_from_slice(identity_dh_public);
+    msg.extend_from_slice(&(ephemeral_public.len() as u32).to_be_bytes());
+    msg.extend_from_slice(ephemeral_public);
+    msg.extend_from_slice(&(routing_id.len() as u32).to_be_bytes());
+    msg.extend_from_slice(routing_id);
+    msg
+}
+
 fn parse_public_key(bytes: &[u8], what: &'static str) -> Result<PublicKey, String> {
     let arr: [u8; 32] = bytes
         .try_into()
@@ -109,17 +133,31 @@ pub fn initiate(
         .identity
         .export_public_key()
         .map_err(|e| e.to_string())?;
+    let identity_dh_public = account.identity_dh_public.as_bytes().to_vec();
+    let ephemeral_public = result
+        .message
+        .initiator_ephemeral_public
+        .as_bytes()
+        .to_vec();
+    // DRA-0022: bind identity_dh_public/ephemeral_public to identity_key,
+    // the same way PairingBundle already binds its own DH key — see
+    // pairing.rs's PairingResponse doc for what this closes.
+    let response_signature = account
+        .identity
+        .sign(&signing_payload(
+            &identity_dh_public,
+            &ephemeral_public,
+            &my_routing_id,
+        ))
+        .map_err(|e| e.to_string())?;
     let response = PairingResponse {
         identity_key,
-        identity_dh_public: account.identity_dh_public.as_bytes().to_vec(),
-        ephemeral_public: result
-            .message
-            .initiator_ephemeral_public
-            .as_bytes()
-            .to_vec(),
+        identity_dh_public,
+        ephemeral_public,
         used_signed_prekey_id: result.message.used_signed_prekey_id,
         used_one_time_prekey_id: result.message.used_one_time_prekey_id,
         routing_id: my_routing_id,
+        response_signature,
     };
     Ok((ratchet, response))
 }
@@ -134,6 +172,27 @@ pub fn respond(
     account: &mut Account,
     peer_response: &PairingResponse,
 ) -> Result<RatchetState, String> {
+    // DRA-0022 (`docs/DELIVERY_FAILURE_FINDINGS.md`): verify
+    // identity_dh_public/ephemeral_public are actually bound to
+    // identity_key *before* either is used as a real Diffie-Hellman
+    // input below. Without this, an on-path party relaying the pairing
+    // blobs could substitute both with values of its own choosing while
+    // leaving identity_key (and so the fingerprint this side later
+    // verifies out of band) untouched — completing a full, independent
+    // X3DH exchange as an active MITM using only the peer bundle's own
+    // public prekeys, undetectable by the fingerprint check that's
+    // supposed to be the system's final defense against exactly this.
+    identity::verify_signature(
+        &peer_response.identity_key,
+        &signing_payload(
+            &peer_response.identity_dh_public,
+            &peer_response.ephemeral_public,
+            &peer_response.routing_id,
+        ),
+        &peer_response.response_signature,
+    )
+    .map_err(|e| e.to_string())?;
+
     let init_message = X3dhInitMessage {
         initiator_identity_dh_public: parse_public_key(
             &peer_response.identity_dh_public,

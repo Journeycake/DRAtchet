@@ -1632,3 +1632,73 @@ and still green — this fix only removes behavior for a strictly
 narrower, previously-unintended case. Full workspace `cargo fmt
 --check` / `cargo clippy --workspace --all-targets -- -D warnings` /
 `cargo test --workspace` all pass.
+
+## DRA-0022: `PairingResponse`'s DH material wasn't bound to its claimed identity, letting an on-path relay MITM the whole session while the later fingerprint check still passed (penetration test round 3, priority 1: gaining access to individual conversations via an active MITM; confirmed real, fixed)
+
+Penetration-test round 3, priority 1 (access), continuing past DRA-0021.
+Audited `client/src/handshake.rs` — Option B's direct, out-of-band
+pairing flow (`ARCHITECTURE.md` §6.3a): two blobs, copy-pasted between
+peers (a QR code in the eventual Tauri UI; this reference CLI just
+base64s a CBOR blob), run X3DH with no server or directory involved.
+`PairingBundle`, the first blob, correctly binds its `identity_dh_public`
+to `identity_key` with a real signature (`identity_dh_signature`,
+checked by `PrekeyBundle::verify` inside `handshake::initiate`) —
+exactly what `ARCHITECTURE.md` §3.2 requires. But `PairingResponse`, the
+blob flowing the *other* direction, carried `identity_dh_public` and
+`ephemeral_public` with no such binding at all, even though
+`x3dh::respond` uses both as real Diffie-Hellman inputs.
+
+The consequence is a complete session compromise, not just a data-
+integrity nit. This round's new `client/tests/pairing_response_mitm.rs`
+proves it two ways. First, at the
+pure DH-math level, independent of any wire format: given only the
+public prekeys `PairingBundle` already exchanges in the open (Bob's
+`identity_dh_public` and `signed_prekey`), a party holding no secret
+belonging to either Alice or Bob can pick two arbitrary secrets of its
+own, substitute the corresponding public keys for Alice's real
+`identity_dh_public`/`ephemeral_public`, and derive the *exact same
+root key* `x3dh::respond` (called as Bob) lands on —
+`a_mitm_can_derive_bobs_root_key_from_only_public_material_without_response_binding`
+proves this by deriving both sides independently and asserting they're
+identical. Second, end to end: an on-path relay of the pairing blobs
+could make exactly this substitution while leaving `identity_key`
+untouched — so the fingerprint Bob later verifies out of band against
+Alice's real identity would still match, even though the session keys
+underneath it were silently forged. This is meaningfully worse than the
+already-accepted directory-TOFU-MITM limitation (where an impersonator
+would show up as a *different*, mismatching fingerprint, exactly the
+case the verification step exists to catch): here the system's own
+designed final defense never fires, because the field it never checks
+is the one actually being forged.
+
+**Fixed**: `PairingResponse` gained a new `response_signature` field.
+`handshake::initiate` now signs `identity_dh_public ‖ ephemeral_public ‖
+routing_id` (length-prefixed, tagged `dratchet-pairing-response-v1`) with
+the initiator's identity key — `handshake::signing_payload` is the one
+function both the signer and the verifier call, so they can't drift
+apart on what's actually covered. `handshake::respond` now verifies this
+signature against the response's own `identity_key` *before* either DH
+field is used, rejecting the response outright if it doesn't verify.
+`routing_id` is bound too, not just the two DH values, so a signature
+can't be spliced from one pairing exchange onto a different one.
+
+Verified with three tests in `client/tests/pairing_response_mitm.rs`:
+the MITM-math proof above (unaffected by the fix, since it demonstrates
+the underlying weakness independent of the wire format — the reason the
+fix is necessary in the first place); `respond_accepts_a_genuine_untampered_pairing_response`
+(the fix must not be overly strict); and
+`respond_rejects_a_pairing_response_whose_dh_material_was_tampered_with_after_signing`,
+which substitutes a fresh `ephemeral_public` into an otherwise-real,
+already-signed response and confirms `respond` now returns `Err` instead
+of silently deriving a session key from it. The existing end-to-end
+`client/tests/integration.rs` golden path (real pairing, real message
+exchange over a real spawned server) still passes unmodified. Full
+workspace `cargo fmt --check` / `cargo clippy --workspace --all-targets
+-- -D warnings` / `cargo test --workspace` all pass.
+
+**Scope note**: `client/`'s Option B pairing flow is explicitly
+documented as this project's reference CLI, not yet wired into the
+production Tauri app (`ui/src-tauri/`), which currently only implements
+Option A's mandatory-verification, directory-based flow. This fix closes
+a real, severe protocol flaw in code that exists and is tested in the
+repository today, ahead of whatever UI eventually calls it.
