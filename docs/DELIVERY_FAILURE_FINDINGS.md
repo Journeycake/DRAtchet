@@ -2367,3 +2367,37 @@ deployment path, not the hardened production one (`scripts/bootstrap-k3s-pi.sh`/
 runbook — `docs/DEPLOY_K3S_PI.md` — uses). A genuinely hostile
 co-tenant on a shared test node has other avenues regardless of this
 fix; this closes the cheapest, most opportunistic one.
+
+## DRA-0035: `full_wipe` left DRA-0033's own keyfile behind, breaking its "destroys everything" contract (penetration test round 4, data destruction; confirmed real, fixed)
+
+Penetration-test round 4, a self-follow-up on this same round's
+DRA-0033 fix — `dratchet_app::full_wipe` (`ARCHITECTURE.md` §11.9's
+device-seizure duress response, its own doc comment says it "destroys
+everything") only knows about the `.redb` file itself; it has no idea
+DRA-0033's `device_passphrase` keyfile exists at all, since that's a
+`ui/src-tauri`-only concept introduced earlier this same round. Left
+as-is, a real `full_wipe` call would leave that sibling file behind
+untouched on disk — not a decryption risk on its own (the old `.redb`'s
+salt/wrapped DEKs are already destroyed by `Db::full_wipe` before the
+file is removed, so the surviving keyfile can't decrypt anything from
+it), but a real gap in `full_wipe`'s own documented "destroys
+everything" promise, and a distinguishable leftover artifact after a
+duress wipe that's supposed to leave nothing behind.
+
+Confirmed with a real test: `ui/src-tauri/src/lib.rs`'s
+`device_passphrase_path_matches_what_full_wipes_cleanup_removes` proves
+`device_passphrase_path` (the function `full_wipe`'s cleanup now calls)
+resolves to the exact path `device_passphrase` actually writes to — the
+two were two independent inline `.with_extension("keyfile")`
+expressions before this fix, with nothing structurally guaranteeing
+they'd ever drift apart, but nothing guaranteeing they wouldn't either.
+
+**Fixed**: factored the shared path expression into one
+`device_passphrase_path` function, called by both `device_passphrase`
+(to find/write the keyfile) and the `full_wipe` Tauri command (to
+remove it, best-effort, right after `dratchet_app::full_wipe` runs and
+before the process restarts) — one definition, so the two can no longer
+disagree.
+
+Full `ui/src-tauri` workspace `cargo fmt --check` / `cargo clippy
+--all-targets -- -D warnings` / `cargo test` all pass (10 tests).

@@ -521,6 +521,15 @@ fn quick_wipe(state: State<AppState>) -> Result<usize, String> {
 #[tauri::command]
 fn full_wipe(state: State<AppState>, app: AppHandle) -> Result<(), String> {
     dratchet_app::full_wipe(&state.db, &state.db_path).map_err(|e| e.to_string())?;
+    // DRA-0035 (`docs/DELIVERY_FAILURE_FINDINGS.md`): `dratchet_app::full_wipe`
+    // only knows about the `.redb` file itself -- it has no idea
+    // DRA-0033's `device_passphrase` keyfile exists at all, since that's a
+    // ui/src-tauri-only concept. Left alone, `full_wipe` (ARCHITECTURE.md
+    // §11.9's device-seizure duress response, documented as destroying
+    // "everything") would leave that sibling file behind untouched,
+    // breaking its own "destroys everything" contract -- best-effort
+    // removal, matching `dratchet_app::full_wipe`'s own file-removal step.
+    let _ = std::fs::remove_file(device_passphrase_path(&state.db_path));
     app.restart();
 }
 
@@ -795,8 +804,12 @@ fn dev_db_path() -> PathBuf {
 /// something the user knows, not just something stored on the same
 /// disk as the data it protects) remains a real UI feature for future
 /// work -- see this finding's "Known residual scope" in the docs.
+fn device_passphrase_path(db_path: &std::path::Path) -> std::path::PathBuf {
+    db_path.with_extension("keyfile")
+}
+
 fn device_passphrase(db_path: &std::path::Path) -> String {
-    let keyfile_path = db_path.with_extension("keyfile");
+    let keyfile_path = device_passphrase_path(db_path);
     if let Ok(existing) = std::fs::read_to_string(&keyfile_path) {
         let trimmed = existing.trim();
         if !trimmed.is_empty() {
@@ -1129,5 +1142,28 @@ mod tests {
         let a = device_passphrase(&dir.path().join("a.redb"));
         let b = device_passphrase(&dir.path().join("b.redb"));
         assert_ne!(a, b);
+    }
+
+    /// DRA-0035: `full_wipe`'s own keyfile cleanup, built on
+    /// `device_passphrase_path` and `remove_file`, must actually remove
+    /// the file `device_passphrase` creates -- proving the path both
+    /// functions compute is the same one, so a real `full_wipe` call
+    /// doesn't leave this file behind.
+    #[test]
+    fn device_passphrase_path_matches_what_full_wipes_cleanup_removes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("a.redb");
+        let _ = device_passphrase(&db_path);
+        let keyfile = device_passphrase_path(&db_path);
+        assert!(
+            keyfile.exists(),
+            "device_passphrase must have created the keyfile"
+        );
+        std::fs::remove_file(&keyfile).unwrap();
+        assert!(
+            !keyfile.exists(),
+            "VULNERABILITY: full_wipe's cleanup path must actually match where \
+             device_passphrase writes the keyfile, or a duress wipe leaves it behind"
+        );
     }
 }
