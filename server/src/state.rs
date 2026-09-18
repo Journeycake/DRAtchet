@@ -8,6 +8,7 @@
 //! `docs/SERVERS.md` §1.4's update for the scope of that exception.
 
 use std::collections::HashMap;
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -111,6 +112,19 @@ pub const MAX_ICE_CANDIDATES: usize = 64;
 /// A real candidate line is well under a hundred bytes.
 pub const MAX_ICE_CANDIDATE_LEN: usize = 4096;
 
+/// DRA-0031 (`docs/DELIVERY_FAILURE_FINDINGS.md`) — a hard ceiling on
+/// total concurrent WebSocket connections this process will accept at
+/// once, enforced in `ws.rs`'s `ws_handler` before the HTTP upgrade
+/// completes (`AppState::active_connections`). DRA-0030 bounds a single
+/// message/frame; nothing bounded connection *count* at all, so a flood
+/// of bare, unauthenticated TCP connections (each cheap for the attacker
+/// — no bytes need to be sent past the initial handshake) could still
+/// exhaust server memory/file descriptors one `tokio::spawn` task and
+/// mpsc channel at a time, at whatever rate the attacker could open
+/// sockets. Generous for any real deployment's legitimate concurrent
+/// user count while bounding the worst case to a fixed, known ceiling.
+pub const MAX_CONCURRENT_CONNECTIONS: usize = 10_000;
+
 /// DRA-0030 (`docs/DELIVERY_FAILURE_FINDINGS.md`) — the *transport-layer*
 /// ceiling on a single WebSocket message, applied to every connection
 /// (`ws.rs`'s `ws_handler`) before any application-layer frame is even
@@ -208,6 +222,18 @@ pub struct AppState {
     /// `crate::app_with_directory_db` built this state — see
     /// `crate::persistence` for what that closes.
     pub persistence: Option<crate::persistence::Persistence>,
+    /// DRA-0031 — current live connection count, checked against
+    /// `connection_cap` before each new upgrade. A plain `AtomicUsize`
+    /// outside `inner`'s `RwLock`: every connection touches this on
+    /// connect/disconnect, and it doesn't need to be consistent with any
+    /// of `Inner`'s other state.
+    pub active_connections: AtomicUsize,
+    /// DRA-0031 — the ceiling `active_connections` is checked against.
+    /// Always `MAX_CONCURRENT_CONNECTIONS` outside tests; overridable via
+    /// [`AppState::new_with_connection_cap`] so a test can prove the cap
+    /// is actually enforced without needing to open thousands of real
+    /// connections against the real 10,000 default.
+    pub connection_cap: usize,
 }
 
 impl AppState {
@@ -215,6 +241,22 @@ impl AppState {
         Arc::new(AppState {
             inner: RwLock::new(Inner::default()),
             persistence: None,
+            active_connections: AtomicUsize::new(0),
+            connection_cap: MAX_CONCURRENT_CONNECTIONS,
+        })
+    }
+
+    /// Like [`AppState::new`], but with a caller-chosen connection cap —
+    /// a test-only convenience (DRA-0031's own regression test is the
+    /// only caller) so the cap can be proven enforced at a small number
+    /// instead of the real `MAX_CONCURRENT_CONNECTIONS`.
+    #[allow(dead_code)]
+    pub fn new_with_connection_cap(cap: usize) -> Arc<Self> {
+        Arc::new(AppState {
+            inner: RwLock::new(Inner::default()),
+            persistence: None,
+            active_connections: AtomicUsize::new(0),
+            connection_cap: cap,
         })
     }
 
@@ -239,6 +281,8 @@ impl AppState {
         Arc::new(AppState {
             inner: RwLock::new(inner),
             persistence: Some(persistence),
+            active_connections: AtomicUsize::new(0),
+            connection_cap: MAX_CONCURRENT_CONNECTIONS,
         })
     }
 }

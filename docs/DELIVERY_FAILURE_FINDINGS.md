@@ -2138,4 +2138,58 @@ bandwidth — a large number of simultaneous connections each staying
 under the 1 MiB ceiling could still add up to significant memory, a
 distinct DoS surface (connection-count limiting) that this fix
 deliberately doesn't address and that isn't currently bounded anywhere
-in this codebase.
+in this codebase. Closed immediately below as DRA-0031.
+
+## DRA-0031: no ceiling on total concurrent WebSocket connections (penetration test round 4, denial of service — unbounded connection count; confirmed real, fixed)
+
+Penetration-test round 4, closing the residual scope DRA-0030 named but
+didn't fix. DRA-0030 bounds a single message/frame; nothing at all
+bounded how many connections `ws_handler` would accept simultaneously.
+Every accepted connection costs the server a spawned `tokio::spawn` task
+(`handle_socket`'s `send_task`), an `mpsc::unbounded_channel`, and an
+entry in various per-connection bookkeeping — and none of that requires
+sending a single byte past the initial WebSocket handshake, so it's
+cheap for an attacker to trigger at whatever rate they can open TCP
+sockets. Unlike DRA-0018 (unbounded distinct *mailbox* creation, which
+required authentication and was already rate-limited per identity),
+opening a bare connection requires no authentication and had no limit
+of any kind — per-IP, per-process, or global.
+
+Confirmed with a real test:
+`server/tests/unbounded_connection_count.rs`'s
+`a_connection_past_the_cap_is_rejected_before_the_upgrade` configures a
+server with a small connection cap (2, via a new test-only
+`AppState::new_with_connection_cap` constructor — proving the real
+10,000-connection default is enforced the same way without needing to
+actually open thousands of connections in a test), fills it with two
+live connections, then attempts a third. Verified pre-fix via `git
+stash` of `server/src/state.rs`/`server/src/ws.rs`: the test doesn't
+even compile, because the cap-enforcement API (`connection_cap`,
+`new_with_connection_cap`) didn't exist at all — direct evidence there
+was previously no mechanism to enforce a connection limit of any kind.
+
+**Fixed**: `AppState` gained `active_connections` (an `AtomicUsize`
+incremented on connect, decremented via an RAII `ConnectionCountGuard`
+on disconnect — guaranteed to release even if `handle_socket` ever
+grows an early-return path in the future) and `connection_cap`
+(defaulting to the new `state::MAX_CONCURRENT_CONNECTIONS`, 10,000 —
+generous for any real deployment's legitimate concurrent user count).
+`ws_handler` checks the count against the cap *before* completing the
+HTTP upgrade; a connection past the cap gets a plain `503 Service
+Unavailable` instead of a WebSocket upgrade, so it never reaches
+`handle_socket`'s per-connection allocations at all.
+
+Re-ran the new tests against the fix (both pass — the cap rejects the
+third connection, and an ordinary connection under the cap still
+connects normally). Full workspace `cargo fmt --check` / `cargo clippy
+--workspace --all-targets -- -D warnings` / `cargo test --workspace`
+all pass (55 test result blocks, zero failures).
+
+**Known residual scope, stated explicitly**: this is a single global
+cap, not a per-IP one — one attacker with many source addresses (or
+behind a NAT shared with legitimate users) could still consume the
+entire budget, denying service to everyone else, though at a
+meaningfully higher cost than an unbounded single-source flood. Per-IP
+connection limiting would close that gap further but is real feature
+work (source-IP extraction behind a real deployment's reverse proxy,
+a second rate-limiter keyed by IP) beyond this bounded fix's scope.

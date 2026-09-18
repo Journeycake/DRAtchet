@@ -31,11 +31,13 @@
 //! they have no reason to ever be discoverable by `username#NNNN`, only to
 //! authenticate to read/write the Tier 1 mailbox they already agreed on.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
-use axum::response::IntoResponse;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tracing::debug;
@@ -62,10 +64,16 @@ use crate::state::{
 /// exhausted one here).
 const OTP_EXHAUSTION_ALERT_THRESHOLD: u32 = 10;
 
-pub async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> Response {
+    // DRA-0031: a hard ceiling on total concurrent connections, checked
+    // before the HTTP upgrade completes -- otherwise an attacker can open
+    // an unbounded number of bare, unauthenticated connections, each
+    // cheap to open but costing the server a spawned task and an mpsc
+    // channel, with nothing capping the total.
+    if state.active_connections.load(Ordering::Relaxed) >= state.connection_cap {
+        return (StatusCode::SERVICE_UNAVAILABLE, "too many connections").into_response();
+    }
+
     // DRA-0030: without an explicit ceiling here, axum/tokio-tungstenite
     // defaults to a 64 MiB per-message limit -- enforced transport-side,
     // before any application-layer cap in `state.rs` (MAX_ENVELOPE_LEN,
@@ -74,9 +82,25 @@ pub async fn ws_handler(
     ws.max_message_size(crate::state::MAX_WS_MESSAGE_BYTES)
         .max_frame_size(crate::state::MAX_WS_MESSAGE_BYTES)
         .on_upgrade(move |socket| handle_socket(socket, state))
+        .into_response()
+}
+
+/// Decrements `AppState::active_connections` when dropped — guarantees the
+/// count is released whether `handle_socket` returns normally or (should
+/// one ever be introduced) via an early return, without needing to
+/// duplicate the decrement at every exit point.
+struct ConnectionCountGuard(Arc<AppState>);
+
+impl Drop for ConnectionCountGuard {
+    fn drop(&mut self) {
+        self.0.active_connections.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
+    state.active_connections.fetch_add(1, Ordering::Relaxed);
+    let _count_guard = ConnectionCountGuard(state.clone());
+
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
