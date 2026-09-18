@@ -1154,6 +1154,21 @@ fn apply_entry(
             let current = db
                 .load_contact(&contact.fingerprint)?
                 .unwrap_or_else(|| contact.clone());
+            // DRA-0021 (`docs/DELIVERY_FAILURE_FINDINGS.md`): unlike every
+            // other arm here, a wipe request has a genuinely destructive
+            // local effect (auto-comply deletes real message history
+            // outright; even the ask-before-delete branch below arms a
+            // confirmation prompt a user could be talked into approving).
+            // §6.5 only ever gated *chat content*, on the theory that
+            // everything else is inert "protocol machinery" — but this
+            // payload isn't inert, so a session that isn't `Verified`
+            // (including one explicitly reverted to `Mismatch`, §6.2/6.3's
+            // hard-stop for a detected identity change) must never have it
+            // take any local effect, exactly as `decrypt_gated` already
+            // withholds chat content from the same untrusted session.
+            if current.verification_state != VerificationState::Verified {
+                return Ok(EntryEffect::None);
+            }
             if current.effective_wipe_ask_before_delete() {
                 // Not applied to this path: the requester's carried
                 // preference isn't persisted anywhere between now and

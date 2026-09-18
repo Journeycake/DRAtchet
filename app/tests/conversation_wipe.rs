@@ -523,3 +523,75 @@ async fn asymmetric_scope_preference_session_included_wins() {
     .await;
     assert!(matches!(alice_result, Err(dratchet_app::Error::NoSession)));
 }
+
+/// Penetration-test finding, DRA-0021 (round 3, priority 2: message
+/// poisoning/corruption), found auditing `apply_entry`'s
+/// `PAYLOAD_CONVERSATION_WIPE_REQUEST` arm (`app/src/lib.rs`) against
+/// `store::gate`'s own doc, which says only `PAYLOAD_CHAT` content is
+/// withheld from a non-`Verified` contact — everything else is treated as
+/// inert "protocol machinery." A wipe request isn't inert: unlike every
+/// other payload type this arm handles, processing it has a real,
+/// destructive local effect (auto-comply deletes real message history
+/// outright). Nothing checked `contact.verification_state` before running
+/// it, so a session that Bob has explicitly reverted to `Mismatch` —
+/// §6.2/6.3's hard stop for a detected identity change, deliberately
+/// non-reversible except by a fresh, successful re-verification — could
+/// still reach in and destroy real, previously-`Verified` conversation
+/// history he never consented to losing from that (now untrusted) party.
+///
+/// This test builds a real, `Verified`, chat-capable pair exactly like
+/// every other test in this file, exchanges one genuine message, then
+/// has Bob revert his belief about Alice to `Mismatch` (via
+/// `record_verification_result(..., false)`, the same real function the
+/// app calls on a detected mismatch) — modeling the realistic scenario
+/// where Bob has already flagged this session as untrustworthy. Alice's
+/// own session is unaffected (her local ratchet/connection don't know
+/// Bob revoked trust in her), so she can still send a real, validly
+/// encrypted `PAYLOAD_CONVERSATION_WIPE_REQUEST` over the wire — proving
+/// this isn't a forgery/AEAD question, only an authorization one.
+#[tokio::test]
+async fn a_wipe_request_from_a_mismatched_contact_is_ignored() {
+    let (mut alice, mut bob, conv_id) = verified_pair().await;
+    // Default policy on both sides is auto-comply (ask_before_delete =
+    // false) — the strictly worse case for this bug, since a `Verified`
+    // sender's wipe request would otherwise auto-delete immediately with
+    // no confirmation step at all.
+    send_and_deliver(&mut alice, &mut bob, b"real message, verified at the time").await;
+    assert_eq!(bob.db.list_messages(conv_id).unwrap().len(), 1);
+
+    // Bob now flags this session as a detected identity mismatch — a
+    // hard stop, deliberately not reversible except by re-verifying.
+    bob.contact = record_verification_result(&bob.db, bob.contact.clone(), false).unwrap();
+    assert_eq!(bob.contact.verification_state, VerificationState::Mismatch);
+
+    // Alice's own client is none the wiser and sends a real wipe request
+    // over the still-live ratchet session.
+    request_conversation_wipe(&alice.db, &mut alice.conn, &alice.account, &alice.contact)
+        .await
+        .unwrap();
+
+    let outcome = receive_pending(&bob.db, &mut bob.conn, &bob.account, &bob.contact)
+        .await
+        .unwrap();
+    assert!(
+        !outcome.wipe_activity,
+        "VULNERABILITY: a wipe request from a Mismatch (untrusted) contact must not even \
+         register as wipe activity"
+    );
+    assert_eq!(
+        bob.db.list_messages(conv_id).unwrap().len(),
+        1,
+        "FIX VERIFIED: real, previously-verified message history must survive a wipe request \
+         from a contact Bob no longer trusts"
+    );
+    let bob_contact = bob
+        .db
+        .load_contact(&bob.contact.fingerprint)
+        .unwrap()
+        .unwrap();
+    assert!(
+        !bob_contact.wipe_request_pending,
+        "must not even arm a confirmation prompt for an untrusted session — that's still a \
+         social-engineering surface, not just an auto-comply one"
+    );
+}

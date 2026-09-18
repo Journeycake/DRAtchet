@@ -1558,3 +1558,77 @@ flag. Full workspace `cargo fmt --check` / `cargo clippy --workspace
 --all-targets -- -D warnings` / `cargo test --workspace` all pass,
 including every existing wipe test (which all correctly set
 `wipe_request_pending` before calling this, so none needed changes).
+
+## DRA-0021: a conversation-wipe request from a contact who isn't Verified — including one already flagged Mismatch — was processed anyway (penetration test round 3, priority 2: message poisoning/corruption; confirmed real, fixed)
+
+Penetration-test round 3, priority 2 (poisoning/corruption), continuing
+past DRA-0020. Two investigative dead ends worth recording first, so
+they aren't re-investigated later: (1) `poll_loop`'s reconnect
+backoff (`ui/src-tauri/src/lib.rs`) resets to its initial value on every
+successful reconnect, which looked at first like a server could force a
+tight reconnect loop by accepting-then-dropping — but this is already
+an accepted characteristic of the design, not a new gap. (2)
+`FetchRateLimiter`'s budget is keyed by `(ConnectionId, target)`, and
+`ConnectionId` is a fresh random value per WebSocket connection — so
+reconnecting resets a target's fetch budget, which looked like a
+bypass of the one-time-prekey exhaustion defense — but `abuse.rs`'s own
+module doc already names this exact tradeoff explicitly ("a known,
+accepted limitation: reconnecting resets the budget"), so it isn't a
+new finding either. (3) The signed prekey is never actually rotated —
+`signed_prekey_expires_at` is always published as a literal `0`
+(`app/src/lib.rs`) and nothing anywhere checks it — but
+`core/src/prekey.rs`'s own doc comment says outright: "Rotated
+periodically in the full design; v0 just models the keypair +
+signature, not the rotation schedule." An explicitly-scoped-out v0
+limitation, not an undiscovered bug.
+
+The real finding: `apply_entry`'s `PAYLOAD_CONVERSATION_WIPE_REQUEST`
+arm (`app/src/lib.rs`) never checked `contact.verification_state`
+before acting on it. `store::gate`'s mandatory-verification gate
+(§6.5) only ever withholds `PAYLOAD_CHAT` content from a non-`Verified`
+contact, on the documented theory that everything else is inert
+"protocol machinery" safe to let through underneath the gate (the
+routing-id exchange has to work before verification completes, for
+instance). A wipe request isn't inert, though — unlike routing-id
+announces or profile announces, processing it has a real, destructive
+local effect: the auto-comply branch calls `wipe_conversation_scoped`
+outright, and even the ask-before-delete branch arms a confirmation
+prompt the user could be talked into approving. Nothing about either
+branch depended on the sender actually being trusted.
+
+The realistic impact is worse than "an unverified first-contact wipes
+an empty conversation": `Contact::mark_mismatch` (§6.2/6.3) is a hard
+stop specifically for a *detected* identity change — deliberately not
+reversible except by a fresh, successful re-verification — and this
+gap meant a session already flagged `Mismatch` could still reach in and
+delete real, previously-`Verified` message history. Confirmed with a
+real, no-mocks test in `app/tests/conversation_wipe.rs`
+(`a_wipe_request_from_a_mismatched_contact_is_ignored`), run against
+the pre-fix code first: a genuine `Verified` pair (real X3DH via the
+directory, real routing-id exchange) exchanges one real message, Bob
+then calls the same `record_verification_result(..., false)` path the
+app uses on a detected mismatch, and Alice's still-live session sends a
+real, validly-encrypted wipe request — proving this is an authorization
+gap, not an AEAD/forgery one. Pre-fix, Bob's one real message was
+deleted and `outcome.wipe_activity` was `true`.
+
+**Fixed**: the wipe-request arm now reloads the fresh, just-persisted
+`Contact` record (the same reload it already needed for the wipe
+boundary) and returns `EntryEffect::None` immediately — before touching
+either the auto-comply or ask-before-delete branch — unless
+`verification_state == VerificationState::Verified`, mirroring exactly
+what `decrypt_gated` already does for chat content from the same kind
+of untrusted session. Not just the destructive auto-comply path but
+also the ask-before-delete path is gated, since arming a confirmation
+prompt from a `Mismatch` contact is still a live social-engineering
+surface even though it isn't itself destructive.
+
+Re-ran the test against the fix: the real message survives, no
+`wipe_activity` is reported, and `wipe_request_pending` isn't even
+armed. Re-ran the rest of `conversation_wipe.rs` (all pre-existing
+auto-comply, ask-before-delete, decline, and asymmetric-preference
+scenarios, all of which use `Verified` contacts throughout) unchanged
+and still green — this fix only removes behavior for a strictly
+narrower, previously-unintended case. Full workspace `cargo fmt
+--check` / `cargo clippy --workspace --all-targets -- -D warnings` /
+`cargo test --workspace` all pass.
