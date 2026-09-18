@@ -1232,6 +1232,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "thiserror 1.0.69",
+ "tokio",
  "tracing",
  "zeroize",
 ]

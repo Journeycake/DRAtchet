@@ -1916,3 +1916,61 @@ separate hardening opportunities left for a follow-up — narrowed out of
 this fix to keep it a clean, bounded size cap matching the established
 pattern, not a broader redesign of Tier 0's trust model under time
 pressure.
+
+## DRA-0027: the Tauri app shipped with no Content-Security-Policy at all (penetration test round 4, data extraction — hardening the blast radius of any future webview XSS; confirmed real, fixed)
+
+Penetration-test round 4, continuing past DRA-0026. Audited
+`ui/src-tauri/tauri.conf.json` — the production Tauri app's own
+configuration, not something reachable by a remote attacker directly,
+but a real gap in defense-in-depth: `app.security.csp` was `null`. No
+current code path in this app has a known script-injection bug (the
+frontend was already checked earlier this engagement and uses no
+`{@html}`/`innerHTML`/dynamic `href`/`src` construction anywhere), but
+an unset CSP means that if any *future* change ever introduced one — a
+message-rendering bug, a vulnerable npm dependency, anything — the
+injected script would have completely unrestricted reach inside the
+webview: arbitrary network requests, arbitrary script/style loading,
+and whatever the Tauri `invoke` IPC bridge exposes (reading every
+contact and message, sending messages as the user, triggering a wipe).
+Tauri's own security documentation recommends every app set an explicit
+CSP for exactly this reason — bounding what a future XSS can *do*, not
+preventing it from existing in the first place.
+
+This isn't a bug with a runtime exploit to demonstrate (there's no
+current injection point), so the "confirmed real" proof here is
+structural rather than an attack PoC: `ui/src-tauri/src/lib.rs`'s new
+`tauri_conf_declares_a_real_restrictive_csp` test, run against the
+pre-fix `"csp": null` config first, fails with a clear panic
+(`VULNERABILITY: app.security.csp must be a real policy string...`) —
+proving the gap existed and would keep existing for any future change
+that touched this file, silently, with nothing to catch it.
+
+**Fixed**: set an explicit, restrictive CSP —
+`default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: asset: http://asset.localhost; connect-src 'self' ipc: http://ipc.localhost; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'`.
+`ipc:`/`http://ipc.localhost` in `connect-src` and `asset:`/
+`http://asset.localhost` in `img-src` are Tauri v2's own documented
+requirements for its IPC bridge and asset protocol to keep working;
+everything else defaults closed (`'self'` only, no `unsafe-eval`, no
+wildcard origins, no plugin objects, no cross-origin form posts).
+
+Re-ran the new test against the fix (passes), plus verified live: built
+the frontend (`npm run build`, `npm run check` — both clean), then
+launched the actual app end to end under Xvfb (`npm run tauri dev`
+against a real running `dratchetd`) and took a screenshot — the app
+rendered and functioned normally (title bar, settings, contact list,
+"No conversations yet." from a real `invoke()` round trip), with no CSP
+violation messages in the console log. This proves the CSP doesn't
+break the app's real IPC/script/style usage in dev mode. Full workspace
+`cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` /
+`cargo test` for the `ui/src-tauri` workspace (a separate Cargo
+workspace from the root one) all pass; root workspace `cargo fmt
+--check` confirmed unaffected.
+
+**Known residual scope, stated explicitly**: live verification here
+covered *dev* mode (`tauri dev`, which proxies through the Vite dev
+server) rather than a full production `tauri build` bundle, which uses
+Tauri's packaged `asset:`/`tauri://` protocol instead. The CSP string
+itself is unchanged between dev and production and follows Tauri's
+documented production requirements, but a production-bundle live check
+is a reasonable follow-up before considering this fully verified
+end-to-end in the exact shipped artifact.

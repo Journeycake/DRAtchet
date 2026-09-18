@@ -966,4 +966,46 @@ mod tests {
             .is_ok();
         assert!(ok, "the replacement connection is genuinely usable");
     }
+
+    /// DRA-0027 (`docs/DELIVERY_FAILURE_FINDINGS.md`, penetration test
+    /// round 4, data extraction — blast-radius-of-a-future-XSS hardening):
+    /// `tauri.conf.json`'s `app.security.csp` was `null` — no Content-
+    /// Security-Policy at all, so if any future code change (a message-
+    /// rendering bug, a vulnerable dependency) ever introduced script
+    /// injection into the webview, the injected script would have
+    /// completely unrestricted network/script/style access, including
+    /// whatever the Tauri `invoke` IPC bridge exposes (contacts, message
+    /// history, wipe commands). A real CSP doesn't prevent a future XSS
+    /// bug from existing, but it bounds what an XSS can actually *do* —
+    /// exactly the belt-and-suspenders layer Tauri's own security
+    /// guidance recommends every app set explicitly rather than leaving
+    /// unset. Pinned here as a regression test (not a runtime exploit —
+    /// there's no current injection point to demonstrate against) so a
+    /// future edit can't silently null this back out or weaken it to
+    /// something permissive (`'unsafe-eval'`, a wildcard `script-src`)
+    /// without a test failing to call attention to it.
+    #[test]
+    fn tauri_conf_declares_a_real_restrictive_csp() {
+        let conf_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tauri.conf.json");
+        let raw = std::fs::read_to_string(&conf_path).expect("tauri.conf.json must be readable");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&raw).expect("tauri.conf.json must be valid JSON");
+        let csp = parsed["app"]["security"]["csp"].as_str().expect(
+            "VULNERABILITY: app.security.csp must be a real policy string, not null/absent — \
+                 an unset CSP gives any future XSS in the webview unrestricted reach",
+        );
+        assert!(
+            csp.contains("default-src 'self'"),
+            "the policy must at minimum restrict the default fetch directive to the app's own \
+             origin"
+        );
+        assert!(
+            !csp.contains("unsafe-eval"),
+            "must not permit eval()-style dynamic code execution"
+        );
+        assert!(
+            !csp.contains("script-src *") && !csp.contains("script-src: *"),
+            "must not permit loading scripts from an arbitrary origin"
+        );
+    }
 }
