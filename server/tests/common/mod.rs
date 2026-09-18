@@ -115,6 +115,17 @@ impl TestClient {
         let _: (_, AuthChallenge) = self.recv().await;
     }
 
+    /// Like `recv_raw`, but returns `None` instead of panicking when the
+    /// connection closes or errors — for tests (DRA-0030) that specifically
+    /// want to observe transport-level rejection (e.g. a message exceeding
+    /// the server's configured size ceiling) rather than treating a closed
+    /// connection as a test failure. Unused by every other test binary —
+    /// see `send_raw`'s doc above for why that's expected.
+    #[allow(dead_code)]
+    pub async fn recv_frame_or_close(&mut self) -> Option<WsMessage> {
+        self.ws.next().await.and_then(|r| r.ok())
+    }
+
     /// Like `recv`, but silently skips server-pushed frames that aren't a
     /// response to anything this connection asked for
     /// (`RendezvousOffer`/`RendezvousAnswer` relayed from a peer,

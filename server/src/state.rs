@@ -111,6 +111,21 @@ pub const MAX_ICE_CANDIDATES: usize = 64;
 /// A real candidate line is well under a hundred bytes.
 pub const MAX_ICE_CANDIDATE_LEN: usize = 4096;
 
+/// DRA-0030 (`docs/DELIVERY_FAILURE_FINDINGS.md`) — the *transport-layer*
+/// ceiling on a single WebSocket message, applied to every connection
+/// (`ws.rs`'s `ws_handler`) before any application-layer frame is even
+/// parsed. Every other `MAX_*` cap in this file bounds one specific
+/// decoded field; none of them matter for a connection that never gets
+/// that far, because `axum`/`tokio-tungstenite` silently defaults to a
+/// 64 MiB per-message ceiling when nothing overrides it — a thousand
+/// times larger than `MAX_ENVELOPE_LEN`, reachable by any TCP connection,
+/// pre-authentication. The largest legitimate frame this protocol ever
+/// sends is an ordinary `RendezvousAnswer` (`MAX_SDP_LEN` plus
+/// `MAX_ICE_CANDIDATES * MAX_ICE_CANDIDATE_LEN`, well under 320 KiB); 1
+/// MiB is generous headroom above that while still cutting the library's
+/// default ceiling by 64x.
+pub const MAX_WS_MESSAGE_BYTES: usize = 1024 * 1024;
+
 /// A username#NNNN identity, as looked up in the directory.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct UsernameKey {

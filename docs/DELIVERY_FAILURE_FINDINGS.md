@@ -2068,3 +2068,74 @@ that range without a manual bump. Recommend an `npm audit` pass as a
 standing item in CI (not currently run there) so future advisories in
 any dependency, direct or transitive, surface automatically rather
 than depending on a manual pentest pass to catch them.
+
+## DRA-0030: no WebSocket transport-layer message-size ceiling, letting a pre-auth connection force up to 64 MiB of memory per frame (penetration test round 4, denial of service — transport-layer resource exhaustion; confirmed real, fixed)
+
+Penetration-test round 4, stepping back from the application-layer caps
+this file already documents (`MAX_ENVELOPE_LEN`/DRA-0015,
+`MAX_ONE_TIME_PREKEYS_PER_PUBLISH`/DRA-0019, `MAX_SDP_LEN`/DRA-0026, ...)
+to ask what happens *before* any of them can run. Every one of those
+checks executes only after `axum`/`tokio-tungstenite` has already fully
+decoded an incoming WebSocket message into memory — `ws_handler`
+(`server/src/ws.rs`) never called either library's own
+`.max_message_size(...)`/`.max_frame_size(...)`, so both silently used
+`tungstenite`'s documented default: 64 MiB per message, 16 MiB per frame.
+That's roughly a thousand times `MAX_ENVELOPE_LEN` (64 KiB) and reachable
+by any raw TCP connection — `dispatch`'s `AuthResponse` check only runs
+*after* a frame is already fully buffered, so this isn't even gated by
+authentication. A single connection sending one crafted near-64 MiB
+message forces the server to allocate that much memory before it ever
+gets a chance to reject anything for being malformed or oversized at the
+application layer; repeated across connections (or one connection in a
+loop), this is a straightforward memory-exhaustion DoS that every
+existing size cap in this file was structurally unable to prevent,
+because none of them run early enough.
+
+Confirmed with a real test:
+`server/tests/unbounded_ws_message_size.rs`'s
+`an_oversized_pre_auth_frame_is_rejected_at_the_transport_layer` opens an
+unauthenticated connection and sends a single 2 MiB binary frame (chosen
+to stay far below the 64 MiB library default while still dwarfing any
+legitimate frame this protocol ever sends). Verified pre-fix via `git
+stash` of `server/src/state.rs`/`server/src/ws.rs`: the frame was
+accepted in full, forwarded into `dispatch`, failed CBOR decoding for an
+unrelated reason, and came back as an ordinary `Error` frame on a
+connection that stayed open — proving there was no transport-level
+rejection at all below the library's own 64 MiB ceiling.
+
+**Fixed**: `server/src/state.rs` gained `MAX_WS_MESSAGE_BYTES` (1 MiB) —
+comfortably above the largest legitimate frame this protocol ever sends
+(an ordinary `RendezvousAnswer`: `MAX_SDP_LEN` plus
+`MAX_ICE_CANDIDATES * MAX_ICE_CANDIDATE_LEN`, well under 320 KiB) while
+cutting the library's default ceiling by 64x. `ws_handler` now calls
+`.max_message_size(MAX_WS_MESSAGE_BYTES).max_frame_size(MAX_WS_MESSAGE_BYTES)`
+on the `WebSocketUpgrade` before `.on_upgrade(...)`, so oversized frames
+are now rejected by `tokio-tungstenite` itself — the connection closes
+immediately, before a single byte reaches `dispatch` or any
+application-layer check.
+
+Re-ran the new test against the fix (passes), plus a second test
+confirming an ordinary connection still authenticates normally (the fix
+must not be overly strict). This surfaced one real interaction with an
+already-fixed finding: DRA-0026's own
+`an_oversized_sdp_offer_is_rejected_before_it_reaches_the_target` test
+used a 10 MiB payload to prove its *application-layer* `MAX_SDP_LEN`
+check — which, after this fix, is now dwarfed by the new 1 MiB
+transport-layer ceiling, so that frame started getting rejected one
+layer earlier (a bare connection close) instead of reaching
+`validate_rendezvous_payload` and returning the descriptive `Error`
+frame the test was asserting on. Fixed by shrinking that test's payload
+to 128 KiB — still clearly over `MAX_SDP_LEN` (64 KiB) to exercise the
+intended check, comfortably under the new 1 MiB transport ceiling so it
+still reaches that check rather than being cut off earlier. Full
+workspace `cargo fmt --check` / `cargo clippy --workspace --all-targets
+-- -D warnings` / `cargo test --workspace` all pass (54 test result
+blocks, zero failures).
+
+**Known residual scope, stated explicitly**: this bounds a single
+message/frame, not total concurrent-connection count or aggregate
+bandwidth — a large number of simultaneous connections each staying
+under the 1 MiB ceiling could still add up to significant memory, a
+distinct DoS surface (connection-count limiting) that this fix
+deliberately doesn't address and that isn't currently bounded anywhere
+in this codebase.

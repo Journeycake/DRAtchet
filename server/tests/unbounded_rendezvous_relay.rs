@@ -37,10 +37,14 @@ async fn an_oversized_sdp_offer_is_rejected_before_it_reaches_the_target() {
     let mut mallory_conn = TestClient::connect(&url).await;
     mallory_conn.authenticate(&mallory).await;
 
-    // 10 MiB "SDP offer" -- no real WebRTC offer is ever remotely this
-    // size, but pre-fix, the server would relay every byte of it
-    // straight at alice's live connection.
-    let huge_sdp = "x".repeat(10 * 1024 * 1024);
+    // 128 KiB "SDP offer" -- no real WebRTC offer is ever remotely this
+    // size, but pre-fix, the server would relay every byte of it straight
+    // at alice's live connection. Kept comfortably under DRA-0030's 1 MiB
+    // transport-level ceiling (`state::MAX_WS_MESSAGE_BYTES`) so this frame
+    // reaches `validate_rendezvous_payload` and is rejected by *this*
+    // application-layer check specifically, rather than being dropped
+    // earlier by the unrelated transport-layer cap.
+    let huge_sdp = "x".repeat(128 * 1024);
     mallory_conn
         .send(
             FrameTag::RendezvousOffer,

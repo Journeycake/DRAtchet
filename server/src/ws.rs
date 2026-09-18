@@ -66,7 +66,14 @@ pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    // DRA-0030: without an explicit ceiling here, axum/tokio-tungstenite
+    // defaults to a 64 MiB per-message limit -- enforced transport-side,
+    // before any application-layer cap in `state.rs` (MAX_ENVELOPE_LEN,
+    // MAX_SDP_LEN, ...) ever gets a chance to run, and reachable by any
+    // TCP connection whether or not it has authenticated.
+    ws.max_message_size(crate::state::MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(crate::state::MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| handle_socket(socket, state))
 }
 
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
