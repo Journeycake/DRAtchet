@@ -1821,3 +1821,98 @@ still registers normally — the fix isn't overly strict. Full workspace
 warnings` / `cargo test --workspace` all pass, including every existing
 test's real usernames (`"alice"`, `"bob"`, etc. — all plain ASCII
 already).
+
+## DRA-0025: the same Unicode homograph impersonation as DRA-0024, reachable through the peer-to-peer `ProfileAnnounce` path DRA-0024's fix doesn't cover (penetration test round 4, data obfuscation; confirmed real, fixed)
+
+Penetration-test round 4 (data extraction/destruction/obfuscation/DoS),
+first finding. DRA-0024 closed the homograph-impersonation gap at
+*directory registration* (`server::ws::publish_bundle`) — but that's
+not the only place an untrusted party gets to set a `username#NNNN`
+this app displays. `store::profile::record_peer_profile` — the handler
+for an already-established contact's `PAYLOAD_PROFILE_ANNOUNCE` —
+already guards against one collision (DRA-0016: an exact-string match
+with a *different* already-known contact's current handle) but never
+checked the announced `username`'s *character set* at all. Since
+`ProfileAnnounce` isn't gated by `store::gate` either (protocol
+metadata, not chat content — same as DRA-0021's finding), any contact
+you already have, verified or not, could rename themselves via this
+path to a Unicode homograph of a *different* already-known contact's
+handle: a distinct string (so DRA-0016's exact-match check never fires)
+that's visually indistinguishable in the UI (e.g. Cyrillic `с`, U+0441,
+standing in for Latin `c` in "carol").
+
+Extracted the character-set check DRA-0024 added into a new shared
+`core::username::has_only_allowed_characters` (single source of truth
+for both enforcement points — `server::state`'s existing function now
+just delegates to it) and confirmed with a new test in
+`store/src/profile.rs`, run against the pre-fix code first: a contact
+announcing `"\u{0441}arol"` (Cyrillic) was accepted outright while a
+real, unrelated "carol" was already a known contact.
+
+**Fixed**: `record_peer_profile` now rejects an announce whose
+`username` fails `core::username::has_only_allowed_characters` before
+either the collision check or the update — declined the same quiet way
+as a collision (no error, no batch abort; the announcing contact just
+keeps whatever it displayed before).
+
+Re-ran the full `store::profile` test module: all 9 tests pass,
+including the pre-existing DRA-0016 collision test and the genuine-
+non-colliding-rename test, unchanged. Full workspace `cargo fmt --check`
+/ `cargo clippy --workspace --all-targets -- -D warnings` / `cargo test
+--workspace` all pass.
+
+## DRA-0026: `RendezvousOffer`/`RendezvousAnswer` had no size bound, letting any identity force the server to relay an arbitrarily large payload at any other connected client (penetration test round 4, denial of service — amplification; confirmed real, fixed)
+
+Penetration-test round 4, continuing past DRA-0025. Every other
+client-supplied payload this server handles has an explicit, deliberate
+size ceiling: `MailboxWrite`'s envelope (`state::MAX_ENVELOPE_LEN`,
+DRA-0015), `PublishBundle`'s one-time-prekey count and username length
+(DRA-0019/DRA-0024). `RendezvousOffer`/`RendezvousAnswer` — the Tier 0
+P2P-rendezvous relay (`ws.rs`'s `FrameTag::RendezvousOffer`/
+`RendezvousAnswer` arms) — had none at all on `sdp_offer`/`sdp_answer`
+(`String`) or `ice_candidates` (`Vec<String>`), and `relay_to_peer`
+forwards the frame verbatim into the *target's* outbound channel with
+no relationship check (unlike `MailboxFetch`/`MailboxDelete`'s
+`mailbox_id_belongs_to_someone_else`) and no rate limit either (unlike
+`FetchBundle`'s `FetchRateLimiter` or `MailboxWrite`'s
+`NewMailboxRateLimiter`). Any authenticated identity — no established
+relationship with the target required — could send an oversized
+`RendezvousOffer` naming any other currently-connected identity's
+fingerprint and force the server to relay the whole thing at them,
+repeatedly: a real amplification/DoS vector against a target who never
+agreed to receive anything from the sender. (Separately, this relay
+path is live production code today even though no client currently
+*consumes* a received offer/answer — see the round-3 investigative
+notes on Tier 0 for that distinction; the relay itself being exploitable
+doesn't depend on any client acting on what it relays.)
+
+Confirmed with three new tests in
+`server/tests/unbounded_rendezvous_relay.rs`, run against the pre-fix
+code first: a 10 MiB `sdp_offer` and a batch of 10,000 `ice_candidates`
+were both accepted and would have been relayed straight to the target
+(the pre-fix run's assertion failure itself proves this — expecting an
+`Error` frame back, it instead got a frame of a different, unexpected
+shape, meaning the oversized payload was silently accepted rather than
+rejected).
+
+**Fixed**: `state::MAX_SDP_LEN` (64 KiB), `state::MAX_ICE_CANDIDATES`
+(64), and `state::MAX_ICE_CANDIDATE_LEN` (4 KiB per candidate) — all
+generous relative to a real WebRTC negotiation's actual size — checked
+by a new `ws::validate_rendezvous_payload` at the top of both handlers,
+before `relay_to_peer` is ever called.
+
+Re-ran the three tests against the fix: both oversized cases are now
+rejected with a clear error, while an ordinary, real-sized offer with
+one real-looking ICE candidate still relays normally end to end. Full
+workspace `cargo fmt --check` / `cargo clippy --workspace --all-targets
+-- -D warnings` / `cargo test --workspace` all pass.
+
+**Known residual scope, stated explicitly**: this fix closes the
+unbounded-*size* half of the gap. The missing relationship check (any
+identity can target any other connected identity by fingerprint, with
+no prior contact/fetch relationship required) and the missing rate
+limit (repeated max-size frames are still unthrottled) are both real,
+separate hardening opportunities left for a follow-up — narrowed out of
+this fix to keep it a clean, bounded size cap matching the established
+pattern, not a broader redesign of Tier 0's trust model under time
+pressure.

@@ -87,11 +87,29 @@ pub const MAX_USERNAME_LEN: usize = 64;
 /// proof-of-work (`crate::abuse`), at the cost of non-ASCII handles not
 /// being supported at all — a real, accepted i18n tradeoff, not a defect.
 pub fn username_has_only_allowed_characters(username: &str) -> bool {
-    !username.is_empty()
-        && username
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    dratchet_core::username::has_only_allowed_characters(username)
 }
+
+/// DRA-0026 (`docs/DELIVERY_FAILURE_FINDINGS.md`) — a hard ceiling on a
+/// single `RendezvousOffer`/`RendezvousAnswer`'s `sdp_offer`/`sdp_answer`,
+/// enforced in `ws.rs`. Unlike every other client-supplied payload in this
+/// file (`MailboxWrite`'s envelope, `PublishBundle`'s username/prekeys),
+/// nothing previously bounded this one at all — relayed verbatim to
+/// another connected client's outbound channel by `relay_to_peer`, with no
+/// relationship check and no rate limit either. A real SDP offer is on the
+/// order of a few KiB; generous headroom, while still bounding the
+/// server-to-victim amplification a single malicious frame can force.
+pub const MAX_SDP_LEN: usize = 64 * 1024;
+
+/// DRA-0026 — a hard ceiling on how many ICE candidates one
+/// `RendezvousOffer`/`RendezvousAnswer` may carry. A real WebRTC
+/// negotiation gathers at most a handful per network interface; generous
+/// headroom for any real client.
+pub const MAX_ICE_CANDIDATES: usize = 64;
+
+/// DRA-0026 — a hard ceiling on a single ICE candidate string's length.
+/// A real candidate line is well under a hundred bytes.
+pub const MAX_ICE_CANDIDATE_LEN: usize = 4096;
 
 /// A username#NNNN identity, as looked up in the directory.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

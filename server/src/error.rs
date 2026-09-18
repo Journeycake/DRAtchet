@@ -83,6 +83,17 @@ pub enum Error {
     /// proof-of-work.
     #[error("username may only contain ASCII letters, digits, '_', and '-'")]
     UsernameInvalidCharacters,
+
+    /// DRA-0026 (`docs/DELIVERY_FAILURE_FINDINGS.md`) — a `RendezvousOffer`/
+    /// `RendezvousAnswer`'s `sdp_offer`/`sdp_answer` exceeded `state::MAX_SDP_LEN`.
+    #[error("SDP payload exceeds the maximum allowed length")]
+    SdpTooLarge,
+
+    /// DRA-0026 — a `RendezvousOffer`/`RendezvousAnswer` carried more ICE
+    /// candidates than `state::MAX_ICE_CANDIDATES`, or one exceeding
+    /// `state::MAX_ICE_CANDIDATE_LEN`.
+    #[error("too many or too large ICE candidates")]
+    IceCandidatesInvalid,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

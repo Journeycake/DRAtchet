@@ -61,6 +61,28 @@ impl Db {
         let changed = contact.username.as_deref() != Some(username.as_str())
             || contact.discriminator != Some(discriminator);
 
+        // DRA-0025 (`docs/DELIVERY_FAILURE_FINDINGS.md`): the same
+        // ASCII-only floor DRA-0024 already enforces at directory
+        // registration (`server::ws::publish_bundle`) — but that only
+        // covers a *fresh registration*, not this peer-to-peer path. A
+        // contact you already have (verified or not — this payload isn't
+        // gated either) could rename themselves via `ProfileAnnounce` to
+        // a Unicode homograph of a *different*, already-known contact's
+        // handle (e.g. Cyrillic `а` standing in for Latin `a`) — a
+        // distinct string, so DRA-0016's exact-match collision check
+        // below never catches it, yet visually indistinguishable in the
+        // UI. Declined the same way as a collision: no error, no batch
+        // abort, this contact just keeps whatever it displayed before.
+        if !dratchet_core::username::has_only_allowed_characters(&username) {
+            tracing::warn!(
+                fingerprint = %crate::db::hex(fingerprint),
+                username,
+                discriminator,
+                "rejected a ProfileAnnounce with a non-ASCII or empty username",
+            );
+            return Ok((contact, false));
+        }
+
         // DRA-0016 (`docs/DELIVERY_FAILURE_FINDINGS.md`): `ProfileAnnounce`
         // is protocol metadata, not chat content — `store::gate` never
         // gates it, and nothing here previously checked the announced
@@ -263,6 +285,48 @@ mod tests {
         let real_bob_reloaded = db.load_contact(&real_bob.fingerprint).unwrap().unwrap();
         assert_eq!(real_bob_reloaded.username.as_deref(), Some("bob"));
         assert_eq!(real_bob_reloaded.discriminator, Some(1490));
+    }
+
+    /// DRA-0025 (penetration test, priority 3/data obfuscation: a Unicode
+    /// homograph impersonating an already-known contact via the
+    /// peer-to-peer `ProfileAnnounce` path, distinct from DRA-0024's
+    /// directory-registration fix). A different, already-known contact
+    /// ("carol") exists; the contact under test announces a Cyrillic
+    /// lookalike of "carol" — a distinct string, so DRA-0016's exact-match
+    /// collision check alone would never catch it. Before this fix, the
+    /// lookalike was accepted outright.
+    #[test]
+    fn record_peer_profile_refuses_a_unicode_homograph_of_an_already_known_contacts_handle() {
+        let db = temp_db();
+
+        let real_carol = sample_contact(Some("carol"), Some(4242));
+        db.save_contact(&real_carol).unwrap();
+
+        let mut impostor = sample_contact(None, None);
+        impostor.fingerprint = vec![2u8; 32];
+        db.save_contact(&impostor).unwrap();
+
+        // Cyrillic "с" (U+0441) in place of Latin "c" -- a distinct
+        // string, visually indistinguishable from "carol" in essentially
+        // every font.
+        let lookalike = "\u{0441}arol";
+        assert_ne!(lookalike, "carol", "sanity check: distinct strings");
+
+        let (updated, changed) = db
+            .record_peer_profile(&impostor.fingerprint, lookalike.into(), 4242)
+            .unwrap();
+        assert!(
+            !changed,
+            "VULNERABILITY: a Unicode homograph of an already-known contact's handle was \
+             accepted"
+        );
+        assert_eq!(
+            updated.username, None,
+            "the impostor's own contact record must not pick up the lookalike handle"
+        );
+
+        let real_carol_reloaded = db.load_contact(&real_carol.fingerprint).unwrap().unwrap();
+        assert_eq!(real_carol_reloaded.username.as_deref(), Some("carol"));
     }
 
     /// The fix must not block a genuine, non-colliding rename — only an

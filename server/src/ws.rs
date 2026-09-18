@@ -300,6 +300,7 @@ async fn dispatch(
         FrameTag::RendezvousOffer => {
             let from = authenticated.ok_or(Error::AuthRequired)?;
             let req: RendezvousOffer = decode_body(body)?;
+            validate_rendezvous_payload(&req.sdp_offer, &req.ice_candidates)?;
             let relayed = encode(
                 FrameTag::RendezvousOffer,
                 &RendezvousOffer {
@@ -314,6 +315,7 @@ async fn dispatch(
         FrameTag::RendezvousAnswer => {
             let from = authenticated.ok_or(Error::AuthRequired)?;
             let req: RendezvousAnswer = decode_body(body)?;
+            validate_rendezvous_payload(&req.sdp_answer, &req.ice_candidates)?;
             let relayed = encode(
                 FrameTag::RendezvousAnswer,
                 &RendezvousAnswer {
@@ -707,6 +709,29 @@ async fn fetch_bundle(
 
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// DRA-0026 (`docs/DELIVERY_FAILURE_FINDINGS.md`): checked before
+/// `relay_to_peer` ever touches the target's outbound channel — unlike
+/// every other client-supplied payload this server relays or stores
+/// (`MailboxWrite`'s envelope, `PublishBundle`'s username/prekeys),
+/// nothing previously bounded a `RendezvousOffer`/`RendezvousAnswer`'s
+/// `sdp_offer`/`sdp_answer`/`ice_candidates` at all before this was
+/// added, letting any authenticated identity force the server to relay
+/// an arbitrarily large payload straight at any other connected client's
+/// WebSocket, with no relationship check and no rate limit either.
+fn validate_rendezvous_payload(sdp: &str, ice_candidates: &[String]) -> Result<()> {
+    if sdp.len() > crate::state::MAX_SDP_LEN {
+        return Err(Error::SdpTooLarge);
+    }
+    if ice_candidates.len() > crate::state::MAX_ICE_CANDIDATES
+        || ice_candidates
+            .iter()
+            .any(|c| c.len() > crate::state::MAX_ICE_CANDIDATE_LEN)
+    {
+        return Err(Error::IceCandidatesInvalid);
+    }
+    Ok(())
 }
 
 /// Deliver an already-built frame to `to`'s live connection, if it has one —
