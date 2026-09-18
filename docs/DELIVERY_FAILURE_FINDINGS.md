@@ -1509,3 +1509,52 @@ severity than the two fixed here (bounded to one request's transient
 processing cost, not permanent directory growth) and left as a
 follow-up rather than expanding this fix's scope further under time
 pressure.
+
+## DRA-0020: confirm_pending_wipe performed a destructive wipe with no check that a request was actually pending (penetration test round 3, priority 2: message poisoning/compromise — unauthorized destructive data loss; confirmed real, fixed)
+
+Penetration-test round 3, priority 2 (poisoning/compromise) — after the
+crypto/protocol core came back clean across two full rounds
+(`untag_and_unpad` bounds-checked, per-entry error classification
+correct, `FirstContactWire`'s identity binding verified before use,
+`server/src/persistence.rs`'s crash-consistency already sound), this
+pass moved to the app layer's own destructive operations and found a
+real gap: `confirm_pending_wipe` (`app/src/lib.rs`) — the sole entry
+point for §11.9a's "ask before deleting" wipe path, exposed directly as
+a Tauri command callable from the webview's JavaScript — performed the
+wipe *unconditionally*. Nothing checked that
+`Contact::wipe_request_pending` was actually set before deleting real
+message history and clearing the flag.
+
+The Svelte UI (`ui/src/routes/+page.svelte`) happens to gate the
+"Allow" button's *visibility* on this same flag
+(`{#if selected.wipe_request_pending}`), but that's a rendering
+decision, not a guard the async handler (`allowPendingWipe`) itself
+re-checks before calling `invoke("confirm_pending_wipe", ...)` — and
+nothing stops any other caller of the same Tauri command (a stale click
+landing after the flag already cleared via another path, a future code
+path that forgets the precondition, or any other script able to reach
+the webview's `invoke` bridge) from destroying a conversation's history
+that was never actually up for deletion. Confirmed with a real,
+local-only test (`app/tests/confirm_pending_wipe_requires_pending.rs`,
+run against the pre-fix code first): calling `confirm_pending_wipe` on
+a contact with `wipe_request_pending: false` deleted two real messages
+that were never requested to be wiped.
+
+**Fixed**: `confirm_pending_wipe` now reloads `contact` fresh from `db`
+by fingerprint (the same "don't trust the caller's possibly-stale
+snapshot" pattern `apply_entry`'s wipe-request arm already established
+for a different reason) and refuses with the new
+`Error::NoPendingWipeRequest` unless `wipe_request_pending` is actually
+set on that fresh record. This is the sole entry point for the
+destructive path, so the fix belongs here — not only in the UI that
+happens to gate the button on the same flag — closing the gap for
+every current and future caller of the Tauri command, not just the one
+button that exists today.
+
+Re-ran the test against the fix: the unwarranted call is now rejected
+and both real messages survive; a second test confirms a genuinely
+pending wipe still succeeds exactly as before and still clears the
+flag. Full workspace `cargo fmt --check` / `cargo clippy --workspace
+--all-targets -- -D warnings` / `cargo test --workspace` all pass,
+including every existing wipe test (which all correctly set
+`wipe_request_pending` before calling this, so none needed changes).

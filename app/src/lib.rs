@@ -1461,12 +1461,30 @@ pub async fn request_conversation_wipe(
 /// wipe request already set `Contact::wipe_request_pending` (via
 /// `receive_pending`); this actually performs the wipe now and clears the
 /// flag. No network access needed. Returns how many records were removed.
+///
+/// DRA-0020 (`docs/DELIVERY_FAILURE_FINDINGS.md`): reloads `contact`
+/// fresh from `db` by fingerprint and refuses with
+/// `Error::NoPendingWipeRequest` unless `wipe_request_pending` is
+/// actually set on that fresh record — this used to trust the caller's
+/// passed-in `contact` unconditionally, wiping real message history for
+/// *any* contact this was called with, pending request or not. This is
+/// the sole entry point for the destructive "ask before deleting" wipe;
+/// nothing upstream of it (the Tauri command layer) re-validates this
+/// invariant, so it belongs here, not only in the UI that happens to
+/// gate the button on the same flag.
 pub fn confirm_pending_wipe(db: &Db, account: &Account, contact: &Contact) -> Result<usize> {
-    let conv_id = conversation_id_for(account, contact);
-    let include_session = contact.effective_wipe_include_session();
-    let removed = wipe_conversation_scoped(db, conv_id, contact, include_session)?;
+    let fresh = db
+        .load_contact(&contact.fingerprint)?
+        .ok_or(Error::NoSuchAccount)?;
+    if !fresh.wipe_request_pending {
+        return Err(Error::NoPendingWipeRequest);
+    }
 
-    let mut updated = contact.clone();
+    let conv_id = conversation_id_for(account, &fresh);
+    let include_session = fresh.effective_wipe_include_session();
+    let removed = wipe_conversation_scoped(db, conv_id, &fresh, include_session)?;
+
+    let mut updated = fresh;
     updated.wipe_request_pending = false;
     db.save_contact(&updated)?;
     Ok(removed)

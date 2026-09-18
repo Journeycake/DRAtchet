@@ -30,6 +30,15 @@ pub enum Error {
     #[error("no account is registered under that username")]
     NoSuchAccount,
 
+    /// `confirm_pending_wipe` (DRA-0020,
+    /// `docs/DELIVERY_FAILURE_FINDINGS.md`): the contact reloaded fresh
+    /// from `db` doesn't actually have `wipe_request_pending` set — either
+    /// it never was, or it was already resolved (confirmed, declined, or
+    /// superseded) by the time this ran. Refuses to wipe rather than
+    /// trusting the caller's claim that a request is pending.
+    #[error("no wipe request is actually pending for this contact")]
+    NoPendingWipeRequest,
+
     #[error("filesystem error: {0}")]
     Io(#[from] std::io::Error),
 }
