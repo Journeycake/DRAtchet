@@ -127,6 +127,19 @@ impl Account {
         self.one_time_prekeys.remove(&id).map(|otp| otp.secret)
     }
 
+    /// Look up the secret behind one of our own one-time prekeys by id
+    /// *without* consuming it (DRA-0023, `docs/DELIVERY_FAILURE_FINDINGS.md`)
+    /// — for a caller that needs to run the DH computation before it can
+    /// tell whether this handshake attempt is genuine (`app::try_accept_first_contact`
+    /// can't check its pairing code until *after* deriving the root key and
+    /// decrypting the envelope that carries it). Only once that later check
+    /// actually succeeds should the caller go back and call
+    /// [`Self::take_one_time_prekey_secret`] for real — peeking here must
+    /// never, by itself, make an id unrecoverable to a genuine retry.
+    pub fn peek_one_time_prekey_secret(&self, id: u32) -> Option<&StaticSecret> {
+        self.one_time_prekeys.get(&id).map(|otp| &otp.secret)
+    }
+
     pub fn identity_dh_secret(&self) -> &StaticSecret {
         &self.identity_dh_secret
     }
@@ -417,5 +430,51 @@ mod tests {
             "single-use: consuming the same id twice must fail the second time"
         );
         assert_eq!(account.one_time_prekey_count(), 2);
+    }
+
+    /// DRA-0023 (`docs/DELIVERY_FAILURE_FINDINGS.md`, penetration test
+    /// round 3, priority 3: DoS via local one-time-prekey exhaustion) —
+    /// `peek_one_time_prekey_secret` exists precisely so
+    /// `app::try_accept_first_contact` can run the DH computation needed
+    /// to even *read* a first-contact attempt's pairing code before
+    /// deciding whether the attempt is genuine. Before this fix, the same
+    /// `take_one_time_prekey_secret` call that ran for a *genuine* attempt
+    /// also ran — irreversibly — for a bogus one with a wrong or made-up
+    /// pairing code, since one-time-prekey ids are small sequential
+    /// integers guessable with no prior `FetchBundle` at all. This test
+    /// pins the two-phase contract peeking now provides: a peek that's
+    /// never followed by a real `take` (standing in for a failed
+    /// pairing-code check) must leave the secret fully intact and still
+    /// consumable by a later, genuine attempt naming the same id.
+    #[test]
+    fn peeking_a_one_time_prekey_secret_does_not_consume_it() {
+        let mut account = Account::generate().unwrap();
+        let batch = account.generate_one_time_prekeys(3);
+        let id = batch[0].id;
+
+        // Simulates a bogus first-contact attempt: the secret is peeked
+        // (as if used for a real DH computation) but the caller's
+        // pairing-code check fails, so `take` is never called.
+        assert!(account.peek_one_time_prekey_secret(id).is_some());
+        assert!(account.peek_one_time_prekey_secret(id).is_some());
+        assert_eq!(
+            account.one_time_prekey_count(),
+            3,
+            "VULNERABILITY (pre-fix behavior): peeking must never by itself remove the secret"
+        );
+
+        // A later, genuine attempt naming the same id must still succeed —
+        // the secret is still there because nothing ever really took it.
+        assert!(
+            account.take_one_time_prekey_secret(id).is_some(),
+            "FIX VERIFIED: a secret that was only ever peeked, never taken, must still be \
+             consumable by a genuine attempt"
+        );
+        assert_eq!(account.one_time_prekey_count(), 2);
+
+        // Once genuinely taken, it behaves exactly as before: single-use,
+        // gone for any further attempt (bogus or genuine) naming this id.
+        assert!(account.peek_one_time_prekey_secret(id).is_none());
+        assert!(account.take_one_time_prekey_secret(id).is_none());
     }
 }

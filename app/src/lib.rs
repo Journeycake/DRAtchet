@@ -665,10 +665,23 @@ fn try_accept_first_contact(
         return Ok(None);
     };
 
-    let otp_secret = init_message
-        .used_one_time_prekey_id
-        .and_then(|id| account.take_one_time_prekey_secret(id));
-    if init_message.used_one_time_prekey_id.is_some() && otp_secret.is_none() {
+    // DRA-0023 (`docs/DELIVERY_FAILURE_FINDINGS.md`): peek, don't consume
+    // yet. The pairing code that actually proves this attempt is genuine
+    // lives *inside* the ratchet-encrypted envelope below, which can't be
+    // decrypted without first deriving the root key from this secret — so
+    // there's no way to check the code before using the secret. But
+    // *using* it for the DH computation and *discarding it from local
+    // storage forever* are different things: only the latter must wait
+    // until the pairing-code check below actually succeeds, or literally
+    // anyone (no code required, no rate limit applies to writing into an
+    // already-existing bootstrap mailbox) could destroy this account's
+    // entire locally-held one-time-prekey batch just by sending garbage
+    // first-contact attempts naming every id in it — one-time-prekey ids
+    // are small sequential integers (`Account::next_otp_id`), so guessing
+    // them all needs no prior `FetchBundle` at all.
+    let otp_id = init_message.used_one_time_prekey_id;
+    let otp_secret_ref = otp_id.and_then(|id| account.peek_one_time_prekey_secret(id));
+    if otp_id.is_some() && otp_secret_ref.is_none() {
         // Named an id we don't have (already consumed, or never existed) —
         // can't derive the same root key the initiator did.
         return Ok(None);
@@ -676,12 +689,9 @@ fn try_accept_first_contact(
     let root_key = x3dh::respond(
         account.identity_dh_secret(),
         account.signed_prekey_secret(),
-        otp_secret.as_ref(),
+        otp_secret_ref,
         &init_message,
     );
-    if otp_secret.is_some() {
-        *account_dirty = true;
-    }
 
     let peer_fp = *fingerprint_of_public_key(&wire.initiator_identity_key).as_bytes();
     let conv_id = conversation_id(account.identity.fingerprint().as_bytes(), &peer_fp);
@@ -712,6 +722,13 @@ fn try_accept_first_contact(
         return Ok(None);
     }
     db.clear_pairing_code()?;
+
+    // Only now, with a genuinely matching pairing code, actually discard
+    // the one-time-prekey secret from local storage for good (DRA-0023).
+    if let Some(id) = otp_id {
+        account.take_one_time_prekey_secret(id);
+        *account_dirty = true;
+    }
 
     let contact = Contact {
         fingerprint: peer_fp.to_vec(),

@@ -1702,3 +1702,65 @@ production Tauri app (`ui/src-tauri/`), which currently only implements
 Option A's mandatory-verification, directory-based flow. This fix closes
 a real, severe protocol flaw in code that exists and is tested in the
 repository today, ahead of whatever UI eventually calls it.
+
+## DRA-0023: a bogus first-contact attempt with a wrong pairing code still permanently destroyed a real local one-time-prekey secret (penetration test round 3, priority 3: denial of service via local prekey exhaustion; confirmed real, fixed)
+
+Penetration-test round 3, priority 3 (DoS), continuing past DRA-0022.
+Audited `app::try_accept_first_contact` (`app/src/lib.rs`) — the
+production directory-based first-contact flow (`ARCHITECTURE.md` §6.4) —
+for the same class of gap DRA-0022 just closed on the reference client:
+is anything used as real key material trusted, or consumed, before it's
+actually confirmed genuine?
+
+`try_accept_first_contact` calls `account.take_one_time_prekey_secret(id)`
+— which *removes* the secret from local storage, permanently — as its
+very first step whenever the incoming `FirstContactWire` names a
+one-time-prekey id, before anything about the attempt has been checked
+except the (trivially self-satisfiable) identity-binding signature.
+Only much later does it decrypt the envelope and check the pairing code
+that actually proves the attempt is genuine (§6.4's whole security
+model for this flow). If that check fails, the function returns
+`Ok(None)` — but the already-`take`n secret is gone for good regardless.
+
+One-time-prekey ids are small sequential integers
+(`Account::next_otp_id`, incrementing from 0), not random or secret.
+Guessing every id in a locally-held batch needs no prior `FetchBundle`
+at all — the attacker just picks `used_one_time_prekey_id = 0, 1, 2, …`
+and sends a `FirstContactWire` naming each, with a made-up pairing code,
+directly to the victim's bootstrap mailbox (freely writable by anyone,
+by design — that's what first contact requires, and DRA-0017's
+per-writer cap of 128 comfortably covers any realistic batch size, e.g.
+the app's own `ONE_TIME_PREKEY_BATCH` of 10). None of this needs
+`FetchBundle` at all, so `FetchRateLimiter` never even sees it. The
+result: a trivial, cheap attack that silently destroys a victim's
+entire locally-held one-time-prekey batch, degrading every subsequent
+session establishment against them — from real contacts using the
+directory, and from real first-contact attempts — to the no-OTP
+"degraded mode" (`docs/MESSAGE_SCHEMA.md` §3), with nothing in the
+existing wrong-code test coverage (`app/tests/first_contact.rs`'s
+`a_wrong_code_leaves_no_trace_even_though_a_real_one_was_generated`)
+checking for this, since that test only asserts no *contact* was
+created, not whether the underlying secret survived.
+
+Confirmed with a new test, `peeking_a_one_time_prekey_secret_does_not_consume_it`
+in `core/src/account.rs`, pinning the exact two-phase contract the fix
+needs: a secret that's only ever peeked (standing in for a failed
+pairing-code check) must remain fully intact and still consumable by a
+later, genuine attempt naming the same id.
+
+**Fixed**: `Account` gained `peek_one_time_prekey_secret` — reads the
+secret by reference without removing it. `try_accept_first_contact` now
+peeks for the DH computation (unavoidable: the pairing code lives
+*inside* the envelope, which can't be decrypted without first deriving
+the root key from this secret, so using it can't be deferred) but only
+calls the real, consuming `take_one_time_prekey_secret` after the
+pairing code has actually matched — right before constructing the new
+`Contact`, alongside the existing `db.clear_pairing_code()` call. A
+bogus attempt now leaves the secret exactly where it was.
+
+Re-ran the full `app/tests/first_contact.rs` suite unchanged: the
+correct-code success path, both wrong/no-code no-trace tests, and the
+rename test all still pass — this fix only changes *when* a genuine
+secret is discarded, not whether a genuine attempt still succeeds. Full
+workspace `cargo fmt --check` / `cargo clippy --workspace --all-targets
+-- -D warnings` / `cargo test --workspace` all pass.
