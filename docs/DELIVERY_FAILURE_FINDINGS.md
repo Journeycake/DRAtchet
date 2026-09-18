@@ -1764,3 +1764,60 @@ rename test all still pass — this fix only changes *when* a genuine
 secret is discarded, not whether a genuine attempt still succeeds. Full
 workspace `cargo fmt --check` / `cargo clippy --workspace --all-targets
 -- -D warnings` / `cargo test --workspace` all pass.
+
+## DRA-0024: no restriction on `username`'s character set let a Unicode homograph impersonate an already-registered identity (penetration test round 3, priority 1: gaining access to conversations via impersonation; confirmed real, fixed)
+
+Penetration-test round 3, priority 1 (access via impersonation),
+continuing past DRA-0023. `ws.rs`'s `publish_bundle` validates
+`username`'s *length* (`state::MAX_USERNAME_LEN`, DRA-0019) but nothing
+about its *character set*. Nothing stopped registering a `username`
+visually indistinguishable from an already-taken one: Cyrillic `а`
+(U+0430) renders identically to Latin `a` (U+0061) in essentially every
+font a real client would render with, so `"аlice"` (Cyrillic `а`) and
+`"alice"` (Latin `a`) are two entirely distinct, independently
+registrable identities — different fingerprints, different directory
+entries — that a human reader cannot tell apart by eye, including in
+the `username#NNNN` display the app shows for exactly this purpose
+(the discriminator disambiguates *collisions*, not the *text* itself).
+A registered lookalike is a durable impersonation vector: any contact
+who adds "alice" by typing/reading her handle, rather than comparing
+raw bytes, could end up talking to the attacker's identity instead,
+with nothing about the display distinguishing it.
+
+This is a different class of gap from DRA-0016 (which was about an
+already-*known* contact's own handle changing to collide with another
+already-known contact) — this is about *registration itself* placing
+an indistinguishable lookalike into the shared directory in the first
+place, reachable by anyone who looks the real handle up, known contact
+or not.
+
+Confirmed with three new tests in
+`server/tests/username_homograph_impersonation.rs`, run against the
+pre-fix code first (`git stash` of the fix, matching this round's
+established practice): registering `"аlice"` after a real `"alice"`
+succeeded outright pre-fix, as did registering an empty username.
+
+**Fixed**, per the option the user selected after being offered a menu
+of homograph mitigations (a full Unicode confusables-skeleton solution
+was also on that menu, but is real feature work — a maintained
+confusables table plus a second server-side index — not a bounded fix):
+`state::username_has_only_allowed_characters`, a narrow ASCII-only
+allowlist (`[A-Za-z0-9_-]`, non-empty), checked in `publish_bundle`
+alongside the existing length cap, before any signature verification or
+directory work — same cheap-rejection ordering DRA-0019 already
+established for the same never-pruned-directory reasoning. This closes
+the specific homograph attack outright for the ASCII case. **Explicit,
+accepted tradeoff**: non-ASCII usernames are no longer supported at
+all, a real i18n cost, not a defect — the same "deliberately modest, a
+floor not a wall" spirit as the registration proof-of-work
+(`crate::abuse`).
+
+Re-ran the three new tests against the fix: the Cyrillic lookalike and
+the empty username are both now rejected with `UsernameInvalidCharacters`
+(the Cyrillic case surfacing a message naming "ascii," confirmed by the
+test), while an ordinary ASCII handle with underscores and hyphens
+still registers normally — the fix isn't overly strict. Full workspace
+`cargo fmt --check` / `cargo clippy --workspace --all-targets -- -D
+warnings` / `cargo test --workspace` all pass, including every existing
+test's real usernames (`"alice"`, `"bob"`, etc. — all plain ASCII
+already).

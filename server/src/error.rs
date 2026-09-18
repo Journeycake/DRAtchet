@@ -74,6 +74,15 @@ pub enum Error {
     /// DRA-0019 — `PublishBundle.username` exceeded `state::MAX_USERNAME_LEN`.
     #[error("username exceeds the maximum allowed length")]
     UsernameTooLong,
+
+    /// DRA-0024 (`docs/DELIVERY_FAILURE_FINDINGS.md`) — `PublishBundle.username`
+    /// contained a character outside `state::USERNAME_ALLOWED_CHARS`, or was
+    /// empty. A narrow, ASCII-only floor against Unicode homograph/confusables
+    /// impersonation (e.g. Cyrillic `а` standing in for Latin `a`), the same
+    /// "deliberately modest, a floor not a wall" spirit as the registration
+    /// proof-of-work.
+    #[error("username may only contain ASCII letters, digits, '_', and '-'")]
+    UsernameInvalidCharacters,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

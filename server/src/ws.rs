@@ -511,6 +511,12 @@ async fn publish_bundle(state: &Arc<AppState>, wire: PrekeyBundleWire) -> Result
     if wire.username.len() > crate::state::MAX_USERNAME_LEN {
         return Err(Error::UsernameTooLong);
     }
+    // DRA-0024: same reasoning, same cheap-rejection ordering — a
+    // non-ASCII username smuggled past this point would sit in the
+    // never-pruned directory as a permanent homograph-impersonation risk.
+    if !crate::state::username_has_only_allowed_characters(&wire.username) {
+        return Err(Error::UsernameInvalidCharacters);
+    }
     if wire.one_time_prekeys.len() > crate::state::MAX_ONE_TIME_PREKEYS_PER_PUBLISH {
         return Err(Error::TooManyOneTimePrekeys);
     }

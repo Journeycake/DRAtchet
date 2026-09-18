@@ -72,6 +72,27 @@ pub const MAX_ONE_TIME_PREKEYS_PER_PUBLISH: usize = 100;
 /// directory.
 pub const MAX_USERNAME_LEN: usize = 64;
 
+/// DRA-0024 (`docs/DELIVERY_FAILURE_FINDINGS.md`) — a narrow, ASCII-only
+/// floor against Unicode homograph/confusables impersonation, enforced in
+/// `ws.rs`'s `publish_bundle`. Without this, nothing stopped registering
+/// a `username` that's visually indistinguishable from an already-taken
+/// one under a different `discriminator` (e.g. Cyrillic `а` (U+0430) in
+/// place of Latin `a`) — a distinct identity a human reader can't tell
+/// apart from the real one by eye, `username#NNNN` display included.
+/// Deliberately narrow rather than a full Unicode confusables-skeleton
+/// solution (which would need a maintained confusables table and a
+/// second server-side index, real feature work, not a bounded fix): this
+/// closes the specific attack outright for the ASCII case, the same
+/// "deliberately modest, a floor not a wall" spirit as the registration
+/// proof-of-work (`crate::abuse`), at the cost of non-ASCII handles not
+/// being supported at all — a real, accepted i18n tradeoff, not a defect.
+pub fn username_has_only_allowed_characters(username: &str) -> bool {
+    !username.is_empty()
+        && username
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
 /// A username#NNNN identity, as looked up in the directory.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct UsernameKey {
