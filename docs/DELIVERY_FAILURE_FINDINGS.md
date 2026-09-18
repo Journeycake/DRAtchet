@@ -2318,3 +2318,52 @@ bounded fix's scope, and are the necessary next step to close this
 finding fully rather than just narrow it. Tracked here rather than left
 implicit, matching this document's standing practice for every partial
 fix.
+
+## DRA-0034: `deploy-rke2-test.sh` shipped a container image through a fixed, predictable remote `/tmp` path (penetration test round 4, data extraction/compromise — local privilege escalation on a shared deploy node; confirmed real, fixed)
+
+Penetration-test round 4 — auditing `scripts/deploy-rke2-test.sh`'s
+`import` ship mode, which `scp`s a locally-built container image tarball
+to each RKE2 node and then `sudo ctr -n k8s.io images import`s it. The
+*local* tarball already used `mktemp -t dratchet-server-XXXXXX.tar` for
+an unpredictable name, but the *remote* copy on every node was the fixed
+literal path `/tmp/dratchet-server.tar` — the same name, every run,
+every node. `/tmp` is world-writable (the sticky bit only stops other
+users from *deleting/renaming* files they don't own, not from creating
+a new file at a path that doesn't exist yet, or racing to replace one
+between the `scp` finishing and the `ssh ... sudo ctr images import`
+starting). Any other local user already on a shared RKE2 test node
+(exactly the kind of shared infra `deploy-rke2-test.sh`'s own name
+implies) could pre-create or race-replace that exact path with their
+own container image tarball, getting it imported — and, once any pod is
+later scheduled from it, executed — with the privilege of whoever ran
+this deploy script via `sudo`.
+
+The "confirmed real" evidence here is the predictable path itself, the
+same evidentiary style used for DRA-0027/0028/0029 (a structural/config
+gap with no live exploit to demonstrate rather than a network-triggered
+bug): the pre-fix script used the identical literal
+`/tmp/dratchet-server.tar` for every node on every run, with nothing to
+distinguish or randomize it — the necessary and sufficient condition for
+the pre-create/race-replace attack described above.
+
+**Fixed**: the remote path now reuses the local tarball's own
+`mktemp`-generated basename (`/tmp/$(basename "$tarball")`) instead of
+a fixed literal — every run gets an unpredictable remote path, the same
+way the local side already did. `scp`/`ssh` both updated to reference
+the new variable, with the remote path quoted throughout.
+
+Verified `bash -n scripts/deploy-rke2-test.sh` (syntax-valid) and
+reviewed the diff directly — `shellcheck` isn't installed in this
+environment, so no linter pass was available, but the change is a
+narrow, mechanical substitution of one path expression for another with
+no control-flow change.
+
+**Known residual scope, stated explicitly**: this closes the specific
+predictable-remote-path gap; it doesn't address the broader trust model
+of `import` ship mode, which inherently requires `sudo` access on each
+target node and is documented (by the script's own name) as a *test*
+deployment path, not the hardened production one (`scripts/bootstrap-k3s-pi.sh`/
+`deploy-k3s-local.sh`, the single-node paths this project's actual
+runbook — `docs/DEPLOY_K3S_PI.md` — uses). A genuinely hostile
+co-tenant on a shared test node has other avenues regardless of this
+fix; this closes the cheapest, most opportunistic one.

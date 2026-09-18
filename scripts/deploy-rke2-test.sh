@@ -100,11 +100,23 @@ cmd_ship() {
       tarball="$(mktemp -t dratchet-server-XXXXXX.tar)"
       log "Saving $FULL_IMAGE to $tarball"
       docker save "$FULL_IMAGE" -o "$tarball"
+      # DRA-0034 (docs/DELIVERY_FAILURE_FINDINGS.md): the remote path used
+      # to be the fixed literal /tmp/dratchet-server.tar on every node --
+      # predictable, and /tmp is world-writable (sticky bit) on
+      # any normal Linux host, so another local user on a shared RKE2 test
+      # node could pre-create or race-replace that exact path between the
+      # scp above and the `sudo ctr images import` below, getting their
+      # own attacker-controlled image imported (and, once a pod is
+      # scheduled from it, executed) with root's own privileges. Reusing
+      # $tarball's own mktemp-generated basename gives every run an
+      # unpredictable remote path instead, the same way the local side
+      # already avoided a fixed name.
+      local remote_tarball="/tmp/$(basename "$tarball")"
       local node
       for node in $RKE2_NODES; do
         log "Copying image to $node and importing into containerd"
-        scp "$tarball" "${SSH_USER}@${node}:/tmp/dratchet-server.tar"
-        ssh "${SSH_USER}@${node}" "sudo ctr -n k8s.io images import /tmp/dratchet-server.tar && rm -f /tmp/dratchet-server.tar"
+        scp "$tarball" "${SSH_USER}@${node}:${remote_tarball}"
+        ssh "${SSH_USER}@${node}" "sudo ctr -n k8s.io images import '${remote_tarball}' && rm -f '${remote_tarball}'"
       done
       rm -f "$tarball"
       ;;
