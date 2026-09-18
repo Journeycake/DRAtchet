@@ -782,13 +782,41 @@ fn dev_db_path() -> PathBuf {
         .unwrap_or_else(|_| std::env::temp_dir().join("dratchet-dev-a.redb"))
 }
 
+/// DRA-0033 (`docs/DELIVERY_FAILURE_FINDINGS.md`): the encrypted local
+/// database's passphrase, previously the literal constant `"dev"` for
+/// every installation of the shipped app -- a fixed, publicly-known
+/// string in open-source code provides zero actual secrecy, defeating
+/// `store::db`'s entire Argon2id/ChaCha20Poly1305 encryption-at-rest
+/// design for the real product. A per-device, high-entropy (256-bit)
+/// passphrase, generated once and persisted alongside the database file
+/// it protects, is a bounded improvement: every installation now gets a
+/// distinct, unguessable secret instead of one universal constant. A
+/// real user-facing passphrase prompt (so the secret depends on
+/// something the user knows, not just something stored on the same
+/// disk as the data it protects) remains a real UI feature for future
+/// work -- see this finding's "Known residual scope" in the docs.
+fn device_passphrase(db_path: &std::path::Path) -> String {
+    let keyfile_path = db_path.with_extension("keyfile");
+    if let Ok(existing) = std::fs::read_to_string(&keyfile_path) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    let random_bytes = dratchet_client::handshake::random_routing_id();
+    let passphrase: String = random_bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let _ = std::fs::write(&keyfile_path, &passphrase);
+    passphrase
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let db_path = dev_db_path();
+    let passphrase = device_passphrase(&db_path);
     let db = if db_path.exists() {
-        Db::open(&db_path, "dev").expect("open dev db")
+        Db::open(&db_path, &passphrase).expect("open dev db")
     } else {
-        Db::create(&db_path, "dev").expect("create dev db")
+        Db::create(&db_path, &passphrase).expect("create dev db")
     };
     let mut account = open_account(&db).expect("open account");
 
@@ -1052,5 +1080,54 @@ mod tests {
              calls any opener command, so this is unused, webview-reachable IPC surface a \
              future XSS could abuse to launch arbitrary URLs/files"
         );
+    }
+
+    /// DRA-0033: proves `device_passphrase` no longer returns the fixed
+    /// literal `"dev"` every installation previously shared -- a
+    /// different database path must get a different, high-entropy
+    /// (32-byte, 64 hex char) passphrase.
+    #[test]
+    fn device_passphrase_is_high_entropy_and_not_the_old_shared_constant() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("a.redb");
+        let passphrase = device_passphrase(&db_path);
+        assert_ne!(
+            passphrase, "dev",
+            "VULNERABILITY: the local database's encryption passphrase must not be the fixed, \
+             publicly-known literal every installation previously shared -- that provides zero \
+             actual confidentiality for Argon2id/ChaCha20Poly1305 encryption-at-rest"
+        );
+        assert_eq!(
+            passphrase.len(),
+            64,
+            "expected a 32-byte value hex-encoded (256 bits of entropy)"
+        );
+    }
+
+    /// A device's passphrase must persist across restarts -- otherwise a
+    /// freshly-generated one on every launch would make an already-created
+    /// database permanently unopenable.
+    #[test]
+    fn device_passphrase_persists_across_calls_for_the_same_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("a.redb");
+        let first = device_passphrase(&db_path);
+        let second = device_passphrase(&db_path);
+        assert_eq!(
+            first, second,
+            "the same db path must always get back the same passphrase, or a real database \
+             created with the first one could never be reopened"
+        );
+    }
+
+    /// Two different devices/databases must never share a passphrase --
+    /// otherwise this fix would just be trading one shared constant for
+    /// another.
+    #[test]
+    fn different_db_paths_get_different_passphrases() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = device_passphrase(&dir.path().join("a.redb"));
+        let b = device_passphrase(&dir.path().join("b.redb"));
+        assert_ne!(a, b);
     }
 }

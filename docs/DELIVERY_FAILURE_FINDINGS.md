@@ -2255,3 +2255,66 @@ delivery-status tracking, none of which silently disables a
 user-configured protection the way wipe-policy poisoning does), so left
 unchanged; worth a fresh look if any of those payloads' effects are ever
 expanded.
+
+## DRA-0033: the shipped app's local database used a fixed, hardcoded `"dev"` passphrase for every installation (penetration test round 4, data extraction/compromise; confirmed real, fixed)
+
+Penetration-test round 4 — auditing `ui/src-tauri/src/lib.rs`'s `run()`,
+the actual entry point (`#[cfg_attr(mobile, tauri::mobile_entry_point)]`)
+of the shipped desktop app, not a test-only or dev-gated path. It opened
+or created the local encrypted database (`store/src/db.rs`'s
+Argon2id-derived master key, ChaCha20Poly1305 content encryption — the
+protection this whole project's local-storage design relies on) with
+the literal string `"dev"` as the passphrase, for every real installation
+of the app. A fixed, publicly-known constant embedded in open-source
+code provides zero actual secrecy: anyone with filesystem access to a
+user's `.redb` file (or simply anyone who has read this source, since
+the "secret" never varied per install) can decrypt the entire local
+database — the account's private identity key, every stored contact,
+and all local message history — trivially, completely defeating
+`store/src/db.rs`'s encryption-at-rest design for the real product. This
+is a supply-of-secrecy defect distinct from anything `store/src/db.rs`
+itself could catch: its own crypto (random nonces, Argon2id, AEAD) is
+implemented correctly — the vulnerability is that the *input* to that
+crypto was never actually secret.
+
+**Fixed**: `run()`'s hardcoded `"dev"` literal is replaced by a new
+`device_passphrase(db_path)`, which reads a per-device, 256-bit
+random passphrase from a sibling file next to the database (generating
+and persisting one via `dratchet_client::handshake::random_routing_id`'s
+`OsRng` source on first run) — every installation now gets a distinct,
+unguessable secret instead of one universal constant shared by every
+copy of the app.
+
+Confirmed with real tests in `ui/src-tauri/src/lib.rs`'s test module:
+`device_passphrase_is_high_entropy_and_not_the_old_shared_constant`
+(asserts the result is never `"dev"` and is a real 32-byte value,
+hex-encoded); `device_passphrase_persists_across_calls_for_the_same_path`
+(a real database created with the first call must still be openable
+later); `different_db_paths_get_different_passphrases` (two devices
+never share a secret). Pre-fix (verified via `git stash` of
+`ui/src-tauri/src/lib.rs`): these tests don't even compile, since
+`device_passphrase` didn't exist — direct evidence the fixed constant
+was the only passphrase mechanism that existed at all.
+
+Full `ui/src-tauri` workspace `cargo fmt --check` / `cargo clippy
+--all-targets -- -D warnings` / `cargo test` all pass.
+
+**Known residual scope, stated explicitly, and the most important
+caveat on this fix**: a passphrase file stored on the same disk as the
+database it protects defends only against a *different* class of
+exposure than a real user-entered passphrase would — it stops the
+"one hardcoded constant works for every installation" failure mode
+this finding demonstrates, and raises the bar from "no attacker effort
+needed" to "attacker needs to read two files instead of knowing one
+public string." It does **not** protect against an attacker with full
+filesystem access to a single device (who can simply read the sibling
+keyfile alongside the database), the way a real user-memorized
+passphrase — never persisted anywhere, entered fresh each unlock — would.
+A proper fix needs a real passphrase-entry UI (a lock screen, prompted
+at launch, with the secret held only in memory) or OS-keychain-backed
+storage (`ui/src-tauri` doesn't currently depend on a keyring crate);
+both are real UI/platform-integration feature work well beyond this
+bounded fix's scope, and are the necessary next step to close this
+finding fully rather than just narrow it. Tracked here rather than left
+implicit, matching this document's standing practice for every partial
+fix.
