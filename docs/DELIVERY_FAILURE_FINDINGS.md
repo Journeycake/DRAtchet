@@ -2013,3 +2013,58 @@ pass. `cargo fmt --check` / `cargo clippy --all-targets -- -D
 warnings` / `cargo test` for the `ui/src-tauri` workspace all clean.
 No live-UI re-verification needed beyond DRA-0027's: removing an
 unused, never-called capability has no functional surface to regress.
+
+## DRA-0029: `cookie@0.6.0`, a transitive frontend dependency, shipped a known out-of-bounds-character parsing flaw (penetration test round 4, data obfuscation/extraction — supply chain; confirmed real via GHSA-pxg6-pf52-xh8x, fixed)
+
+Penetration-test round 4, switching categories to the frontend's
+supply chain — `npm audit --json` in `ui/` surfaced a real, named
+advisory: **GHSA-pxg6-pf52-xh8x** ("cookie accepts cookie name, path,
+and domain with out of bounds characters", CWE-74/improper input
+validation), affecting `cookie < 0.7.0`. `npm ls cookie` confirmed the
+path it entered by: `ui@0.1.0 -> @sveltejs/kit@2.70.3 -> cookie@0.6.0`
+— a transitive dependency of SvelteKit itself, never declared directly
+by this project. The flaw lets a cookie name/path/domain containing
+out-of-bounds characters (e.g. control characters) be accepted and
+serialized without rejection, which upstream code that trusts
+`cookie`'s validation could use to inject unexpected `Set-Cookie`
+header structure. This app is a static-adapter Tauri desktop build
+with no server-rendered routes and no first-party use of `document.cookie`
+or SvelteKit's `cookies` API, so the advisory's direct blast radius
+here is low — but it is still real, shipped code (`node_modules`
+inside every build) reachable indirectly through SvelteKit's own
+internals, and a build tool or future SSR-adjacent code path could
+change that calculus without anyone re-auditing.
+
+The "confirmed real" evidence for this finding is the advisory itself
+plus the tool that reports it, not a custom exploit — this is a
+supply-chain gap, not a logic bug in this codebase, so there is no
+DRAtchet-specific PoC to write. Before the fix: `npm audit --json`
+reported one low-severity vulnerability, naming GHSA-pxg6-pf52-xh8x
+against `cookie@0.6.0`, with no direct fix available (fixing it
+required either an SvelteKit major bump or forcing the transitive
+version).
+
+**Fixed**: added an `overrides` entry to `ui/package.json` —
+`"overrides": { "cookie": "^0.7.2" } ` — forcing every resolution of
+`cookie` (including SvelteKit's own internal one) to the patched
+`0.7.2`, without bumping `@sveltejs/kit`'s own declared major version
+(the higher-risk alternative). `npm install` confirmed the override
+took effect (`npm ls cookie` now shows `cookie@0.7.2 overridden` under
+`@sveltejs/kit`) and re-ran `npm audit --json`: **0 vulnerabilities**
+reported.
+
+Verified the override doesn't break the app: `npm run check`
+(svelte-check) — 163 files, 0 errors, 0 warnings; `npm run build` —
+succeeded (`✓ built in 2.25s`, site written to `build/`). No Rust-side
+changes were needed for this finding, so the root and `ui/src-tauri`
+Cargo workspaces are unaffected.
+
+**Known residual scope, stated explicitly**: an `overrides` pin is a
+point-in-time fix — if SvelteKit's own `cookie` dependency is bumped
+past `0.7.2` in a future SvelteKit release, the override continues to
+force `^0.7.2` and won't silently regress, but it also won't
+automatically track further upstream patches to `cookie` itself past
+that range without a manual bump. Recommend an `npm audit` pass as a
+standing item in CI (not currently run there) so future advisories in
+any dependency, direct or transitive, surface automatically rather
+than depending on a manual pentest pass to catch them.
