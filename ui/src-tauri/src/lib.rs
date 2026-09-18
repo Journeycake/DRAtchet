@@ -1008,4 +1008,49 @@ mod tests {
             "must not permit loading scripts from an arbitrary origin"
         );
     }
+
+    /// DRA-0028 (`docs/DELIVERY_FAILURE_FINDINGS.md`, penetration test
+    /// round 4, data extraction — unused capability grant widening the
+    /// blast radius of any future webview XSS, same category as
+    /// DRA-0027): `capabilities/default.json` granted `opener:default` —
+    /// making `tauri-plugin-opener`'s `open_url`/`open_path` commands
+    /// callable from the webview via `invoke()` — even though nothing in
+    /// `ui/src` ever calls them (confirmed by grep: no `opener` import,
+    /// no `openUrl`/`openPath` call, anywhere in the frontend). An
+    /// unnecessary capability grant is exactly the kind of gap DRA-0027's
+    /// CSP doesn't cover on its own: CSP bounds *network/script* reach,
+    /// but a Tauri capability grant is a *separate* trust boundary —
+    /// injected script calling `invoke("plugin:opener|open_url", ...)`
+    /// isn't a network request the CSP's `connect-src` would catch, it's
+    /// Tauri's own IPC bridge, gated only by what capabilities/*.json
+    /// grants. With this granted-but-unused, a future XSS could have
+    /// launched an arbitrary URL/file via the OS's default handler
+    /// (phishing, or platform-specific URI-scheme-handler abuse) for no
+    /// functional benefit to the real app. The plugin stays registered
+    /// in `main.rs`/`lib.rs`'s `.plugin(tauri_plugin_opener::init())` —
+    /// removing the *capability grant* is what actually closes the
+    /// webview-reachable surface; a registered-but-ungranted plugin's
+    /// commands simply can't be invoked at all.
+    #[test]
+    fn opener_capability_is_not_granted_since_the_frontend_never_uses_it() {
+        let caps_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("capabilities")
+            .join("default.json");
+        let raw = std::fs::read_to_string(&caps_path)
+            .expect("capabilities/default.json must be readable");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&raw).expect("capabilities/default.json must be valid JSON");
+        let permissions = parsed["permissions"]
+            .as_array()
+            .expect("permissions must be an array");
+        let has_opener = permissions
+            .iter()
+            .any(|p| p.as_str().is_some_and(|s| s.starts_with("opener")));
+        assert!(
+            !has_opener,
+            "VULNERABILITY: opener:* must not be granted to the webview -- the frontend never \
+             calls any opener command, so this is unused, webview-reachable IPC surface a \
+             future XSS could abuse to launch arbitrary URLs/files"
+        );
+    }
 }

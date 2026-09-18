@@ -1974,3 +1974,42 @@ itself is unchanged between dev and production and follows Tauri's
 documented production requirements, but a production-bundle live check
 is a reasonable follow-up before considering this fully verified
 end-to-end in the exact shipped artifact.
+
+## DRA-0028: an unused `opener` capability was granted to the webview, widening the blast radius of any future XSS (penetration test round 4, data extraction — unnecessary IPC surface; confirmed real, fixed)
+
+Penetration-test round 4, continuing past DRA-0027 in the same
+category — a Tauri capability grant is a *separate* trust boundary
+from CSP, not covered by it: CSP's `connect-src` bounds network
+fetches, but `invoke("plugin:opener|open_url", ...)` is Tauri's own
+IPC bridge, gated only by what `capabilities/*.json` grants, not by
+CSP at all. `ui/src-tauri/capabilities/default.json` granted
+`opener:default`, making `tauri-plugin-opener`'s `open_url`/
+`open_path` commands callable from the webview — but nothing in
+`ui/src` ever calls them (confirmed by grep across the whole frontend:
+no `opener` import, no `openUrl`/`openPath` call, anywhere). A future
+XSS (still no known one today — same caveat as DRA-0027) could have
+used this granted-but-unused capability to launch an arbitrary URL or
+file via the OS's default handler — phishing, or platform-specific
+URI-scheme-handler abuse — for zero functional benefit to the real
+app, which never needed this permission in the first place.
+
+Confirmed structurally, the same way as DRA-0027: a new
+`opener_capability_is_not_granted_since_the_frontend_never_uses_it`
+test in `ui/src-tauri/src/lib.rs`, run against the pre-fix capability
+file first, fails with a clear panic naming the gap.
+
+**Fixed**: removed `"opener:default"` from `capabilities/default.json`
+— now just `["core:default"]`. The plugin stays registered in
+`lib.rs`'s `.plugin(tauri_plugin_opener::init())`; removing the
+*capability grant* (not the plugin registration) is what actually
+closes the webview-reachable surface, since a registered-but-ungranted
+plugin's commands simply can't be invoked from the webview at all —
+matches Tauri v2's own permission model, where registration and
+webview-callability are independent.
+
+Re-ran the new test against the fix (passes) plus the full
+`ui/src-tauri` suite (6 tests, including DRA-0027's CSP test) — all
+pass. `cargo fmt --check` / `cargo clippy --all-targets -- -D
+warnings` / `cargo test` for the `ui/src-tauri` workspace all clean.
+No live-UI re-verification needed beyond DRA-0027's: removing an
+unused, never-called capability has no functional surface to regress.
