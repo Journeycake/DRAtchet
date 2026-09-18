@@ -797,3 +797,70 @@ async fn boundary_scoped_wipe_protects_alices_pre_announce_history() {
         b"still works after the boundary-scoped wipe"
     );
 }
+
+/// Penetration-test finding DRA-0032 (round 4, data destruction):
+/// `PAYLOAD_CONVERSATION_WIPE_POLICY_ANNOUNCE`'s handler in `apply_entry`
+/// had no verification-state check at all, unlike its sibling
+/// `PAYLOAD_CONVERSATION_WIPE_REQUEST` arm right below it (DRA-0021),
+/// whose own doc comment explains exactly why one is required: this
+/// payload has a real, persisted local effect (`peer_wipe_ask_before_delete`,
+/// and the wipe boundary a later auto-complied wipe request scopes itself
+/// against). **Expected**: once Alice's local record of Bob is reverted
+/// to `Mismatch` (a detected identity change, `ARCHITECTURE.md` §6.2/6.3's
+/// hard stop), an incoming wipe-policy announcement over that same
+/// session must be silently dropped -- `peer_wipe_ask_before_delete` must
+/// stay `None`, not get poisoned to `Some(false)`, which would otherwise
+/// defeat Alice's own configured ask-before-delete safety net the next
+/// time a genuinely `Verified` wipe request arrives.
+#[tokio::test]
+async fn a_mismatch_contacts_wipe_policy_announcement_never_takes_effect() {
+    let Paired {
+        db_alice,
+        alice: _alice,
+        mut alice_contact,
+        mut alice_conn,
+        db_bob,
+        bob,
+        bob_contact,
+        mut bob_conn,
+    } = pair().await;
+
+    // Alice's own opt-in: she wants to be asked before a wipe request
+    // deletes anything -- the safety net this finding shows can be
+    // silently defeated.
+    alice_contact.wipe_ask_before_delete = true;
+    db_alice.save_contact(&alice_contact).unwrap();
+
+    // Simulate a detected identity change: Alice's local record of this
+    // conversation is reverted to Mismatch, exactly as DRA-0021's own
+    // fixed WIPE_REQUEST arm already treats as an untrusted hard stop.
+    alice_contact.verification_state = VerificationState::Mismatch;
+    db_alice.save_contact(&alice_contact).unwrap();
+
+    // Bob (standing in for whatever session now lands as Mismatch on
+    // Alice's side -- the attack doesn't require Bob himself to be
+    // malicious, only that *some* session Alice no longer trusts can
+    // still reach this handler) announces `ask_before_delete: false`.
+    announce_wipe_policy(&db_bob, &mut bob_conn, &bob, &bob_contact, false, false)
+        .await
+        .unwrap();
+
+    receive_pending(&db_alice, &mut alice_conn, &_alice, &alice_contact)
+        .await
+        .unwrap();
+
+    let after = db_alice
+        .load_contact(&alice_contact.fingerprint)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.peer_wipe_ask_before_delete, None,
+        "VULNERABILITY: a Mismatch (untrusted) session's wipe-policy announcement took \
+         effect -- poisoning peer_wipe_ask_before_delete would silently defeat Alice's own \
+         ask-before-delete safety net for a later, genuinely Verified wipe request"
+    );
+    assert_eq!(
+        after.peer_wipe_boundary_timestamp, None,
+        "a Mismatch session must not be able to move the wipe boundary either"
+    );
+}

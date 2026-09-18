@@ -2193,3 +2193,65 @@ meaningfully higher cost than an unbounded single-source flood. Per-IP
 connection limiting would close that gap further but is real feature
 work (source-IP extraction behind a real deployment's reverse proxy,
 a second rate-limiter keyed by IP) beyond this bounded fix's scope.
+
+## DRA-0032: `PAYLOAD_CONVERSATION_WIPE_POLICY_ANNOUNCE` had no verification-state check, unlike its sibling wipe-request arm (penetration test round 4, data destruction; confirmed real, fixed)
+
+Penetration-test round 4, auditing `app/src/lib.rs`'s `apply_entry` —
+the same function DRA-0021 already hardened for
+`PAYLOAD_CONVERSATION_WIPE_REQUEST`, with a detailed comment explaining
+exactly why a session that isn't `Verified` (including one reverted to
+`Mismatch`, §6.2/6.3's hard stop for a detected identity change) must
+never have that payload take local effect. The very next `match` arm up,
+handling `PAYLOAD_CONVERSATION_WIPE_POLICY_ANNOUNCE`, had no such check
+at all — `db.record_peer_wipe_policy(...)` ran unconditionally for any
+session the ratchet could decrypt, regardless of `contact.verification_state`.
+
+That call has two real, persisted effects: it sets
+`peer_wipe_ask_before_delete` (used by `effective_wipe_ask_before_delete()`,
+which requires *both* sides to opt in — so a forged `false` from the
+peer's side silently overrides the local user's own opt-in, even though
+the local user never agreed to that), and it stamps
+`peer_wipe_boundary_timestamp`/`_sequence`, the boundary a later
+auto-complied wipe request scopes itself against. Concretely: a session
+that isn't (or is no longer) `Verified` could poison
+`peer_wipe_ask_before_delete` to `false` — and later, when the *actual*
+`Verified` peer sends a genuine wipe request, `effective_wipe_ask_before_delete()`
+would already be `false` (never re-announced since the poisoning),
+silently skipping the confirmation the local user explicitly configured
+and auto-deleting their own message history for that conversation.
+
+Confirmed with a real test:
+`app/tests/single_sided_wipe_request.rs`'s
+`a_mismatch_contacts_wipe_policy_announcement_never_takes_effect` pairs
+Alice and Bob (both `Verified`), has Alice opt in to
+`wipe_ask_before_delete`, then reverts Alice's local record of the
+conversation to `Mismatch`. A wipe-policy announcement (`ask_before_delete: false`)
+then arrives over that same session. Verified pre-fix via `git stash` of
+`app/src/lib.rs`: the test fails — `peer_wipe_ask_before_delete` was set
+to `Some(false)` despite the Mismatch state, exactly the poisoning
+described above.
+
+**Fixed**: the `PAYLOAD_CONVERSATION_WIPE_POLICY_ANNOUNCE` arm now
+checks `contact.verification_state != VerificationState::Verified`
+first and returns `EntryEffect::None` if so — the same guard, in the
+same place, as the sibling `PAYLOAD_CONVERSATION_WIPE_REQUEST` arm
+right below it.
+
+Re-ran the new test against the fix (passes), plus the full
+`single_sided_wipe_request.rs` suite (6 tests, zero regressions) and the
+full workspace: `cargo fmt --check` / `cargo clippy --workspace
+--all-targets -- -D warnings` / `cargo test --workspace` all pass (55
+test result blocks, zero failures).
+
+**Known residual scope, stated explicitly**: this closes the specific
+poisoning path through `apply_entry`'s dispatch. §6.5's broader "what's
+gated is release of application content... not the protocol machinery
+underneath it" design still lets several other non-chat payload types
+(`PAYLOAD_PROFILE_ANNOUNCE`, `PAYLOAD_ROUTING_ID_ANNOUNCE`, `PAYLOAD_DELIVERY_ACK`)
+take effect regardless of verification state — reviewed as part of this
+finding and judged to have no comparable destructive/safety-net-defeating
+effect (they only affect display metadata, routing bookkeeping, or
+delivery-status tracking, none of which silently disables a
+user-configured protection the way wipe-policy poisoning does), so left
+unchanged; worth a fresh look if any of those payloads' effects are ever
+expanded.

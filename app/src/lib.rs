@@ -1134,6 +1134,21 @@ fn apply_entry(
             }
         }
         Ok((PAYLOAD_CONVERSATION_WIPE_POLICY_ANNOUNCE, content)) => {
+            // DRA-0032 (`docs/DELIVERY_FAILURE_FINDINGS.md`): mirrors
+            // DRA-0021's reasoning for `PAYLOAD_CONVERSATION_WIPE_REQUEST`
+            // immediately below -- this payload has a real, persisted
+            // local effect too (`peer_wipe_ask_before_delete`, and the
+            // wipe boundary a later auto-complied wipe request scopes
+            // itself against), so a session that isn't `Verified`
+            // (including one reverted to `Mismatch`) must never have it
+            // take effect, exactly like chat content. Without this, an
+            // unverified/mismatched peer could silently poison
+            // `peer_wipe_ask_before_delete` to `false`, defeating this
+            // side's own configured ask-before-delete safety net for a
+            // later, genuinely `Verified` wipe request.
+            if contact.verification_state != VerificationState::Verified {
+                return Ok(EntryEffect::None);
+            }
             let announce = ConversationWipePolicyAnnounce::decode(&content)?;
             db.record_peer_wipe_policy(
                 &contact.fingerprint,
