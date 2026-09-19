@@ -35,6 +35,13 @@ pub enum Error {
     /// computable by anyone, so the handshake is refused outright.
     #[error("handshake rejected: peer supplied a low-order (non-contributory) public key")]
     NonContributoryHandshake,
+
+    /// DRA-0042 (`docs/DELIVERY_FAILURE_FINDINGS.md`): the envelope's
+    /// `conversation_id` names a different conversation than the ratchet
+    /// asked to decrypt it. The sender chooses that field, so a session
+    /// must never accept an envelope that claims to belong somewhere else.
+    #[error("envelope rejected: its conversation_id is not this session's")]
+    ConversationIdMismatch,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -2941,3 +2941,83 @@ record.
   here, but the fix makes it reachable by deliberate tampering — a
   local denial of service on one conversation's history, trading a
   read failure for the much worse silent-forgery outcome it replaces.
+
+## DRA-0042: a ratchet decrypted any envelope handed to it, including one naming a conversation that was not its own (penetration test round 6, data obfuscation — latent cross-conversation misattribution; confirmed real, fixed) — **LOW**
+
+Penetration-test round 6, auditing `core/src/ratchet.rs`'s `decrypt_raw`
+against `core/src/envelope.rs`'s header. Every envelope carries a
+`conversation_id` in its fixed 61-byte header, and `decrypt_raw` never
+compared that value to `self.conversation_id`.
+
+The subtlety worth stating plainly, because it is what makes this a real
+gap rather than a non-issue: the `conversation_id` **is** covered by the
+AEAD, because `header_bytes()` is the associated data. A third party
+cannot flip it in transit — `tampered_header_is_rejected_even_though_ciphertext_is_untouched`
+already pins that down. But the associated data is the envelope's *own*
+header, so the binding is circular: a sender who stamps a different
+conversation id produces an envelope that is entirely self-consistent and
+entirely authentic, and the receiving ratchet had nothing to compare it
+against.
+
+So a peer with a live session could hand over a genuine, correctly
+authenticated envelope that claims to belong to a completely different
+conversation, and it would decrypt without objection.
+
+**Nothing in the workspace routes on the field today.** `app/src/lib.rs`
+always derives the conversation from the contact it is processing
+(`conversation_id_for`), never from the envelope, so there is no path
+from this to a misattributed message right now — which is precisely why
+it is rated **Low** rather than higher. It is a latent gap: an
+unvalidated, sender-chosen identifier sitting in an authenticated header,
+waiting for the first piece of code that decides to trust it. That is not
+hypothetical drift either — `app/src/lib.rs:1152` already checks
+`DeliveryAck.conversation_id` against the session it arrived on, one
+layer up, which shows both that this class of mismatch is considered a
+real threat here and that the temptation to read the field is already
+present.
+
+### Confirmation
+
+`core/src/ratchet.rs`,
+`an_envelope_claiming_a_different_conversation_is_rejected`. A naive
+"flip a byte in the header" test proves nothing here (it fails with
+`Error::Aead` with or without the fix, since the header is the AAD), so
+the test reproduces the actual condition instead: two sessions that share
+a root key but disagree about which conversation they are — Alice
+initialised with `[0xAA; 16]`, Bob with `[0xBB; 16]`. Alice's envelope is
+genuine and self-consistent, and Bob must refuse it.
+
+Verified against pre-fix behaviour by disabling only the new comparison
+in place: the test fails with
+
+> VULNERABILITY: a ratchet accepted an envelope naming a conversation
+> that is not its own — the conversation_id a sender chooses must be
+> checked against the session decrypting it, not merely carried along
+
+confirming the envelope really did decrypt cleanly on the wrong session
+before the fix.
+
+### Fixed
+
+`decrypt_raw` now rejects a mismatch with the new
+`Error::ConversationIdMismatch`. The check sits above every other path —
+including the cached skipped-key fast path — and returns before any
+mutation of `self`, preserving the function's existing transactional
+guarantee that a rejected envelope leaves the ratchet exactly as it found
+it. The test asserts that too.
+
+### Known residual scope
+
+- **This authenticates the claim, it does not make the identifier
+  meaningful.** `conversation_id` is still derived from the two
+  fingerprints by `core::conversation_id`, so it says nothing a
+  successfully-decrypting session did not already imply. The value of the
+  check is that it fails closed if anything ever does start routing on
+  the field.
+- **The circular-AAD shape remains elsewhere.** Every other header field
+  (`pn`, `n`, `dh_pub`) is likewise authenticated only against itself,
+  and each is validated by the ratchet algorithm proper rather than by a
+  comparison like this one. No separate gap was found in those, but the
+  general principle — a sender-chosen value inside its own AAD is not
+  validated merely by being authenticated — applies to any field added
+  to this header in future.

@@ -235,6 +235,24 @@ impl RatchetState {
     /// conversation for both legitimate parties, even though that envelope itself gets
     /// correctly rejected — see `tests::garbage_envelope_does_not_desync_the_ratchet`.
     pub fn decrypt_raw(&mut self, envelope: &Envelope) -> Result<Vec<u8>> {
+        // DRA-0042 (`docs/DELIVERY_FAILURE_FINDINGS.md`): the envelope names
+        // the conversation it claims to belong to, but nothing checked that
+        // claim against the session actually decrypting it. The field rides
+        // in the AEAD-authenticated header, so a third party cannot alter it
+        // -- but the *sender* chooses it freely, and a peer with a live
+        // session could name any conversation they liked. Nothing routes on
+        // the field today, so this rejects a mismatch before it can ever
+        // become one; `app`'s own `DeliveryAck.conversation_id` check is the
+        // same guard one layer up.
+        //
+        // Placed above every other path, including the skipped-key fast
+        // path, and returning before any mutation: a rejected envelope must
+        // leave the ratchet exactly as it found it, for the same reason
+        // documented below.
+        if envelope.conversation_id != self.conversation_id {
+            return Err(Error::ConversationIdMismatch);
+        }
+
         let skipped_id = (DhPubBytes(envelope.dh_pub), envelope.n);
 
         // Fast path: an already-cached skipped-message key. Peek, don't remove, until
@@ -1130,6 +1148,65 @@ mod tests {
         let mut e0 = alice.encrypt(&chat("hello")).unwrap();
         e0.n = 5; // header field, part of the AEAD associated data
         assert!(matches!(bob.decrypt_raw(&e0), Err(Error::Aead)));
+    }
+
+    /// Penetration-test finding DRA-0042: the envelope header names the
+    /// conversation it belongs to, and `decrypt_raw` never compared that
+    /// name to the session actually decrypting it.
+    ///
+    /// The field rides inside the AEAD associated data, so a third party
+    /// cannot rewrite it in transit -- which is exactly why a naive
+    /// tamper-the-byte test proves nothing here. The real gap is that the
+    /// associated data is the envelope's *own* header, so a sender who
+    /// stamps a different conversation id produces a perfectly
+    /// self-consistent, perfectly authentic envelope, and the receiving
+    /// ratchet had nothing to compare it against. Two sessions sharing a
+    /// root key but disagreeing about which conversation they are
+    /// reproduce that exactly.
+    #[test]
+    fn an_envelope_claiming_a_different_conversation_is_rejected() {
+        let root_key = [7u8; 32];
+        let responder_secret = StaticSecret::random_from_rng(OsRng);
+        let responder_public = PublicKey::from(&responder_secret);
+
+        // Alice believes she is in conversation A...
+        let mut alice = RatchetState::init_as_initiator(
+            [0xAAu8; 16],
+            root_key,
+            responder_public,
+            DEFAULT_MAX_SKIP,
+        )
+        .unwrap();
+        // ...Bob, decrypting, is session B.
+        let mut bob = RatchetState::init_as_responder(
+            [0xBBu8; 16],
+            root_key,
+            responder_secret,
+            DEFAULT_MAX_SKIP,
+        )
+        .unwrap();
+
+        let misattributed = alice.encrypt(&chat("hello")).unwrap();
+        assert_eq!(misattributed.conversation_id, [0xAAu8; 16]);
+
+        assert!(
+            matches!(
+                bob.decrypt_raw(&misattributed),
+                Err(Error::ConversationIdMismatch)
+            ),
+            "VULNERABILITY: a ratchet accepted an envelope naming a conversation that is not \
+             its own -- the conversation_id a sender chooses must be checked against the \
+             session decrypting it, not merely carried along"
+        );
+
+        // The rejection is transactional, like every other one here: a
+        // matched session still works normally afterwards.
+        let (mut a2, mut b2) = matched_pair();
+        let genuine = a2.encrypt(&chat("still fine")).unwrap();
+        assert_eq!(
+            b2.decrypt_payload(&genuine).unwrap(),
+            (PAYLOAD_CHAT, b"still fine".to_vec())
+        );
     }
 
     #[test]
