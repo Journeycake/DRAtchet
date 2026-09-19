@@ -53,7 +53,8 @@ fn full_handshake_with_one_time_prekey_then_ratchet_conversation() {
         bob_account.signed_prekey_secret(),
         otp_secret.as_ref(),
         &init.message,
-    );
+    )
+    .unwrap();
 
     assert_eq!(
         init.root_key, bob_root_key,
@@ -119,7 +120,8 @@ fn handshake_degrades_gracefully_without_a_one_time_prekey() {
         bob_account.signed_prekey_secret(),
         None,
         &init.message,
-    );
+    )
+    .unwrap();
     assert_eq!(init.root_key, bob_root_key);
 }
 

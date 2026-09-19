@@ -223,7 +223,16 @@ async fn dispatch(
                 return Err(Error::AlreadyAuthenticated);
             }
             let req: AuthResponse = decode_body(body)?;
-            if identity::verify_signature(&req.identity_key, nonce, &req.signature).is_err() {
+            // DRA-0039: verifies against the domain-separated auth payload,
+            // so a signature harvested for any other context (or minted by a
+            // malicious relay posing as this one) can never authenticate.
+            if identity::Identity::verify_auth_challenge_signature(
+                &req.identity_key,
+                nonce,
+                &req.signature,
+            )
+            .is_err()
+            {
                 tracing::debug!(
                     connection = %hex_encode(&connection_id),
                     "authentication failed: bad nonce signature",

@@ -210,7 +210,8 @@ async fn main() {
         bob.signed_prekey_secret(),
         bob_otp_secret.as_ref(),
         &init.message,
-    );
+    )
+    .unwrap();
     let bob_ratchet = RatchetState::init_as_responder(
         conv_id,
         bob_root_key,

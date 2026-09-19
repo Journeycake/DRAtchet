@@ -62,9 +62,12 @@ impl Connection {
         if tag != FrameTag::AuthChallenge {
             return Err(format!("expected AuthChallenge, got {tag:?}"));
         }
+        // DRA-0039: domain-separated -- never sign a server-chosen value
+        // verbatim, or the client becomes a signing oracle for the prekey
+        // context (see `Identity::sign_auth_challenge`).
         let signature = account
             .identity
-            .sign(&challenge.nonce)
+            .sign_auth_challenge(&challenge.nonce)
             .map_err(|e| e.to_string())?;
         let identity_key = account
             .identity

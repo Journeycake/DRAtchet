@@ -68,7 +68,8 @@ fn a_mitm_can_derive_bobs_root_key_from_only_public_material_without_response_bi
         bob.signed_prekey_secret(),
         None,
         &forged_message,
-    );
+    )
+    .unwrap();
 
     // Mallory independently derives the same root key using only Bob's
     // already-public bundle values (identity_dh_public, signed_prekey --

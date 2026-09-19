@@ -289,11 +289,15 @@ impl RatchetState {
                 .dh_self
                 .as_ref()
                 .ok_or(Error::RatchetNotInitialized("dh_self"))?;
+            // DRA-0038: rejected here, before the commit block below, so a
+            // low-order `dh_pub` leaves the ratchet exactly as it was —
+            // the same transactional discipline this method's own doc
+            // comment describes for a forged envelope.
             Some(compute_dh_ratchet_step(
                 &self.root_key,
                 dh_self_secret,
                 &incoming_dh,
-            ))
+            )?)
         } else {
             None
         };
@@ -728,26 +732,47 @@ struct RatchetStep {
     new_dh_self_public: PublicKey,
 }
 
+/// **DRA-0038 (`docs/DELIVERY_FAILURE_FINDINGS.md`), the reason this
+/// returns `Result`:** `incoming_dh` is `envelope.dh_pub`, taken verbatim
+/// off the wire. X25519's order-8 subgroup means a low-order point makes
+/// both `diffie_hellman` calls below return all-zeros, so `kdf_rk` — which
+/// takes the DH output as its IKM and the old root key as its salt —
+/// derives the new root key and *both* chain keys as a pure, deterministic
+/// function of the **old root key alone**.
+///
+/// That destroys the Double Ratchet's break-in recovery (post-compromise
+/// security): a DH step is supposed to heal a conversation whose keys
+/// leaked, because the attacker can't compute the fresh DH. Pin every step
+/// to a low-order point and the healing never happens — anyone who learns
+/// the root key once keeps deriving every future key forever, and a
+/// malicious peer can force exactly that on a conversation they're a
+/// legitimate party to.
 fn compute_dh_ratchet_step(
     root_key: &[u8; 32],
     dh_self_secret: &StaticSecret,
     incoming_dh: &PublicKey,
-) -> RatchetStep {
+) -> Result<RatchetStep> {
     let dh_output = dh_self_secret.diffie_hellman(incoming_dh);
+    if !dh_output.was_contributory() {
+        return Err(Error::NonContributoryHandshake);
+    }
     let (root_after_recv, receiving_chain_key) = kdf_rk(root_key, dh_output.as_bytes());
 
     let new_secret = StaticSecret::random_from_rng(OsRng);
     let new_public = PublicKey::from(&new_secret);
     let dh_output = new_secret.diffie_hellman(incoming_dh);
+    if !dh_output.was_contributory() {
+        return Err(Error::NonContributoryHandshake);
+    }
     let (root_after_send, sending_chain_key) = kdf_rk(&root_after_recv, dh_output.as_bytes());
 
-    RatchetStep {
+    Ok(RatchetStep {
         new_root_key: root_after_send,
         new_receiving_chain_key: receiving_chain_key,
         new_sending_chain_key: sending_chain_key,
         new_dh_self_secret: new_secret,
         new_dh_self_public: new_public,
-    }
+    })
 }
 
 /// Derive the AEAD encryption key and nonce from a single-use message key, per
@@ -1637,5 +1662,101 @@ mod tests {
             exported.dh_self_secret,
             alice.dh_self.as_ref().map(|(s, _)| s.to_bytes().to_vec())
         );
+    }
+
+    /// The all-zero X25519 point — order 1, so `diffie_hellman` against it
+    /// returns all-zeros for every private key (RFC 7748's small subgroup).
+    const LOW_ORDER_POINT: [u8; 32] = [0u8; 32];
+
+    /// Penetration-test finding DRA-0038: a DH ratchet step against a
+    /// low-order `dh_pub` must never derive its new keys from the old root
+    /// key alone. Pre-fix it did — two parties holding *completely
+    /// different* DH secrets, stepping against the same low-order point,
+    /// landed on identical new root *and* chain keys, because every DH
+    /// output was all-zeros and `kdf_rk` takes that output as its IKM.
+    /// That means an attacker who learns the root key once keeps deriving
+    /// every future key: the Double Ratchet's break-in recovery
+    /// (post-compromise security) never heals the conversation.
+    #[test]
+    fn a_low_order_dh_pub_cannot_pin_the_ratchet_step_to_the_old_root_key() {
+        let shared_root_key = [42u8; 32];
+        let low_order = PublicKey::from(LOW_ORDER_POINT);
+
+        let alice_secret = StaticSecret::random_from_rng(OsRng);
+        let bob_secret = StaticSecret::random_from_rng(OsRng);
+
+        let alice_step = compute_dh_ratchet_step(&shared_root_key, &alice_secret, &low_order);
+        let bob_step = compute_dh_ratchet_step(&shared_root_key, &bob_secret, &low_order);
+
+        match (alice_step, bob_step) {
+            // Fixed: a non-contributory ratchet step is refused.
+            (Err(_), Err(_)) => {}
+            (Ok(alice_step), Ok(bob_step)) => {
+                assert_ne!(
+                    alice_step.new_root_key, bob_step.new_root_key,
+                    "VULNERABILITY: a low-order dh_pub forced the DH output to all-zeros, so the \
+                     new root key is a pure function of the OLD root key -- break-in recovery is \
+                     defeated and anyone who ever learns the root key derives every future key"
+                );
+                assert_ne!(
+                    alice_step.new_receiving_chain_key, bob_step.new_receiving_chain_key,
+                    "VULNERABILITY: the receiving chain key is likewise determined entirely by \
+                     the old root key"
+                );
+            }
+            _ => panic!("both sides must agree on whether the step is acceptable"),
+        }
+    }
+
+    /// DRA-0038, end to end through the real decrypt path: a forged
+    /// envelope carrying a low-order `dh_pub` must be rejected and must
+    /// leave the ratchet completely untouched — the same transactional
+    /// guarantee `garbage_envelope_does_not_desync_the_ratchet` asserts
+    /// for ordinary forgeries.
+    #[test]
+    fn a_low_order_dh_pub_envelope_is_rejected_without_desyncing_the_ratchet() {
+        let (mut alice, mut bob) = matched_pair();
+
+        let envelope = alice.encrypt_payload(0, b"a real message").unwrap();
+        bob.decrypt_payload(&envelope).unwrap();
+
+        let root_before = *bob.root_key;
+        let recv_n_before = bob.recv_n;
+        let dh_remote_before = bob.dh_remote.map(|k| k.to_bytes());
+
+        let mut forged = alice.encrypt_payload(0, b"forged").unwrap();
+        forged.dh_pub = LOW_ORDER_POINT;
+
+        assert!(
+            bob.decrypt_payload(&forged).is_err(),
+            "an envelope naming a low-order dh_pub must be rejected"
+        );
+        assert_eq!(*bob.root_key, root_before, "the root key must be untouched");
+        assert_eq!(bob.recv_n, recv_n_before, "recv_n must be untouched");
+        assert_eq!(
+            bob.dh_remote.map(|k| k.to_bytes()),
+            dh_remote_before,
+            "dh_remote must be untouched"
+        );
+    }
+
+    /// The fix must not be overly strict: ordinary DH ratchet steps
+    /// between two genuine parties must keep working, and must keep
+    /// producing *different* keys for different secrets.
+    #[test]
+    fn ordinary_dh_ratchet_steps_still_succeed_and_stay_distinct() {
+        let shared_root_key = [42u8; 32];
+        let peer_secret = StaticSecret::random_from_rng(OsRng);
+        let peer_public = PublicKey::from(&peer_secret);
+
+        let alice_secret = StaticSecret::random_from_rng(OsRng);
+        let bob_secret = StaticSecret::random_from_rng(OsRng);
+
+        let alice_step = compute_dh_ratchet_step(&shared_root_key, &alice_secret, &peer_public)
+            .expect("a genuine ratchet step must still succeed");
+        let bob_step = compute_dh_ratchet_step(&shared_root_key, &bob_secret, &peer_public)
+            .expect("a genuine ratchet step must still succeed");
+
+        assert_ne!(alice_step.new_root_key, bob_step.new_root_key);
     }
 }

@@ -93,7 +93,10 @@ impl TestClient {
     pub async fn authenticate(&mut self, account: &Account) {
         let (tag, challenge): (_, AuthChallenge) = self.recv().await;
         assert_eq!(tag, FrameTag::AuthChallenge);
-        let signature = account.identity.sign(&challenge.nonce).unwrap();
+        let signature = account
+            .identity
+            .sign_auth_challenge(&challenge.nonce)
+            .unwrap();
         let identity_key = account.identity.export_public_key().unwrap();
         self.send(
             FrameTag::AuthResponse,

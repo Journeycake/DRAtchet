@@ -686,12 +686,19 @@ fn try_accept_first_contact(
         // can't derive the same root key the initiator did.
         return Ok(None);
     }
-    let root_key = x3dh::respond(
+    // DRA-0037 (`docs/DELIVERY_FAILURE_FINDINGS.md`): a first-contact
+    // attempt naming low-order X25519 points derives a root key any
+    // observer could recompute -- rejected here like every other
+    // adversarial attempt, without consuming the one-time prekey (the
+    // peek/commit split above) or touching any other local state.
+    let Ok(root_key) = x3dh::respond(
         account.identity_dh_secret(),
         account.signed_prekey_secret(),
         otp_secret_ref,
         &init_message,
-    );
+    ) else {
+        return Ok(None);
+    };
 
     let peer_fp = *fingerprint_of_public_key(&wire.initiator_identity_key).as_bytes();
     let conv_id = conversation_id(account.identity.fingerprint().as_bytes(), &peer_fp);

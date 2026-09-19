@@ -343,7 +343,8 @@ mod tests {
             bob.signed_prekey_secret(),
             otp_secret.as_ref(),
             &init.message,
-        );
+        )
+        .unwrap();
         assert_eq!(bob_root_key, init.root_key);
     }
 

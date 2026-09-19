@@ -198,7 +198,8 @@ async fn scenario_22_retrying_from_unsaved_ratchet_state_reuses_the_same_chain_p
         bob.signed_prekey_secret(),
         bob_otp_secret.as_ref(),
         &init.message,
-    );
+    )
+    .unwrap();
     let mut bob_ratchet = RatchetState::init_as_responder(
         conv_id,
         bob_root_key,
@@ -365,7 +366,8 @@ async fn scenario_14_a_crash_before_save_ratchet_does_not_lose_already_processed
         alice.signed_prekey_secret(),
         alice_otp_secret.as_ref(),
         &init.message,
-    );
+    )
+    .unwrap();
     let alice_ratchet = RatchetState::init_as_responder(
         conv_id,
         alice_root_key,

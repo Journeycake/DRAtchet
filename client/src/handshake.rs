@@ -210,12 +210,16 @@ pub fn respond(
         .used_one_time_prekey_id
         .and_then(|id| account.take_one_time_prekey_secret(id));
 
+    // DRA-0037: a pairing response naming low-order X25519 points yields a
+    // root key any observer could recompute -- refuse it rather than
+    // establishing a session whose security is entirely illusory.
     let root_key = x3dh::respond(
         account.identity_dh_secret(),
         account.signed_prekey_secret(),
         one_time_prekey_secret.as_ref(),
         &init_message,
-    );
+    )
+    .map_err(|e| e.to_string())?;
 
     let my_fp = account.identity.fingerprint();
     let peer_fp = identity::fingerprint_of_public_key(&peer_response.identity_key);

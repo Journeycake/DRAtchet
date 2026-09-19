@@ -28,6 +28,13 @@ pub enum Error {
 
     #[error("exported ratchet state is malformed: {0}")]
     MalformedExportedState(&'static str),
+
+    /// DRA-0037: a Diffie-Hellman output carried no contribution from the
+    /// private key, meaning the peer supplied a low-order X25519 point
+    /// (RFC 7748's order-8 subgroup) — the resulting root key would be
+    /// computable by anyone, so the handshake is refused outright.
+    #[error("handshake rejected: peer supplied a low-order (non-contributory) public key")]
+    NonContributoryHandshake,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

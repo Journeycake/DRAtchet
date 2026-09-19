@@ -93,11 +93,46 @@ impl Identity {
         verify_signature(signer_public_key_bytes, &message, signature_bytes)
     }
 
+    /// Sign a Signaling & Presence Service connection-auth challenge
+    /// (`SERVERS.md` §1.2).
+    ///
+    /// **DRA-0039 (`docs/DELIVERY_FAILURE_FINDINGS.md`), why this exists
+    /// instead of calling [`Identity::sign`] on the nonce directly:** the
+    /// nonce is chosen entirely by the *server*, which this project's own
+    /// threat model treats as untrusted, and `AuthChallenge::nonce` is an
+    /// unbounded `Vec<u8>`. Signing it verbatim made the client a signing
+    /// oracle: a malicious relay could send a 36-byte "nonce" shaped
+    /// exactly like [`prekey_signing_payload`]'s output and harvest a
+    /// signature that verifies as a *prekey* signature under the victim's
+    /// identity key. Both payloads are now domain-separated by a distinct,
+    /// non-prefix-colliding tag, so a signature made for one context can
+    /// never be replayed into the other.
+    pub fn sign_auth_challenge(&self, nonce: &[u8]) -> Result<Vec<u8>> {
+        self.sign(&auth_challenge_signing_payload(nonce))
+    }
+
+    /// Verify a signature produced by [`Identity::sign_auth_challenge`] —
+    /// the server side of DRA-0039's domain separation.
+    pub fn verify_auth_challenge_signature(
+        signer_public_key_bytes: &[u8],
+        nonce: &[u8],
+        signature_bytes: &[u8],
+    ) -> Result<()> {
+        verify_signature(
+            signer_public_key_bytes,
+            &auth_challenge_signing_payload(nonce),
+            signature_bytes,
+        )
+    }
+
     /// Sign an arbitrary message with this identity's key — the general-purpose
-    /// primitive `sign_prekey` is built on top of. Used directly wherever
-    /// something other than a prekey binding needs an identity signature (e.g.
-    /// the Signaling & Presence Service's connection auth handshake,
-    /// `SERVERS.md` §1.2, which signs a server-issued nonce).
+    /// primitive the domain-separated helpers above are built on.
+    ///
+    /// **Never call this on bytes a remote party chose.** Doing so turns
+    /// this identity into a signing oracle for every other context that
+    /// signs with the same key (DRA-0039). Use
+    /// [`Identity::sign_auth_challenge`] or [`Identity::sign_prekey`],
+    /// which prefix a context tag, instead.
     pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>> {
         let sig = self.signing_key.sign(message);
         Ok(sig.to_bytes().to_vec())
@@ -141,10 +176,27 @@ pub fn verify_signature(
         .map_err(|_| Error::InvalidSignature)
 }
 
+/// DRA-0039: the context tag that makes a prekey signature unusable in any
+/// other signing context. Neither this nor [`AUTH_CHALLENGE_DOMAIN_TAG`] is
+/// a prefix of the other, so no payload built with one can ever collide
+/// with a payload built with the other, whatever the caller-supplied bytes
+/// are.
+const PREKEY_DOMAIN_TAG: &[u8] = b"dratchet-prekey-signature-v1";
+/// DRA-0039: the matching tag for connection-auth challenges.
+const AUTH_CHALLENGE_DOMAIN_TAG: &[u8] = b"dratchet-auth-challenge-v1";
+
 fn prekey_signing_payload(prekey_id: u32, prekey_public: &[u8; 32]) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(4 + 32);
+    let mut msg = Vec::with_capacity(PREKEY_DOMAIN_TAG.len() + 4 + 32);
+    msg.extend_from_slice(PREKEY_DOMAIN_TAG);
     msg.extend_from_slice(&prekey_id.to_be_bytes());
     msg.extend_from_slice(prekey_public);
+    msg
+}
+
+fn auth_challenge_signing_payload(nonce: &[u8]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(AUTH_CHALLENGE_DOMAIN_TAG.len() + nonce.len());
+    msg.extend_from_slice(AUTH_CHALLENGE_DOMAIN_TAG);
+    msg.extend_from_slice(nonce);
     msg
 }
 
@@ -250,6 +302,101 @@ mod tests {
         );
         assert!(
             Identity::verify_prekey_signature(&[0u8; 32], 7, &prekey_public, &[0u8; 3]).is_err()
+        );
+    }
+
+    /// Penetration-test finding DRA-0039, the core property: a signature
+    /// the client produced for the *connection-auth* context must never
+    /// verify as a *prekey* signature.
+    ///
+    /// The attack this closes: `AuthChallenge::nonce` is an unbounded
+    /// `Vec<u8>` chosen entirely by the server, which this project's threat
+    /// model treats as untrusted, and the client used to sign it verbatim.
+    /// A malicious relay sends a 36-byte "nonce" shaped exactly like a
+    /// prekey signing payload (`prekey_id ‖ prekey_public`), harvests the
+    /// reply, and now holds a valid prekey signature under the victim's
+    /// identity key — enough to publish a bundle in the victim's name
+    /// carrying the *attacker's* keys, which the directory accepts as an
+    /// ordinary rotation because the fingerprint still matches.
+    #[test]
+    fn an_auth_challenge_signature_can_never_be_replayed_as_a_prekey_signature() {
+        let identity = Identity::generate().unwrap();
+        let public_key = identity.export_public_key().unwrap();
+
+        // The attacker's own X25519 key, and the prekey id they want it
+        // bound to.
+        let attacker_prekey_public = [0x42u8; 32];
+        let target_prekey_id: u32 = 1;
+
+        // A malicious server's "nonce": byte-for-byte a prekey signing
+        // payload, as the pre-fix code would have built it.
+        let mut malicious_nonce = Vec::new();
+        malicious_nonce.extend_from_slice(&target_prekey_id.to_be_bytes());
+        malicious_nonce.extend_from_slice(&attacker_prekey_public);
+
+        let harvested = identity.sign_auth_challenge(&malicious_nonce).unwrap();
+
+        assert!(
+            Identity::verify_prekey_signature(
+                &public_key,
+                target_prekey_id,
+                &attacker_prekey_public,
+                &harvested,
+            )
+            .is_err(),
+            "VULNERABILITY: a signature harvested from the connection-auth handshake verified as \
+             a prekey signature under this identity -- a malicious relay can mint prekey \
+             signatures for attacker-controlled keys and take over the victim's directory entry"
+        );
+    }
+
+    /// DRA-0039, the mirror property: a genuine prekey signature must not
+    /// be accepted as proof of a connection-auth challenge either.
+    #[test]
+    fn a_prekey_signature_can_never_be_replayed_as_an_auth_challenge_signature() {
+        let identity = Identity::generate().unwrap();
+        let public_key = identity.export_public_key().unwrap();
+        let prekey_public = [9u8; 32];
+        let prekey_id: u32 = 3;
+
+        let prekey_signature = identity.sign_prekey(prekey_id, &prekey_public).unwrap();
+
+        let mut nonce_the_server_would_have_issued = Vec::new();
+        nonce_the_server_would_have_issued.extend_from_slice(&prekey_id.to_be_bytes());
+        nonce_the_server_would_have_issued.extend_from_slice(&prekey_public);
+
+        assert!(
+            Identity::verify_auth_challenge_signature(
+                &public_key,
+                &nonce_the_server_would_have_issued,
+                &prekey_signature,
+            )
+            .is_err(),
+            "VULNERABILITY: a prekey signature authenticated a connection as this identity"
+        );
+    }
+
+    /// The fix must not be overly strict: both domain-separated paths must
+    /// still verify their own genuine signatures.
+    #[test]
+    fn both_domain_separated_paths_still_verify_their_own_signatures() {
+        let identity = Identity::generate().unwrap();
+        let public_key = identity.export_public_key().unwrap();
+
+        let prekey_public = [5u8; 32];
+        let prekey_signature = identity.sign_prekey(11, &prekey_public).unwrap();
+        assert!(Identity::verify_prekey_signature(
+            &public_key,
+            11,
+            &prekey_public,
+            &prekey_signature
+        )
+        .is_ok());
+
+        let nonce = [7u8; 32];
+        let auth_signature = identity.sign_auth_challenge(&nonce).unwrap();
+        assert!(
+            Identity::verify_auth_challenge_signature(&public_key, &nonce, &auth_signature).is_ok()
         );
     }
 }

@@ -54,7 +54,10 @@ impl Conn {
 
     async fn authenticate(&mut self, account: &Account) {
         let (_, challenge): (_, AuthChallenge) = self.recv().await;
-        let signature = account.identity.sign(&challenge.nonce).unwrap();
+        let signature = account
+            .identity
+            .sign_auth_challenge(&challenge.nonce)
+            .unwrap();
         let identity_key = account.identity.export_public_key().unwrap();
         self.send(
             FrameTag::AuthResponse,
@@ -205,7 +208,8 @@ async fn both_sides_exchange_routing_ids_over_the_real_server_and_converge_on_th
         bob.signed_prekey_secret(),
         bob_otp_secret.as_ref(),
         &init.message,
-    );
+    )
+    .unwrap();
     let mut bob_ratchet = RatchetState::init_as_responder(
         conv_id,
         bob_root_key,

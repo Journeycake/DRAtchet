@@ -210,7 +210,8 @@ async fn pair_new_peer(
         peer.signed_prekey_secret(),
         peer_otp_secret.as_ref(),
         &init.message,
-    );
+    )
+    .unwrap();
     let peer_ratchet = RatchetState::init_as_responder(
         conv_id,
         peer_root_key,

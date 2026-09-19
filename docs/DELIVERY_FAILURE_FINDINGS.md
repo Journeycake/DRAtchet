@@ -2449,3 +2449,229 @@ wraps the value immediately after each place it's actually produced
 minimizes but doesn't structurally eliminate this — the same caveat
 that already applies to every other `Zeroizing`-wrapped value in this
 codebase, not something specific to this fix.
+
+## DRA-0037: X3DH accepted low-order X25519 points, letting an attacker with no key material derive the session root key (penetration test round 5, data compromise — complete handshake authentication bypass; confirmed real, fixed) — **CRITICAL**
+
+Penetration-test round 5, auditing `core/src/x3dh.rs`'s Diffie-Hellman
+computations directly. `x3dh::respond` ran `diffie_hellman()` against
+`init_message.initiator_identity_dh_public` and
+`initiator_ephemeral_public` — both taken **verbatim from an
+attacker-written `X3dhInitMessage`** — with no validation of any kind on
+the resulting shared secrets.
+
+X25519 (RFC 7748) has a small subgroup of order 8. A peer who supplies a
+**low-order point** as their public key — the all-zero point being the
+simplest, and the one libsodium has blacklisted since 2016 — forces
+`diffie_hellman()` to return an **all-zero shared secret regardless of
+which private key it is called with**. Supplying low-order points for
+*both* public keys collapses dh1, dh2 and dh3 to all-zeros; dh4 runs
+against the same attacker-chosen ephemeral, so the one-time prekey is no
+protection either. The responder then derives
+`root_key = HKDF(00…0 ‖ 00…0 ‖ 00…0 [‖ 00…0])` — a value that depends on
+**nothing secret at all**, and which the attacker computes independently
+while holding no key material and learning nothing about the responder's
+secrets.
+
+That destroys X3DH's core authentication property: the root key is
+supposed to be derivable only by someone who actually holds the
+initiator's private keys. `FirstContactWire::verify_identity_binding`
+(DRA-0022's sibling check) offers no defense — an attacker signs their
+*own* low-order "DH key" with their *own* genuine identity key, so the
+binding signature verifies correctly. The one-time-prekey peek/commit
+split (DRA-0023) and the pairing-code gate (§6.4) are likewise
+unaffected by it: the attacker reaches a fully working ratchet session
+and can encrypt/decrypt ungated protocol payloads (§6.5 deliberately
+leaves routing-id announces, delivery acks and profile announces
+ungated), with only a 6-digit code standing between them and a
+`Verified` contact record. Rated **Critical**: the cryptographic barrier
+that the entire protocol's authentication rests on is removed
+completely, by an attacker who needs nothing but the victim's published
+(public) bundle.
+
+Confirmed with real tests in `core/src/x3dh.rs`'s own test module:
+`low_order_points_cannot_make_two_different_responders_derive_the_same_root_key`
+runs `respond` twice, for two responders holding **entirely different**
+identity and signed-prekey secrets, against the same low-order
+`X3dhInitMessage`. Pre-fix both derive the *identical* root key —
+conclusive proof that the responder's secrets contribute nothing, so
+anyone can compute it. `a_low_order_ephemeral_defeats_the_one_time_prekey_dh_too`
+proves dh4 doesn't help. Both are written to pass either way
+structurally, and assert the security property itself, so they fail
+loudly against the pre-fix code rather than merely failing to compile.
+
+**Fixed**: a new `reject_non_contributory` helper checks every DH output
+via `x25519_dalek::SharedSecret::was_contributory()` — the check the
+crate exposes for exactly this purpose, which this code simply never
+called — and returns the new `Error::NonContributoryHandshake`. Applied
+in `respond` (which consequently now returns `Result<[u8; 32]>`) and
+also in `initiate`, whose exposure is narrower (a fetched bundle's keys
+are signature-bound to the identity that published them) but where a
+peer is still free to *sign* a low-order key as their own, and where a
+root key any observer can recompute is never acceptable either.
+Call sites updated to treat it as a rejection, not a panic:
+`app/src/lib.rs`'s `try_accept_first_contact` returns `Ok(None)` (its
+established convention for every adversarial attempt, so nothing is
+consumed or persisted), and `client/src/handshake.rs::respond` surfaces
+it as an error.
+
+Full workspace `cargo fmt --check` / `cargo clippy --workspace
+--all-targets -- -D warnings` / `cargo test --workspace` all pass,
+including `an_ordinary_handshake_still_derives_matching_root_keys`
+(proving the fix isn't overly strict — two genuine parties still agree
+on a root key) and every pre-existing X3DH/ratchet/pairing test.
+
+**Known residual scope, stated explicitly**: `was_contributory()`
+rejects the order-1 and low-order cases that make the shared secret
+all-zeros, which is what makes this attack work. It is not a full
+prime-order-subgroup membership proof, and X25519's clamping plus the
+cofactor mean a handful of exotic non-canonical encodings can still map
+to the same point as a canonical one — none of which yields a
+predictable shared secret, so none enables this class of bypass. Per-key
+canonical-encoding validation would be a stricter belt-and-braces
+addition; it is not required to close this finding.
+
+## DRA-0038: the Double Ratchet's DH step accepted low-order points, permanently defeating break-in recovery (penetration test round 5, data compromise — post-compromise security bypass; confirmed real, fixed) — **CRITICAL**
+
+Penetration-test round 5, immediately after DRA-0037 — the same missing
+check, in a *different* code path, defeating a *different* security
+property, so it gets its own finding rather than being folded in.
+
+`ratchet::compute_dh_ratchet_step` ran `diffie_hellman()` against
+`incoming_dh` — which is `envelope.dh_pub`, taken verbatim off the wire
+— with no contributory check, on **both** of its DH calls. A low-order
+point makes both outputs all-zeros, and `kdf_rk` takes the DH output as
+its HKDF **IKM** (with the old root key as salt), so the new root key
+*and both chain keys* become a pure, deterministic function of the **old
+root key alone**.
+
+That destroys the Double Ratchet's break-in recovery — its
+post-compromise security property. A DH step is supposed to *heal* a
+conversation whose keys have leaked, precisely because the attacker
+cannot compute the fresh Diffie-Hellman. Pin every step to a low-order
+point and the healing never happens: anyone who learns the root key once
+keeps deriving every future key indefinitely, turning what should be a
+transient compromise into a permanent one. A malicious peer — a
+legitimate party to the conversation, who therefore has no trouble
+producing envelopes that authenticate — can force exactly this on a
+conversation at will, so that if the root key ever leaks (device
+seizure, backup exposure, a future implementation bug), every message
+from that point forward is readable forever.
+
+Confirmed with a real test:
+`a_low_order_dh_pub_cannot_pin_the_ratchet_step_to_the_old_root_key`
+runs `compute_dh_ratchet_step` twice with **completely different** DH
+secrets against the same low-order point and the same old root key.
+Pre-fix (verified by temporarily disabling only the new check) it fails
+with the VULNERABILITY message: both sides derive the *identical* new
+root key and receiving chain key, proving the private keys contributed
+nothing at all.
+
+**Fixed**: both `diffie_hellman` results in `compute_dh_ratchet_step`
+are now checked with `was_contributory()`, returning
+`Error::NonContributoryHandshake`; the function returns `Result`, and
+its single caller in `decrypt_raw` propagates with `?` **before** the
+commit block — preserving that method's documented transactional
+guarantee that a rejected envelope leaves the ratchet byte-for-byte
+unchanged.
+
+Verified with a second test,
+`a_low_order_dh_pub_envelope_is_rejected_without_desyncing_the_ratchet`,
+which drives the real `decrypt_payload` path with a forged low-order
+`dh_pub` and asserts the root key, `recv_n` and `dh_remote` are all
+untouched afterwards; and with
+`ordinary_dh_ratchet_steps_still_succeed_and_stay_distinct`, proving the
+fix isn't overly strict. Full `dratchet-core` suite (77 tests) and the
+full workspace suite pass.
+
+**Known residual scope, stated explicitly**: same caveat as DRA-0037 —
+`was_contributory()` catches the all-zeros cases that make this attack
+work, not full prime-order-subgroup membership. Note also that this
+finding's *exploitation* presupposes an attacker who can already produce
+authenticating envelopes (a malicious peer, or someone holding leaked
+keys); what it closes is the escalation from that position to a
+*permanent*, unhealable compromise.
+
+## DRA-0039: no domain separation between signing contexts — a malicious relay could harvest prekey signatures from the auth handshake and take over any identity (penetration test round 5, data compromise — identity takeover via cross-protocol signature reuse; confirmed real, fixed) — **CRITICAL**
+
+Penetration-test round 5, auditing `core/src/identity.rs`'s signing
+payloads. The same Ed25519 identity key signs in two different contexts,
+and **neither payload carried a domain-separation tag**:
+
+- `prekey_signing_payload(prekey_id, prekey_public)` was exactly
+  `prekey_id.to_be_bytes() ‖ prekey_public` — 36 bytes, no tag.
+- The Signaling & Presence Service's connection-auth handshake
+  (`SERVERS.md` §1.2) signed the server-issued nonce **verbatim**:
+  `client/src/net.rs` called `account.identity.sign(&challenge.nonce)`
+  directly.
+
+`AuthChallenge::nonce` is an unbounded `Vec<u8>` chosen entirely by the
+*server* — which this project's own threat model treats as untrusted
+(`docs/SERVERS.md`) — and the client never validated its length or
+content. That made every client a **signing oracle**.
+
+The attack, end to end:
+
+1. A malicious or compromised relay (or anyone MITM-ing the WebSocket)
+   sends an `AuthChallenge` whose "nonce" is a 36-byte value crafted as
+   `prekey_id ‖ attacker_x25519_public_key`.
+2. The client signs it verbatim and returns the signature, believing it
+   is authenticating a connection.
+3. That reply is **byte-for-byte a valid `sign_prekey` signature** over
+   the attacker's own key, under the victim's identity key.
+4. The attacker publishes a `PublishBundle` in the victim's name: the
+   real `identity_key` (so the fingerprint matches), but the
+   *attacker's* `signed_prekey` and — harvesting a second signature over
+   `IDENTITY_DH_SIGNATURE_ID ‖ attacker_key` the same way — the
+   attacker's `identity_dh_public`. `PrekeyBundle::verify()` passes,
+   because the signatures genuinely verify.
+5. The directory's ownership check (correctly) sees the same fingerprint
+   and treats it as an ordinary **rotation** — no proof-of-work, no
+   rejection — silently overwriting the victim's real bundle.
+6. Everyone who now fetches the victim's bundle runs X3DH against keys
+   the attacker holds the secrets for: dh1, dh2 and dh3 are all
+   attacker-controlled, so the attacker derives the root key and reads
+   and writes as the victim. Complete identity takeover and full MITM,
+   against a victim who did nothing but connect.
+
+Rated **Critical**: it requires only the relay position the threat model
+already assumes is hostile, needs no key compromise of any kind, and
+yields full impersonation of arbitrary users in the directory.
+
+Confirmed with real tests in `core/src/identity.rs`:
+`an_auth_challenge_signature_can_never_be_replayed_as_a_prekey_signature`
+builds precisely the malicious 36-byte nonce above, signs it through the
+auth path, and asserts the result does *not* verify as a prekey
+signature. `a_prekey_signature_can_never_be_replayed_as_an_auth_challenge_signature`
+asserts the mirror direction (a prekey signature must not authenticate a
+connection). Verified pre-fix by temporarily blanking only the two new
+domain tags: both fail with their VULNERABILITY messages, confirming
+the collision was real in both directions.
+
+**Fixed**: two distinct, non-prefix-colliding context tags —
+`b"dratchet-prekey-signature-v1"` and `b"dratchet-auth-challenge-v1"` —
+now prefix their respective payloads, so no payload built for one
+context can ever equal a payload built for the other, whatever bytes a
+remote party supplies. Added `Identity::sign_auth_challenge` /
+`Identity::verify_auth_challenge_signature` as the only supported way to
+sign and check a connection challenge, and documented the general
+`Identity::sign` primitive as **never to be called on bytes a remote
+party chose**. Call sites updated: `client/src/net.rs` (client side),
+`server/src/ws.rs` (server verification), and both test harnesses.
+
+Full workspace `cargo fmt --check` / `cargo clippy --workspace
+--all-targets -- -D warnings` / `cargo test --workspace` all pass,
+including `both_domain_separated_paths_still_verify_their_own_signatures`
+(proving the fix isn't overly strict).
+
+**Known residual scope, stated explicitly**: this is a **wire-format
+breaking change** in two places — prekey signatures and the auth
+handshake. Bundles published by a pre-fix client will no longer verify,
+and a pre-fix client cannot authenticate against a fixed server (or vice
+versa); every client and the relay must be upgraded together. That is
+the correct trade for a signature-forgery bypass and is acceptable
+pre-1.0 (`ARCHITECTURE.md` §9's roadmap), but it is a real migration
+cost rather than a silent drop-in. Separately, the client still does not
+bound `AuthChallenge::nonce`'s length — domain separation makes that
+harmless for *this* attack, but a length cap would be reasonable
+belt-and-braces hardening against a relay sending a needlessly enormous
+nonce.
