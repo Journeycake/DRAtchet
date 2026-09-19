@@ -212,6 +212,13 @@ async fn publish_under_candidates(
     username: &str,
     candidates: impl Iterator<Item = u16>,
 ) -> Result<OwnProfile> {
+    // DRA-0040 (`docs/DELIVERY_FAILURE_FINDINGS.md`): every republish is a
+    // chance to retire a signed prekey that's aged out. Before this, the
+    // key generated at `Account::generate` was kept forever, so the window
+    // X3DH's dh1/dh3 protect never closed.
+    if account.signed_prekey_rotation_due(now_unix()) {
+        account.rotate_signed_prekey(now_unix())?;
+    }
     let otp_publics = account.generate_one_time_prekeys(ONE_TIME_PREKEY_BATCH);
     let bundle = account.publish_bundle(false)?;
     let one_time_prekeys: Vec<OneTimePrekeyWire> = otp_publics
@@ -233,7 +240,7 @@ async fn publish_under_candidates(
             signed_prekey_id: bundle.signed_prekey.id,
             signed_prekey: bundle.signed_prekey.public.as_bytes().to_vec(),
             signed_prekey_sig: bundle.signed_prekey.signature.clone(),
-            signed_prekey_expires_at: 0,
+            signed_prekey_expires_at: account.signed_prekey_expires_at(),
             one_time_prekeys: one_time_prekeys.clone(),
             registration_pow: Some(dratchet_server::abuse::solve_registration_pow(
                 username,
@@ -389,7 +396,11 @@ pub async fn replenish_prekeys_if_low(
     let Some(existing) = db.load_own_profile()? else {
         return Ok(false);
     };
-    if own_prekey_count(conn).await? > PREKEY_REPLENISH_THRESHOLD {
+    // DRA-0040: republish when the signed prekey is due for rotation even
+    // if the one-time-prekey pool is still healthy -- otherwise a chatty
+    // account that never drains its pool would never rotate.
+    let rotation_due = account.signed_prekey_rotation_due(now_unix());
+    if !rotation_due && own_prekey_count(conn).await? > PREKEY_REPLENISH_THRESHOLD {
         return Ok(false);
     }
 
@@ -490,6 +501,18 @@ pub async fn add_contact_by_username(
     .await?;
     let (_, result): (_, BundleResult) = conn.recv().await?;
     let fetched = result.bundle.ok_or(Error::NoSuchAccount)?;
+
+    // DRA-0040: refuse a signed prekey that has outlived its published
+    // lifetime, so a directory can't keep serving one indefinitely after
+    // the owner has rotated past it. `0` means "no expiry published" (an
+    // account that predates DRA-0040) and is accepted, since rejecting it
+    // would lock out every already-published bundle; note that expiry is
+    // not covered by the bundle's signature chain, so this is protection
+    // against a *stale* directory, not a malicious one -- the malicious
+    // case is `ARCHITECTURE.md` §11.7's key-transparency gap.
+    if fetched.signed_prekey_expires_at != 0 && fetched.signed_prekey_expires_at < now_unix() {
+        return Err(Error::SignedPrekeyExpired);
+    }
 
     let core_bundle = to_core_bundle(&fetched)?;
     let init = x3dh::initiate(

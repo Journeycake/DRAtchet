@@ -2675,3 +2675,153 @@ bound `AuthChallenge::nonce`'s length — domain separation makes that
 harmless for *this* attack, but a length cap would be reasonable
 belt-and-braces hardening against a relay sending a needlessly enormous
 nonce.
+
+## DRA-0040: the signed prekey never rotated and its published expiry was hardcoded to zero — a single device seizure retroactively decrypted every degraded-mode session the account had ever established (penetration test round 6, data extraction; confirmed real, fixed) — **HIGH**
+
+Penetration-test round 6, auditing X3DH key lifetime in
+`core/src/account.rs` and `app/src/lib.rs`. Two independent halves of the
+same gap:
+
+1. **Nothing ever rotated the signed prekey.** `SignedPrekey::generate`
+   was called exactly once, from `Account::generate`, and the resulting
+   secret was then persisted and reloaded for the entire life of the
+   account. There was no rotation function anywhere in the workspace:
+
+   ```
+   $ git grep -n "rotate_signed_prekey" d2eee23 -- core app
+   (no matches)
+   ```
+
+2. **The published expiry was a literal `0`.** `app/src/lib.rs:236`
+   published `signed_prekey_expires_at: 0` on every bundle, and no
+   fetching client ever read the field back:
+
+   ```
+   $ git show d2eee23:app/src/lib.rs | grep -n "signed_prekey_expires_at"
+   236:            signed_prekey_expires_at: 0,
+   $ git show d2eee23:app/src/lib.rs | grep -n "expires_at.*now_unix"
+   (no matches)
+   ```
+
+   So the wire field existed, was always zero, and was never checked —
+   the directory could serve a signed prekey of any age indefinitely.
+
+### Why this matters
+
+X3DH derives **two of its four** Diffie-Hellman inputs from the
+responder's signed prekey: `dh1 = IK_initiator × SPK` and
+`dh3 = EK_initiator × SPK`. When no one-time prekey is available, `dh4`
+is absent entirely, so the session root key is a function of exactly two
+long-lived responder secrets — the identity DH secret and the signed
+prekey secret — both of which sit side by side in the same local account
+blob.
+
+That degraded mode is not a rare accident: an attacker can **force** it
+by draining the account's one-time-prekey pool, which `ARCHITECTURE.md`
+§11.8 already documents as reachable. Chain the two together and the
+attack is:
+
+1. Drain the victim's one-time prekeys (§11.8), so every subsequent
+   inbound handshake runs without `dh4`.
+2. Passively record the resulting ciphertext for as long as you like.
+3. At any point in the future — months, years — seize the device (or
+   exfiltrate the account blob once).
+4. Recompute `dh1` and `dh3` from the still-current signed prekey secret,
+   `dh2` from the still-current identity DH secret, and derive the root
+   key of **every** recorded degraded-mode session. Ratchet forward from
+   there and read the plaintext.
+
+Without rotation the forward-secrecy window that the signed prekey is
+supposed to bound simply never closed. One seizure reached back over the
+account's entire history.
+
+Rated **High**, not Critical: it requires a device seizure or local
+account-blob compromise (a real compromise of the victim's endpoint),
+which is a strictly stronger precondition than DRA-0037/0038/0039's
+relay-only position. Given that compromise, though, the impact is
+unbounded retroactive plaintext recovery rather than the single-session
+exposure a rotating key would have limited it to — hence High rather
+than Medium.
+
+### Confirmation
+
+`core/src/account.rs`,
+`rotating_retires_the_secret_that_would_otherwise_decrypt_every_past_session`
+demonstrates it end to end with real keys and no mocks: Bob publishes a
+bundle with `one_time_prekey: None` (the forced degraded mode), Alice
+runs a real `x3dh::initiate` against it, and the test first asserts the
+**baseline** — Bob's current secrets reproduce the recorded session's
+root key exactly, which is precisely what an attacker holding a seized
+device computes. It then rotates and asserts that the same computation
+with the post-rotation secrets no longer reproduces it, failing with
+
+> VULNERABILITY: the signed prekey never rotates, so seizing the device
+> at any point in the future recomputes the root key of every
+> degraded-mode session the account ever established — the X3DH
+> forward-secrecy window never closes
+
+Pre-fix that assertion cannot even be reached, because the API it needs
+(`rotate_signed_prekey`) did not exist in any form — the grep above is
+the pre-fix evidence, and the baseline half of the test is the proof that
+the recomputation genuinely works while the key is live.
+
+`a_never_rotated_signed_prekey_reads_as_due` covers the second half:
+every account persisted before this fix imports with
+`signed_prekey_created_at == 0` and must immediately read as overdue,
+with the negative case (a freshly rotated key is *not* due) asserted
+alongside so the predicate isn't trivially true.
+
+### Fixed
+
+`core/src/account.rs`:
+
+- `SIGNED_PREKEY_ROTATION_SECS` (7 days, matching the cadence Signal's
+  X3DH write-up recommends for the same key) and
+  `SIGNED_PREKEY_LIFETIME_SECS` (30 days). The lifetime is deliberately
+  the longer of the two so a rotation never invalidates a bundle an
+  initiator fetched moments earlier.
+- A new private `signed_prekey_created_at: u64` on `Account`, exported
+  with `#[serde(default)]` so accounts persisted before this field
+  existed still import — landing on `0`, i.e. "never rotated", which is
+  exactly the truth for them and correctly reads as due.
+- `signed_prekey_created_at()`, `signed_prekey_expires_at()`,
+  `signed_prekey_rotation_due(now)` and `rotate_signed_prekey(now)`. The
+  rotation increments the prekey id so a replacement is distinguishable
+  from the key it replaced, and re-signs it under the identity key so the
+  new bundle still passes `PrekeyBundle::verify()`.
+
+`app/src/lib.rs`:
+
+- `publish_under_candidates` rotates first if the key is due, so every
+  republish carries a fresh key once the deadline passes.
+- The published `signed_prekey_expires_at` is now the real
+  `account.signed_prekey_expires_at()` instead of `0`.
+- `replenish_prekeys_if_low` no longer short-circuits on prekey count
+  alone — it also republishes when a rotation is due, so a well-stocked
+  account that never runs low still rotates on schedule.
+- `add_contact_by_username` rejects a fetched bundle whose non-zero
+  `signed_prekey_expires_at` is in the past, with the new
+  `Error::SignedPrekeyExpired` (`app/src/error.rs`).
+
+### Known residual scope
+
+- **`signed_prekey_expires_at` is not covered by the bundle's signature
+  chain.** `PrekeyBundle::verify()` authenticates the identity key, the
+  identity DH key and the signed prekey — not the expiry, which the
+  directory could set to any value it likes. The new check therefore
+  protects against a **stale** directory (one still serving a key its
+  owner has rotated away from), not a **malicious** one, which can simply
+  advertise a far-future expiry. Defending against a directory that lies
+  about which keys belong to a user is the key-transparency gap already
+  documented in `ARCHITECTURE.md` §11.7, and is not in scope here.
+- **Rotation is driven by publish, not by a timer.** An account that goes
+  a long time without connecting does not rotate while offline; it
+  rotates on its next `publish_under_candidates` or
+  `replenish_prekeys_if_low`. The window is therefore bounded by
+  "7 days *of connectivity*", not 7 days of wall clock, for a device that
+  is rarely online.
+- **Pre-existing accounts rotate exactly once on their next publish, then
+  settle onto the 7-day cadence.** Sessions established before that first
+  rotation remain recoverable from the old secret up until it is
+  replaced — the fix bounds future exposure, it cannot retroactively
+  protect history already established under a never-rotated key.

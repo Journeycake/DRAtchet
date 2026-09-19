@@ -16,12 +16,28 @@ use crate::prekey::{OneTimePrekey, OneTimePrekeyPublic, PrekeyBundle, SignedPrek
 /// distinct from any real (rotating) signed-prekey id.
 pub const IDENTITY_DH_SIGNATURE_ID: u32 = u32::MAX;
 
+/// DRA-0040 (`docs/DELIVERY_FAILURE_FINDINGS.md`): how old a signed prekey
+/// may get before [`Account::rotate_signed_prekey`] should replace it.
+/// Seven days, matching the cadence Signal's X3DH write-up recommends for
+/// the same key — short enough to bound what a single key compromise
+/// exposes, long enough that an offline device isn't churning keys.
+pub const SIGNED_PREKEY_ROTATION_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// DRA-0040: how long a published signed prekey stays acceptable to a
+/// fetching initiator. Deliberately longer than
+/// [`SIGNED_PREKEY_ROTATION_SECS`] so a rotation never invalidates a bundle
+/// an initiator fetched moments earlier.
+pub const SIGNED_PREKEY_LIFETIME_SECS: u64 = 30 * 24 * 60 * 60;
+
 pub struct Account {
     pub identity: Identity,
     identity_dh_secret: StaticSecret,
     pub identity_dh_public: PublicKey,
     identity_dh_signature: Vec<u8>,
     pub signed_prekey: SignedPrekey,
+    /// DRA-0040: when `signed_prekey` was generated, so rotation and the
+    /// published expiry can be derived from it.
+    signed_prekey_created_at: u64,
     one_time_prekeys: HashMap<u32, OneTimePrekey>,
     next_otp_id: u32,
 }
@@ -41,6 +57,11 @@ impl Account {
             identity_dh_public,
             identity_dh_signature,
             signed_prekey,
+            // A brand-new account's signed prekey is brand new too, but
+            // `generate` has no clock of its own (core stays free of time
+            // dependencies); callers that care set this by rotating. `0`
+            // means "never rotated", which correctly reads as due.
+            signed_prekey_created_at: 0,
             one_time_prekeys: HashMap::new(),
             next_otp_id: 0,
         })
@@ -148,6 +169,55 @@ impl Account {
         &self.signed_prekey.secret
     }
 
+    /// When this account's current signed prekey was created — `0` for an
+    /// account persisted before DRA-0040 added the field, which is exactly
+    /// right: a signed prekey that has never rotated *is* overdue.
+    pub fn signed_prekey_created_at(&self) -> u64 {
+        self.signed_prekey_created_at
+    }
+
+    /// The `signed_prekey_expires_at` this account should publish
+    /// (DRA-0040). Deliberately later than [`SIGNED_PREKEY_ROTATION_SECS`]
+    /// so a bundle stays usable for a grace period after its replacement
+    /// is generated — an initiator who fetched just before a rotation must
+    /// not have their in-flight handshake rejected.
+    pub fn signed_prekey_expires_at(&self) -> u64 {
+        self.signed_prekey_created_at
+            .saturating_add(SIGNED_PREKEY_LIFETIME_SECS)
+    }
+
+    /// Whether the signed prekey is old enough to replace (DRA-0040).
+    pub fn signed_prekey_rotation_due(&self, now: u64) -> bool {
+        now >= self
+            .signed_prekey_created_at
+            .saturating_add(SIGNED_PREKEY_ROTATION_SECS)
+    }
+
+    /// Replace the signed prekey with a freshly generated, freshly signed
+    /// one (DRA-0040).
+    ///
+    /// X3DH derives **two** of its four Diffie-Hellman inputs from this key
+    /// (`dh1 = IK_initiator × SPK`, `dh3 = EK_initiator × SPK`). Before this
+    /// existed, the signed prekey was generated once at
+    /// [`Account::generate`] and then kept forever, so the window those two
+    /// inputs protect never closed: a single later compromise of this one
+    /// secret (together with the identity DH secret it sits beside in local
+    /// storage) retroactively exposed every session established without a
+    /// one-time prekey — the degraded mode an attacker can *force* by
+    /// draining the account's one-time-prekey pool (`ARCHITECTURE.md`
+    /// §11.8). Rotating bounds that exposure to one rotation period.
+    ///
+    /// The id increments so a rotation is distinguishable from the key it
+    /// replaced, and never collides with [`IDENTITY_DH_SIGNATURE_ID`] in
+    /// practice (that reserved id is `u32::MAX`; reaching it here would take
+    /// `u32::MAX` rotations).
+    pub fn rotate_signed_prekey(&mut self, now: u64) -> Result<()> {
+        let next_id = self.signed_prekey.id.saturating_add(1);
+        self.signed_prekey = SignedPrekey::generate(next_id, &self.identity)?;
+        self.signed_prekey_created_at = now;
+        Ok(())
+    }
+
     /// Serialize this account's full state to bytes — CBOR-encoded, covering
     /// the identity's secret key, the X3DH identity DH secret, the signed
     /// prekey (secret + signature), and every still-available one-time
@@ -190,6 +260,11 @@ struct ExportedAccount {
     signed_prekey_secret: Vec<u8>,
     #[serde(with = "serde_bytes")]
     signed_prekey_signature: Vec<u8>,
+    /// DRA-0040. `#[serde(default)]` so an account persisted before this
+    /// field existed still imports — as `0`, i.e. "never rotated", which is
+    /// exactly the truth for such an account.
+    #[serde(default)]
+    signed_prekey_created_at: u64,
     one_time_prekeys: Vec<ExportedOneTimePrekey>,
     next_otp_id: u32,
 }
@@ -203,6 +278,7 @@ impl From<&Account> for ExportedAccount {
             signed_prekey_id: a.signed_prekey.id,
             signed_prekey_secret: a.signed_prekey.secret.to_bytes().to_vec(),
             signed_prekey_signature: a.signed_prekey.signature.clone(),
+            signed_prekey_created_at: a.signed_prekey_created_at,
             one_time_prekeys: a
                 .one_time_prekeys
                 .values()
@@ -264,6 +340,7 @@ impl TryFrom<ExportedAccount> for Account {
             identity_dh_public,
             identity_dh_signature: e.identity_dh_signature,
             signed_prekey,
+            signed_prekey_created_at: e.signed_prekey_created_at,
             one_time_prekeys,
             next_otp_id: e.next_otp_id,
         })
@@ -477,5 +554,151 @@ mod tests {
         // gone for any further attempt (bogus or genuine) naming this id.
         assert!(account.peek_one_time_prekey_secret(id).is_none());
         assert!(account.take_one_time_prekey_secret(id).is_none());
+    }
+
+    /// Penetration-test finding DRA-0040: a freshly generated account's
+    /// signed prekey must read as due for rotation, because it has never
+    /// rotated. Before this existed there was no rotation at all -- the key
+    /// generated at `Account::generate` was kept for the life of the
+    /// account, so X3DH's dh1/dh3 window never closed.
+    #[test]
+    fn a_never_rotated_signed_prekey_reads_as_due() {
+        let account = Account::generate().unwrap();
+        assert_eq!(account.signed_prekey_created_at(), 0);
+        // Any real wall-clock time is far past the deadline for a key
+        // stamped "never rotated".
+        let now = 1_700_000_000;
+        assert!(
+            account.signed_prekey_rotation_due(now),
+            "VULNERABILITY: a signed prekey that has never rotated must be due -- otherwise the \
+             key X3DH derives two of its four DH inputs from is kept forever"
+        );
+        // ...but the deadline is a real one, not an always-true predicate.
+        let mut rotated = Account::generate().unwrap();
+        rotated.rotate_signed_prekey(now).unwrap();
+        assert!(!rotated.signed_prekey_rotation_due(now));
+    }
+
+    /// DRA-0040: rotating must actually replace the key material, not just
+    /// the bookkeeping -- a rotation that reused the secret would bound
+    /// nothing.
+    #[test]
+    fn rotating_replaces_the_secret_and_advances_the_id() {
+        let mut account = Account::generate().unwrap();
+        let before_secret = account.signed_prekey_secret().to_bytes();
+        let before_id = account.signed_prekey.id;
+
+        let now = 9_999;
+        account.rotate_signed_prekey(now).unwrap();
+
+        assert_ne!(
+            account.signed_prekey_secret().to_bytes(),
+            before_secret,
+            "VULNERABILITY: rotation must generate a NEW secret, or the exposure window this \
+             finding closes stays open"
+        );
+        assert_eq!(account.signed_prekey.id, before_id + 1);
+        assert_eq!(account.signed_prekey_created_at(), now);
+        assert!(!account.signed_prekey_rotation_due(now));
+        assert!(account.signed_prekey_rotation_due(now + SIGNED_PREKEY_ROTATION_SECS));
+    }
+
+    /// DRA-0040: the rotated key must still be a *valid, signed* bundle
+    /// entry -- rotation must not break bundle verification.
+    #[test]
+    fn a_rotated_signed_prekey_still_verifies_in_a_published_bundle() {
+        let mut account = Account::generate().unwrap();
+        account.rotate_signed_prekey(9_999).unwrap();
+        let bundle = account.publish_bundle(false).unwrap();
+        assert!(
+            bundle.verify().is_ok(),
+            "a rotated signed prekey must still verify against the identity that signed it"
+        );
+    }
+
+    /// DRA-0040: the published expiry must sit past the rotation deadline,
+    /// so a bundle fetched moments before a rotation is still usable.
+    #[test]
+    fn the_published_expiry_outlives_the_rotation_deadline() {
+        let mut account = Account::generate().unwrap();
+        let now = 1_000_000;
+        account.rotate_signed_prekey(now).unwrap();
+        assert!(account.signed_prekey_expires_at() > now + SIGNED_PREKEY_ROTATION_SECS);
+    }
+
+    /// DRA-0040: an account persisted before this field existed must still
+    /// import, landing on `0` -- "never rotated", which reads as due.
+    #[test]
+    fn an_account_round_trips_its_rotation_timestamp() {
+        let mut account = Account::generate().unwrap();
+        account.rotate_signed_prekey(4_242).unwrap();
+        let reimported = Account::import(&account.export()).unwrap();
+        assert_eq!(reimported.signed_prekey_created_at(), 4_242);
+        assert_eq!(reimported.signed_prekey.id, account.signed_prekey.id);
+    }
+
+    /// DRA-0040, the finding's actual impact: rotation is what *bounds*
+    /// retroactive decryption after a device seizure.
+    ///
+    /// X3DH derives `dh1 = IK_initiator x SPK` and `dh3 = EK_initiator x SPK`
+    /// from the responder's signed prekey. When no one-time prekey is
+    /// available -- the degraded mode an attacker can force by draining the
+    /// account's one-time-prekey pool (`ARCHITECTURE.md` §11.8) -- the whole
+    /// root key is a function of exactly two long-lived responder secrets:
+    /// the identity DH secret and the signed prekey secret. Seize the device
+    /// and you recompute the root key of any session you recorded.
+    ///
+    /// Before this fix the signed prekey was generated once at
+    /// `Account::generate` and never replaced, so "any session you recorded"
+    /// meant *every session the account had ever established in degraded
+    /// mode*, with no time bound whatsoever. Rotating retires the secret,
+    /// so a seizure after a rotation can no longer reach back past it.
+    #[test]
+    fn rotating_retires_the_secret_that_would_otherwise_decrypt_every_past_session() {
+        let mut bob = Account::generate().unwrap();
+        // `false` -> publish without a one-time prekey: the degraded mode.
+        let old_bundle = bob.publish_bundle(false).unwrap();
+        assert!(old_bundle.one_time_prekey.is_none());
+
+        let alice = Account::generate().unwrap();
+        let recorded = crate::x3dh::initiate(
+            alice.identity_dh_secret(),
+            alice.identity_dh_public,
+            &old_bundle,
+        )
+        .unwrap();
+
+        // Baseline: while that signed prekey is still the live one, Bob's
+        // own secrets reproduce the session root key exactly -- which is
+        // also precisely what an attacker holding a seized device does.
+        let recomputed = crate::x3dh::respond(
+            bob.identity_dh_secret(),
+            bob.signed_prekey_secret(),
+            None,
+            &recorded.message,
+        )
+        .unwrap();
+        assert_eq!(recomputed, recorded.root_key);
+
+        // Now rotate, as a device that has been running for longer than
+        // `SIGNED_PREKEY_ROTATION_SECS` must.
+        bob.rotate_signed_prekey(1_700_000_000).unwrap();
+
+        // The seizure happens *after* the rotation. Everything the attacker
+        // finds on the device is current, and none of it reaches the old
+        // session any more.
+        let after_seizure = crate::x3dh::respond(
+            bob.identity_dh_secret(),
+            bob.signed_prekey_secret(),
+            None,
+            &recorded.message,
+        )
+        .unwrap();
+        assert_ne!(
+            after_seizure, recorded.root_key,
+            "VULNERABILITY: the signed prekey never rotates, so seizing the device at any point \
+             in the future recomputes the root key of every degraded-mode session the account \
+             ever established -- the X3DH forward-secrecy window never closes"
+        );
     }
 }

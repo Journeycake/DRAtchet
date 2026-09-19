@@ -30,6 +30,13 @@ pub enum Error {
     #[error("no account is registered under that username")]
     NoSuchAccount,
 
+    /// `add_contact_by_username` (DRA-0040,
+    /// `docs/DELIVERY_FAILURE_FINDINGS.md`): the fetched bundle's signed
+    /// prekey is past its published expiry, so the directory is serving a
+    /// key its owner has already rotated away from.
+    #[error("that account's published signed prekey has expired")]
+    SignedPrekeyExpired,
+
     /// `confirm_pending_wipe` (DRA-0020,
     /// `docs/DELIVERY_FAILURE_FINDINGS.md`): the contact reloaded fresh
     /// from `db` doesn't actually have `wipe_request_pending` set — either
