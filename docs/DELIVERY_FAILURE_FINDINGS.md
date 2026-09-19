@@ -2825,3 +2825,119 @@ alongside so the predicate isn't trivially true.
   rotation remain recoverable from the old secret up until it is
   replaced — the fix bounds future exposure, it cannot retroactively
   protect history already established under a never-rotated key.
+
+## DRA-0041: the local database authenticated every record's *contents* but never its *location* — anyone able to write to the `.redb` file could relocate ciphertext they could not read, re-attributing messages and rolling conversations onto attacker-chosen ratchet state (penetration test round 6, data obfuscation + data compromise; confirmed real, fixed) — **HIGH**
+
+Penetration-test round 6, auditing `store/src/db.rs`'s encryption
+envelope. Every stored value is `nonce ‖ ChaCha20Poly1305(plaintext)`
+under one of three scope DEKs — correct as far as it goes, but both
+helpers passed **no associated data**:
+
+```rust
+cipher.encrypt(Nonce::from_slice(&nonce_bytes), plaintext)
+cipher.decrypt(Nonce::from_slice(nonce_bytes), ciphertext)
+```
+
+The AEAD tag therefore covered *what* a record contains and nothing about
+*where* it lives. That matters enormously here, because in this schema the
+record key carries the entire relational structure:
+
+- `message:<conversation_id>:<message_id>` — and `Message` itself has **no
+  `conversation_id` field** (`store/src/messages.rs:19`). The key is the
+  only thing that binds a message to a conversation.
+- `ratchet:<conversation_id>` — likewise the only binding between session
+  state and the conversation it drives.
+- `contact:<fingerprint>`, the wrapped-DEK records, the KDF check value —
+  same shape, same gap.
+
+So any value encrypted under a given scope DEK decrypted cleanly under
+**any other key in that same scope**. An attacker who can write to the
+database file but has no passphrase, no DEK and no ability to read a
+single byte of plaintext could still:
+
+1. **Re-attribute messages.** Copy `message:<alice>:<id>` to
+   `message:<mallory>:<id>`. The message now appears in a conversation it
+   was never part of, attributed to a different contact, with a valid
+   AEAD tag and a correct-looking `sender_is_local`. The victim's own
+   client renders it as genuine. This is message forgery against content
+   the attacker cannot read — enough to fabricate a conversation for
+   coercion, blackmail or a forensic narrative.
+2. **Force ratchet reuse.** Copy or roll back a `ratchet:<conv>` blob.
+   `RatchetState` carries the chain keys and message counters; planting
+   an old or foreign one drives the conversation back onto message
+   numbers it has already used, which means **message-key and nonce
+   reuse** in the Double Ratchet. Two ciphertexts under one key and nonce
+   leak plaintext by XOR and hand over the Poly1305 key — that path leads
+   to real plaintext recovery, not merely confusion.
+3. **Shuffle contact records.** Relocate `contact:` records within the
+   Contacts scope to move verification state, routing ids and wipe policy
+   between entries.
+
+Rated **High**, not Critical. It needs write access to the local database
+file — a synced or backed-up copy, a shared/rooted device, malware
+running without the passphrase, an evil-maid pass on a stolen-and-returned
+laptop — which is a materially stronger precondition than the relay-only
+position DRA-0037/0038/0039 assumed. But at-rest encryption exists
+precisely to make an adversary holding that file harmless, and this made
+them *not* harmless: tampering, not just reading, is part of what the
+envelope is supposed to prevent.
+
+### Confirmation
+
+Three real tests in `store/src/db.rs`, all using a `write_raw_record`
+helper that writes opaque bytes straight into the redb table — modelling
+an attacker with the file and nothing else:
+
+- `a_message_ciphertext_cannot_be_relocated_into_another_conversation`
+  saves a message in Alice's conversation, copies the raw stored bytes to
+  Mallory's conversation key, and asserts the message does not surface
+  there. Pre-fix it did, failing with the VULNERABILITY message.
+- `a_ratchet_blob_cannot_be_relocated_into_another_conversation` does the
+  same for `ratchet:<conv>`; pre-fix the foreign blob loaded cleanly.
+- `a_record_written_before_the_key_was_bound_still_reads_and_is_upgraded_in_place`
+  covers the compatibility half described below.
+
+Both relocation tests were run against the unfixed code first and failed
+with exactly their VULNERABILITY assertions; both pass after the fix,
+alongside the rest of the store suite (72 lib tests) unchanged.
+
+### Fixed
+
+`encrypt` and `decrypt` now take an `aad` parameter and pass it through
+`chacha20poly1305::aead::Payload`, and **every** call site supplies the
+record's own key: `put_encrypted`/`get_encrypted` for all three scopes,
+and `write_master_encrypted`/`read_master_encrypted` for the
+salt-adjacent bootstrap records (KDF check, wrapped DEKs). A ciphertext
+now only verifies at the exact key it was written to.
+
+Backward compatibility is handled by `decrypt_record`, which tries the
+bound interpretation and falls back to the empty AAD for a record written
+before this change — so no existing database is locked out. Crucially,
+the fallback is **not** silent: it reports that it took the legacy path,
+and both readers immediately rewrite the record in the bound format. Every
+record is upgraded the first time anything reads it, so the unbound form
+disappears with use instead of persisting as a permanently relocatable
+record.
+
+### Known residual scope
+
+- **Unread legacy records stay relocatable until read.** The upgrade is
+  on-access, not a migration pass at `open()`. A record that nothing ever
+  reads keeps its unbound ciphertext. In practice the app reads contacts
+  and the account at startup and a conversation's messages on open, so
+  the window closes quickly for anything the user actually touches — but
+  it is a window, and a scheduled migration sweep would close it fully.
+- **Binding the key prevents relocation, not rollback in place.** An
+  attacker who restores an *older copy of the same record at the same
+  key* still passes the AEAD check, because that ciphertext genuinely
+  belongs there. Defeating that needs a monotonic version or a MAC over
+  the whole database state, neither of which exists here; the
+  ratchet-reuse consequence described above is therefore reduced, not
+  eliminated. Worth tracking as its own follow-up.
+- **A tampered record now fails the whole read.** `list_messages`
+  propagates a decryption failure with `?`, so one planted junk record
+  makes that conversation's listing error rather than skipping the bad
+  entry. That is pre-existing behaviour for any corrupt record, not new
+  here, but the fix makes it reachable by deliberate tampering — a
+  local denial of service on one conversation's history, trading a
+  read failure for the much worse silent-forgery outcome it replaces.
