@@ -2401,3 +2401,51 @@ disagree.
 
 Full `ui/src-tauri` workspace `cargo fmt --check` / `cargo clippy
 --all-targets -- -D warnings` / `cargo test` all pass (10 tests).
+
+## DRA-0036: `device_passphrase` returned a bare `String`, not `Zeroizing`, unlike every other real secret this codebase holds (penetration test round 4, data extraction/compromise; confirmed real, fixed)
+
+Penetration-test round 4, a second self-follow-up reviewing this same
+round's DRA-0033 fix against this codebase's own established pattern
+for handling secrets in memory. `store/src/db.rs` wraps every real key
+it holds — `master_key`, `identity_key`, `contacts_key`, `content_key`
+— in `Zeroizing<[u8; 32]>` specifically so the backing memory is
+overwritten when the value is dropped, rather than left as ordinary
+freed heap bytes a process-memory dump (a coredump, a swapped page, a
+debugger attached to a live process) could recover intact. DRA-0033's
+new `device_passphrase` function introduced a *new* real secret — a
+per-device, high-entropy passphrase — but returned it as a bare
+`String`, with no such protection. This was harmless in the narrow
+sense that the pre-DRA-0033 code had the exact same non-zeroizing shape
+around the old hardcoded `"dev"` literal — but that was moot, since
+`"dev"` was never a secret to begin with. Once DRA-0033 made this a
+genuine unique-per-device value, the missing `Zeroizing` wrapper became
+a real, if narrower, gap: an attacker with the ability to dump this
+process's memory (a materially higher bar than DRA-0033's own
+filesystem-access threat model, but a real and distinct one) could
+potentially recover the passphrase from freed memory that was never
+scrubbed.
+
+**Fixed**: `device_passphrase` now returns `zeroize::Zeroizing<String>`
+instead of a bare `String` — `zeroize` was already a transitive
+dependency (used by `dratchet_store`) and is now a direct one for
+`ui/src-tauri` too. `run()`'s local `passphrase` binding is
+`Zeroizing<String>` throughout; `Db::open`/`Db::create` still take
+`&str`, so the call sites are unchanged (`Zeroizing<String>` derefs to
+`String` derefs to `str`).
+
+Full `ui/src-tauri` workspace `cargo fmt --check` / `cargo clippy
+--all-targets -- -D warnings` / `cargo test` all pass, including the
+three existing DRA-0033 tests updated to compare through
+`Zeroizing`'s `Deref` (`.as_str()`) where needed.
+
+**Known residual scope, stated explicitly**: `Zeroizing` scrubs its
+*own* backing buffer on drop, but doesn't prevent every possible
+leak — a `String` that gets reallocated/copied internally (e.g. by
+`format!`, cloning, or an intermediate `.to_string()`) before being
+wrapped can leave a stray, non-zeroized copy of the same bytes
+elsewhere in memory until that page is reused. `device_passphrase`
+wraps the value immediately after each place it's actually produced
+(the hex-formatted random bytes, and the trimmed keyfile read), which
+minimizes but doesn't structurally eliminate this — the same caveat
+that already applies to every other `Zeroizing`-wrapped value in this
+codebase, not something specific to this fix.

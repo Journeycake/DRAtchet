@@ -4893,6 +4893,7 @@ dependencies = [
  "tauri-plugin-opener",
  "tempfile",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

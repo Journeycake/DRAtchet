@@ -808,18 +808,30 @@ fn device_passphrase_path(db_path: &std::path::Path) -> std::path::PathBuf {
     db_path.with_extension("keyfile")
 }
 
-fn device_passphrase(db_path: &std::path::Path) -> String {
+/// DRA-0036 (`docs/DELIVERY_FAILURE_FINDINGS.md`): returns `Zeroizing<String>`,
+/// not a plain `String` -- every other real secret this codebase holds in
+/// memory (`store::db`'s `master_key`/`identity_key`/`contacts_key`/
+/// `content_key`) is wrapped the same way specifically so the backing
+/// memory is overwritten on drop rather than left as ordinary freed
+/// heap/stack bytes a process-memory dump could recover. Before this fix,
+/// `device_passphrase` returned a bare `String` -- harmless while the
+/// value was the constant `"dev"` (DRA-0033's own pre-fix state), but a
+/// real gap once this function started returning a genuine, unique
+/// per-device secret: this was a live loose end DRA-0033 itself left
+/// behind, caught reviewing that fix's own memory-handling discipline
+/// against the rest of this codebase's established pattern.
+fn device_passphrase(db_path: &std::path::Path) -> zeroize::Zeroizing<String> {
     let keyfile_path = device_passphrase_path(db_path);
     if let Ok(existing) = std::fs::read_to_string(&keyfile_path) {
         let trimmed = existing.trim();
         if !trimmed.is_empty() {
-            return trimmed.to_string();
+            return zeroize::Zeroizing::new(trimmed.to_string());
         }
     }
     let random_bytes = dratchet_client::handshake::random_routing_id();
     let passphrase: String = random_bytes.iter().map(|b| format!("{b:02x}")).collect();
     let _ = std::fs::write(&keyfile_path, &passphrase);
-    passphrase
+    zeroize::Zeroizing::new(passphrase)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1105,7 +1117,8 @@ mod tests {
         let db_path = dir.path().join("a.redb");
         let passphrase = device_passphrase(&db_path);
         assert_ne!(
-            passphrase, "dev",
+            passphrase.as_str(),
+            "dev",
             "VULNERABILITY: the local database's encryption passphrase must not be the fixed, \
              publicly-known literal every installation previously shared -- that provides zero \
              actual confidentiality for Argon2id/ChaCha20Poly1305 encryption-at-rest"
