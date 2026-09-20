@@ -3021,3 +3021,95 @@ it. The test asserts that too.
   general principle — a sender-chosen value inside its own AAD is not
   validated merely by being authenticated — applies to any field added
   to this header in future.
+
+## DRA-0043: the peer-to-peer `ProfileAnnounce` path never bounded an announced username's length, so DRA-0019's 64-byte cap applied only to the directory (penetration test round 6, denial of service + data obfuscation; confirmed real, fixed) — **MEDIUM**
+
+Penetration-test round 6, auditing the two places a `username#NNNN`
+handle is accepted from an untrusted party. `core/src/username.rs`'s own
+module doc names them explicitly — `server/src/ws.rs`'s `publish_bundle`
+(a fresh directory registration) and `store/src/profile.rs`'s
+`record_peer_profile` (a peer announcing their handle directly over
+`PAYLOAD_PROFILE_ANNOUNCE`) — and says the shared module exists "so the
+two enforcement points can't drift apart."
+
+They had drifted. Two checks guard a registration at the directory:
+
+```rust
+if wire.username.len() > crate::state::MAX_USERNAME_LEN { ... }   // DRA-0019
+if !username_has_only_allowed_characters(&wire.username) { ... }  // DRA-0024
+```
+
+Only the second had a counterpart on the peer-to-peer path. DRA-0025
+brought the character allowlist across; **DRA-0019's length cap was never
+mirrored**, and `ProfileAnnounce::decode` validates nothing at all
+(`core/src/payload.rs:344` is a bare `ciborium::from_reader`). So the
+only bound on an announced handle was the transport's 1 MiB frame cap
+(DRA-0030).
+
+The character allowlist is no help here, which is the point: a megabyte
+of `a` is entirely well-formed ASCII and sails straight through it,
+through DRA-0016's exact-match collision check (nothing else is called
+that), and into `db.save_contact`. A contact could therefore:
+
+- **Bloat the contact record**, persisted and re-read on every listing,
+  with a handle three orders of magnitude past what the directory path
+  accepts — and re-announce a *different* long handle repeatedly, each
+  one registering as `changed` and rewriting the record.
+- **Flood the UI.** `app/src/lib.rs`'s `ProfileChangeNotice` carries
+  `old_handle` and `new_handle` straight to a toast, and the handle is
+  rendered in the contact list and every conversation header. A
+  megabyte-long name in those positions is a denial of service against
+  the interface, not a cosmetic issue.
+
+Rated **Medium**: it takes an established session with the victim (so
+not remotely reachable by an arbitrary party the way DRA-0019's
+directory variant was), and there is no confidentiality impact — but the
+effect is persisted, attacker-chosen, repeatable, and lands directly in
+the interface the user relies on to tell contacts apart.
+
+### Confirmation
+
+`store/src/profile.rs`,
+`record_peer_profile_refuses_an_overlong_announced_username`: asserts
+first that the oversized handle *does* clear the DRA-0025 allowlist on
+its own (so the test is exercising the missing length check, not the
+character one), then announces it and requires the contact to keep its
+previous handle. Verified pre-fix by reverting only the new call back to
+`has_only_allowed_characters`, which fails with
+
+> VULNERABILITY: an announced username past the length the directory path
+> enforces was accepted over the peer-to-peer path
+
+`record_peer_profile_still_accepts_a_username_exactly_at_the_limit`
+pins the boundary down as a real limit rather than a blanket refusal, and
+`core/src/username.rs`'s
+`is_acceptable_rejects_an_overlong_but_otherwise_well_formed_handle`
+covers the predicate itself.
+
+### Fixed
+
+The cap moves to where the shared floor already lives:
+`dratchet_core::username::MAX_LEN` (64, the value DRA-0019 chose), plus
+`is_acceptable(username)` = within `MAX_LEN` **and** drawn only from the
+allowed characters. `record_peer_profile` now calls `is_acceptable`,
+declining exactly as it already declined a homograph — no error, no batch
+abort, the contact simply keeps whatever it displayed before.
+`server::state::MAX_USERNAME_LEN` is redefined as
+`dratchet_core::username::MAX_LEN`, so the directory path and the
+peer-to-peer path now read the same constant and cannot drift again.
+
+### Known residual scope
+
+- **`ProfileAnnounce::decode` still validates nothing.** The fix is at
+  the storage boundary, not the parse boundary, matching where the
+  existing checks live. A future consumer that decodes a
+  `ProfileAnnounce` without going through `record_peer_profile` would not
+  inherit the check — the same shape of gap this finding is about.
+- **Announce rate is still unbounded.** Nothing limits how often a
+  contact may announce; `ARCHITECTURE.md` §10 already tracks a
+  `ProfileAnnounce` rate limit as an open decision. The length cap
+  reduces the cost of each announce by ~16000x but does not bound their
+  number.
+- **The 64-byte ceiling is inherited, not re-derived.** It is DRA-0019's
+  choice for the directory, adopted here for consistency; nothing in this
+  finding re-examines whether 64 is the right number.

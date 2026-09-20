@@ -73,12 +73,21 @@ impl Db {
         // below never catches it, yet visually indistinguishable in the
         // UI. Declined the same way as a collision: no error, no batch
         // abort, this contact just keeps whatever it displayed before.
-        if !dratchet_core::username::has_only_allowed_characters(&username) {
+        //
+        // DRA-0043: the same call now also enforces
+        // `dratchet_core::username::MAX_LEN`, which DRA-0019 had put on
+        // the directory path alone. Nothing here previously bounded an
+        // announced handle's *length* at all, so a contact could announce
+        // one limited only by the transport's 1 MiB frame cap -- entirely
+        // well-formed ASCII, so the character allowlist waved it through
+        // -- and have it persisted into their contact record and rendered
+        // in every conversation header.
+        if !dratchet_core::username::is_acceptable(&username) {
             tracing::warn!(
                 fingerprint = %crate::db::hex(fingerprint),
-                username,
+                username_len = username.len(),
                 discriminator,
-                "rejected a ProfileAnnounce with a non-ASCII or empty username",
+                "rejected a ProfileAnnounce with an empty, overlong, or non-ASCII username",
             );
             return Ok((contact, false));
         }
@@ -327,6 +336,61 @@ mod tests {
 
         let real_carol_reloaded = db.load_contact(&real_carol.fingerprint).unwrap().unwrap();
         assert_eq!(real_carol_reloaded.username.as_deref(), Some("carol"));
+    }
+
+    /// Penetration-test finding DRA-0043: DRA-0019 capped a username's
+    /// length at the directory-registration path
+    /// (`server::ws::publish_bundle`, 64 bytes) but nothing capped it on
+    /// this peer-to-peer one. A contact could therefore announce a handle
+    /// bounded only by the transport's 1 MiB frame cap and have it
+    /// persisted into their contact record and rendered in the UI. The
+    /// DRA-0025 character allowlist is no defense here: a megabyte of `a`
+    /// is perfectly well-formed ASCII.
+    #[test]
+    fn record_peer_profile_refuses_an_overlong_announced_username() {
+        let db = temp_db();
+        let contact = sample_contact(Some("bob"), Some(1490));
+        db.save_contact(&contact).unwrap();
+
+        // Well within what the 1 MiB transport cap allows through, and
+        // entirely inside the allowed character set.
+        let overlong = "a".repeat(dratchet_core::username::MAX_LEN + 1);
+        assert!(dratchet_core::username::has_only_allowed_characters(
+            &overlong
+        ));
+
+        let (updated, changed) = db
+            .record_peer_profile(&contact.fingerprint, overlong.clone(), 1490)
+            .unwrap();
+        assert!(
+            !changed,
+            "VULNERABILITY: an announced username past the length the directory path enforces \
+             was accepted over the peer-to-peer path"
+        );
+        assert_eq!(
+            updated.username.as_deref(),
+            Some("bob"),
+            "the contact must keep whatever handle it displayed before"
+        );
+
+        let reloaded = db.load_contact(&contact.fingerprint).unwrap().unwrap();
+        assert_eq!(reloaded.username.as_deref(), Some("bob"));
+    }
+
+    /// The cap must be a real boundary, not a blanket refusal: a handle
+    /// exactly at the limit is still a legitimate rename.
+    #[test]
+    fn record_peer_profile_still_accepts_a_username_exactly_at_the_limit() {
+        let db = temp_db();
+        let contact = sample_contact(Some("bob"), Some(1490));
+        db.save_contact(&contact).unwrap();
+
+        let at_limit = "a".repeat(dratchet_core::username::MAX_LEN);
+        let (updated, changed) = db
+            .record_peer_profile(&contact.fingerprint, at_limit.clone(), 1490)
+            .unwrap();
+        assert!(changed);
+        assert_eq!(updated.username.as_deref(), Some(at_limit.as_str()));
     }
 
     /// The fix must not block a genuine, non-colliding rename — only an

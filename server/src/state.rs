@@ -71,7 +71,7 @@ pub const MAX_ONE_TIME_PREKEYS_PER_PUBLISH: usize = 100;
 /// handle (`ARCHITECTURE.md` §6.1 shows short, ordinary handles) while
 /// bounding how much one publish can add to the same never-pruned
 /// directory.
-pub const MAX_USERNAME_LEN: usize = 64;
+pub const MAX_USERNAME_LEN: usize = dratchet_core::username::MAX_LEN;
 
 /// DRA-0024 (`docs/DELIVERY_FAILURE_FINDINGS.md`) — a narrow, ASCII-only
 /// floor against Unicode homograph/confusables impersonation, enforced in
