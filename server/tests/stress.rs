@@ -19,6 +19,27 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Barrier;
 
+/// DRA-0045: a rendezvous offer now answers with either an `Ack` (relayed)
+/// or an `Error` (refused by the rate limiter). Returns whether it
+/// relayed, skipping the peer pushes that arrive on this same socket.
+async fn recv_ack_or_rate_limit_refusal(client: &mut TestClient) -> bool {
+    loop {
+        let raw = client.recv_raw().await;
+        let (tag, body) = split_tag(&raw).expect("valid frame from the server");
+        match tag {
+            FrameTag::Ack => {
+                let ack: Ack = decode_body(body).expect("Ack decodes");
+                return ack.ok;
+            }
+            FrameTag::Error => return false,
+            FrameTag::RendezvousOffer | FrameTag::RendezvousAnswer | FrameTag::PresenceUpdate => {
+                continue
+            }
+            other => panic!("unexpected frame tag {other:?} while waiting for a rendezvous reply"),
+        }
+    }
+}
+
 const CLIENT_COUNT: usize = 40;
 const ITERATIONS_PER_CLIENT: usize = 15;
 
@@ -164,7 +185,14 @@ async fn many_concurrent_clients_publish_fetch_mailbox_presence_rendezvous_witho
                 ops += 1;
 
                 // 3. Rendezvous offer to the (already-authenticated,
-                //    still-connected) ring neighbor — must always relay.
+                //    still-connected) ring neighbor. The bundle fetch
+                //    above supplies DRA-0045's required fetch evidence, so
+                //    the relay is authorized — but DRA-0045 also meters
+                //    it, and this loop deliberately fires far faster than
+                //    any human places calls. The first
+                //    `RENDEZVOUS_RATE_LIMIT_CAPACITY` offers must relay;
+                //    past that, a refusal is the limiter working, not a
+                //    failure.
                 client
                     .send(
                         FrameTag::RendezvousOffer,
@@ -175,11 +203,16 @@ async fn many_concurrent_clients_publish_fetch_mailbox_presence_rendezvous_witho
                         },
                     )
                     .await;
-                let ack: Ack = client.recv_skip_pushes(FrameTag::Ack).await;
-                assert!(
-                    ack.ok,
-                    "client {i} iter {iter}: peer is online, rendezvous must relay"
-                );
+                let within_budget =
+                    iter < dratchet_server::abuse::RENDEZVOUS_RATE_LIMIT_CAPACITY as usize;
+                let relayed = recv_ack_or_rate_limit_refusal(&mut client).await;
+                if within_budget {
+                    assert!(
+                        relayed,
+                        "client {i} iter {iter}: peer is online and within the rendezvous \
+                         budget, so this offer must relay"
+                    );
+                }
                 ops += 1;
             }
 

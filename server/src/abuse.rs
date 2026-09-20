@@ -188,6 +188,61 @@ impl NewMailboxRateLimiter {
     }
 }
 
+/// DRA-0045 (`docs/DELIVERY_FAILURE_FINDINGS.md`) — gates how fast one
+/// identity may have the server relay `RendezvousOffer`/`RendezvousAnswer`
+/// frames at other clients.
+///
+/// Unlike every other client-supplied payload this server handles, a
+/// relayed rendezvous frame is pushed straight into *another* client's
+/// outbound queue, so its cost lands on a third party rather than on the
+/// sender. DRA-0026 bounded one frame's size; this bounds their rate.
+/// Keyed by the *sender*, not by the (sender, target) pair, so an
+/// attacker cannot buy fresh budget simply by spreading the flood across
+/// many victims.
+#[derive(Default)]
+pub struct RendezvousRateLimiter {
+    buckets: HashMap<Fingerprint, RateBucket>,
+}
+
+/// Burst capacity. A real WebRTC negotiation is one offer and one answer,
+/// plus a retry or two if the first attempt is missed; this is generous
+/// headroom for a user placing several calls in a row.
+pub const RENDEZVOUS_RATE_LIMIT_CAPACITY: f64 = 10.0;
+/// Refill rate: one additional relayed frame every 5 seconds. Calls are a
+/// human-paced action, so this is far slower than `FetchBundle`'s budget
+/// while still never getting in a real caller's way.
+const RENDEZVOUS_RATE_LIMIT_REFILL_PER_SEC: f64 = 1.0 / 5.0;
+
+impl RendezvousRateLimiter {
+    /// Returns `true` (and consumes one token) if `sender` may have one
+    /// more frame relayed on its behalf right now.
+    pub fn allow(&mut self, sender: Fingerprint) -> bool {
+        let now = Instant::now();
+        let bucket = self.buckets.entry(sender).or_insert_with(|| RateBucket {
+            tokens: RENDEZVOUS_RATE_LIMIT_CAPACITY,
+            last_refill: now,
+        });
+        let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * RENDEZVOUS_RATE_LIMIT_REFILL_PER_SEC)
+            .min(RENDEZVOUS_RATE_LIMIT_CAPACITY);
+        bucket.last_refill = now;
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Same reasoning as the other two limiters' `sweep_stale`.
+    pub fn sweep_stale(&mut self, older_than: std::time::Duration, now: Instant) -> usize {
+        let before = self.buckets.len();
+        self.buckets
+            .retain(|_, bucket| now.duration_since(bucket.last_refill) < older_than);
+        before - self.buckets.len()
+    }
+}
+
 /// How many leading zero bits a solution's hash must have. ~2^12 average
 /// hash attempts to find one — sub-millisecond for a legitimate client
 /// registering one username, but a real (if deliberately modest, per the

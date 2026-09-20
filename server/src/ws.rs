@@ -102,7 +102,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let _count_guard = ConnectionCountGuard(state.clone());
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(crate::state::MAX_QUEUED_OUTBOUND_FRAMES);
 
     let send_task = tokio::spawn(async move {
         while let Some(bytes) = rx.recv().await {
@@ -113,7 +113,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     });
 
     let nonce = random_32();
-    let _ = tx.send(encode(
+    let _ = tx.try_send(encode(
         FrameTag::AuthChallenge,
         &AuthChallenge {
             nonce: nonce.to_vec(),
@@ -149,7 +149,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             Ok(t) => t,
             Err(e) => {
                 debug!("malformed frame from client: {e}");
-                let _ = tx.send(encode(
+                let _ = tx.try_send(encode(
                     FrameTag::Error,
                     &ErrorFrame {
                         message: e.to_string(),
@@ -171,7 +171,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         )
         .await
         {
-            let _ = tx.send(encode(
+            let _ = tx.try_send(encode(
                 FrameTag::Error,
                 &ErrorFrame {
                     message: e.to_string(),
@@ -212,7 +212,7 @@ async fn dispatch(
     tag: FrameTag,
     body: &[u8],
     state: &Arc<AppState>,
-    tx: &mpsc::UnboundedSender<Vec<u8>>,
+    tx: &mpsc::Sender<Vec<u8>>,
     nonce: &[u8; 32],
     connection_id: ConnectionId,
     authenticated: &mut Option<Fingerprint>,
@@ -254,7 +254,7 @@ async fn dispatch(
                 inner.connections.insert(fp, tx.clone());
                 inner.subscriptions.get(&fp).cloned().unwrap_or_default()
             };
-            let _ = tx.send(encode(FrameTag::Ack, &Ack { ok: true }));
+            let _ = tx.try_send(encode(FrameTag::Ack, &Ack { ok: true }));
             notify_presence(state, fp, PresenceState::Online, &subscribers).await;
             Ok(())
         }
@@ -270,14 +270,14 @@ async fn dispatch(
             // made that undetectable; every existing test either doesn't
             // check for a response or only checks a later `FetchBundle`, so
             // this is purely additive.
-            let _ = tx.send(encode(FrameTag::Ack, &Ack { ok: true }));
+            let _ = tx.try_send(encode(FrameTag::Ack, &Ack { ok: true }));
             Ok(())
         }
 
         FrameTag::FetchBundle => {
             let req: FetchBundle = decode_body(body)?;
             let result = fetch_bundle(state, &req, *authenticated, connection_id).await?;
-            let _ = tx.send(encode(FrameTag::BundleResult, &result));
+            let _ = tx.try_send(encode(FrameTag::BundleResult, &result));
             Ok(())
         }
 
@@ -325,7 +325,7 @@ async fn dispatch(
 
             if let Some(state_now) = current {
                 let (state_byte, last_seen) = presence_wire(state_now);
-                let _ = tx.send(encode(
+                let _ = tx.try_send(encode(
                     FrameTag::PresenceUpdate,
                     &PresenceUpdate {
                         identity_fingerprint: target.to_vec(),
@@ -341,6 +341,7 @@ async fn dispatch(
             let from = authenticated.ok_or(Error::AuthRequired)?;
             let req: RendezvousOffer = decode_body(body)?;
             validate_rendezvous_payload(&req.sdp_offer, &req.ice_candidates)?;
+            authorize_rendezvous(state, from, &req.peer_fingerprint).await?;
             let relayed = encode(
                 FrameTag::RendezvousOffer,
                 &RendezvousOffer {
@@ -356,6 +357,7 @@ async fn dispatch(
             let from = authenticated.ok_or(Error::AuthRequired)?;
             let req: RendezvousAnswer = decode_body(body)?;
             validate_rendezvous_payload(&req.sdp_answer, &req.ice_candidates)?;
+            authorize_rendezvous(state, from, &req.peer_fingerprint).await?;
             let relayed = encode(
                 FrameTag::RendezvousAnswer,
                 &RendezvousAnswer {
@@ -412,7 +414,7 @@ async fn dispatch(
             }
             entries.push(entry);
             drop(inner);
-            let _ = tx.send(encode(FrameTag::Ack, &Ack { ok: true }));
+            let _ = tx.try_send(encode(FrameTag::Ack, &Ack { ok: true }));
             Ok(())
         }
 
@@ -428,24 +430,39 @@ async fn dispatch(
             if mailbox_id_belongs_to_someone_else(&inner, &mailbox_id, &fetcher) {
                 return Err(Error::NotMailboxOwner);
             }
-            let entries = inner.mailboxes.entry(mailbox_id).or_default();
-            prune_expired(entries);
-            // `ARCHITECTURE.md` §11.1: this mailbox is bidirectional — both
-            // sides of a pairing write to and fetch from the identical
-            // address, so without this a fetcher would get its own
-            // not-yet-collected entries handed back to it (see
-            // `MailboxEntry::written_by`'s doc for what that silently
-            // breaks).
-            let wire_entries: Vec<MailboxEntryWire> = entries
-                .iter()
-                .filter(|e| e.written_by != fetcher)
-                .map(|e| MailboxEntryWire {
-                    entry_id: e.entry_id.to_vec(),
-                    envelope: e.envelope.clone(),
-                })
-                .collect();
+            // DRA-0046 (`docs/DELIVERY_FAILURE_FINDINGS.md`): `get_mut`,
+            // never `entry(..).or_default()`. `or_default()` *inserts*,
+            // so fetching used to create the very mailbox it was asking
+            // about — for any 16-byte id the caller invented. Originating
+            // a mailbox id is exactly what DRA-0018's
+            // `NewMailboxRateLimiter` meters on `MailboxWrite`, and
+            // `MailboxFetch` has no rate limit at all, so the read path
+            // was the cheapest way to allocate the state the write path's
+            // limiter exists to bound. A fetch of a mailbox that doesn't
+            // exist now simply returns nothing, which is what it always
+            // reported anyway.
+            let wire_entries: Vec<MailboxEntryWire> = match inner.mailboxes.get_mut(&mailbox_id) {
+                Some(entries) => {
+                    prune_expired(entries);
+                    // `ARCHITECTURE.md` §11.1: this mailbox is
+                    // bidirectional — both sides of a pairing write to and
+                    // fetch from the identical address, so without this a
+                    // fetcher would get its own not-yet-collected entries
+                    // handed back to it (see `MailboxEntry::written_by`'s
+                    // doc for what that silently breaks).
+                    entries
+                        .iter()
+                        .filter(|e| e.written_by != fetcher)
+                        .map(|e| MailboxEntryWire {
+                            entry_id: e.entry_id.to_vec(),
+                            envelope: e.envelope.clone(),
+                        })
+                        .collect()
+                }
+                None => Vec::new(),
+            };
             drop(inner);
-            let _ = tx.send(encode(
+            let _ = tx.try_send(encode(
                 FrameTag::MailboxEntries,
                 &MailboxEntries {
                     entries: wire_entries,
@@ -475,7 +492,7 @@ async fn dispatch(
                 entries.retain(|e| e.entry_id != entry_id);
             }
             drop(inner);
-            let _ = tx.send(encode(FrameTag::Ack, &Ack { ok: true }));
+            let _ = tx.try_send(encode(FrameTag::Ack, &Ack { ok: true }));
             Ok(())
         }
 
@@ -489,7 +506,7 @@ async fn dispatch(
                 .map(|stored| stored.one_time_prekeys.len() as u32)
                 .unwrap_or(0);
             drop(inner);
-            let _ = tx.send(encode(
+            let _ = tx.try_send(encode(
                 FrameTag::OwnPrekeyCount,
                 &OwnPrekeyCount { remaining },
             ));
@@ -774,6 +791,49 @@ fn validate_rendezvous_payload(sdp: &str, ice_candidates: &[String]) -> Result<(
     Ok(())
 }
 
+/// DRA-0045 (`docs/DELIVERY_FAILURE_FINDINGS.md`): may `from` have the
+/// server relay a rendezvous frame at `peer_fingerprint` right now?
+///
+/// Two gates, both of which the relay previously lacked entirely — its
+/// own doc comment on [`validate_rendezvous_payload`] recorded the gap as
+/// "no relationship check and no rate limit either".
+///
+/// 1. **Relationship.** The sender must have fetched the target's bundle,
+///    exactly the evidence `PresenceSubscribe` already requires
+///    (`SERVERS.md` §1.3's "only for accounts it has an established or
+///    attempted session with"). Any real caller has done this: a bundle
+///    fetch is how you obtain the keys to establish the session a call
+///    runs over in the first place. A stranger who knows only a public
+///    fingerprint has not.
+/// 2. **Rate.** Even a real peer is metered, because a relayed frame
+///    costs the *target*, not the sender — see
+///    `abuse::RendezvousRateLimiter`.
+///
+/// Checked before `relay_to_peer` so a refused frame never touches the
+/// target's outbound channel at all.
+async fn authorize_rendezvous(
+    state: &Arc<AppState>,
+    from: Fingerprint,
+    peer_fingerprint: &[u8],
+) -> Result<()> {
+    let target: Fingerprint = peer_fingerprint
+        .try_into()
+        .map_err(|_| Error::MalformedFrame("peer_fingerprint must be 32 bytes"))?;
+
+    let mut inner = state.inner.write().await;
+    let has_evidence = inner
+        .fetch_evidence
+        .get(&from)
+        .is_some_and(|fetched| fetched.contains(&target));
+    if !has_evidence {
+        return Err(Error::AuthRequired);
+    }
+    if !inner.rendezvous_rate_limiter.allow(from) {
+        return Err(Error::RateLimited);
+    }
+    Ok(())
+}
+
 /// Deliver an already-built frame to `to`'s live connection, if it has one —
 /// rendezvous is direct relay-while-online only, with no store-and-forward
 /// (that's what the Tier 1 mailbox is for). Acks the *original* sender with
@@ -781,7 +841,7 @@ fn validate_rendezvous_payload(sdp: &str, ice_candidates: &[String]) -> Result<(
 async fn relay_to_peer(
     state: &Arc<AppState>,
     to: &[u8],
-    original_sender_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    original_sender_tx: &mpsc::Sender<Vec<u8>>,
     frame: Vec<u8>,
 ) -> Result<()> {
     let to_fp: Fingerprint = to
@@ -789,11 +849,11 @@ async fn relay_to_peer(
         .map_err(|_| Error::MalformedFrame("peer_fingerprint must be 32 bytes"))?;
     let inner = state.inner.read().await;
     let sent = match inner.connections.get(&to_fp) {
-        Some(peer_tx) => peer_tx.send(frame).is_ok(),
+        Some(peer_tx) => peer_tx.try_send(frame).is_ok(),
         None => false,
     };
     drop(inner);
-    let _ = original_sender_tx.send(encode(FrameTag::Ack, &Ack { ok: sent }));
+    let _ = original_sender_tx.try_send(encode(FrameTag::Ack, &Ack { ok: sent }));
     Ok(())
 }
 
@@ -818,7 +878,7 @@ async fn notify_presence(
     let inner = state.inner.read().await;
     for sub in subscribers {
         if let Some(sub_tx) = inner.connections.get(sub) {
-            let _ = sub_tx.send(frame.clone());
+            let _ = sub_tx.try_send(frame.clone());
         }
     }
 }

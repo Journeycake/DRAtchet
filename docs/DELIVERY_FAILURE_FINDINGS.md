@@ -3113,3 +3113,277 @@ peer-to-peer path now read the same constant and cannot drift again.
 - **The 64-byte ceiling is inherited, not re-derived.** It is DRA-0019's
   choice for the directory, adopted here for consistency; nothing in this
   finding re-examines whether 64 is the right number.
+
+## DRA-0044: per-identity server state only ever grew, and minting identities is free — a throwaway-identity flood exhausted server memory permanently (penetration test round 7, denial of service; confirmed real, fixed) — **HIGH**
+
+Penetration-test round 7, auditing what an authenticated client leaves
+behind on the Signaling & Presence Service. Three of `Inner`'s maps are
+keyed by identity and, before this, were only ever inserted into:
+
+- **`presence`** — `ws.rs` writes `Online` on every successful
+  authentication, then `Offline { last_seen }` again on every disconnect.
+- **`fetch_evidence`** — written by every `FetchBundle`, keyed by the
+  *fetcher*.
+- **`subscriptions`** — the subscriber *sets* inside it, keyed by target
+  but filled with attacker-chosen subscriber fingerprints.
+
+`pruning.rs`'s module doc stated the position explicitly: "`presence`,
+`subscriptions`, and `fetch_evidence` are never touched here."
+
+The problem is what authentication costs. It is one locally generated
+Ed25519 keypair and one signature over the server's nonce — **no
+registration, no proof-of-work, no directory entry, nothing an attacker
+must ask anyone for**. So:
+
+1. Connect, authenticate as a brand-new fingerprint, disconnect.
+2. That fingerprint now owns a permanent `presence` entry.
+3. Repeat forever with fresh keys.
+
+DRA-0031's connection cap bounds how many sockets are open *at once*; it
+says nothing about sequential reconnects. Worse, every fresh identity
+also gets fresh `FetchRateLimiter` and `NewMailboxRateLimiter` buckets,
+so per-identity throttling is exactly what this defeats.
+
+The subscriber-set half is the sharpest, because it is not only storage:
+`ws.rs` clones the whole subscriber set on **every** presence change of
+the target (`inner.subscriptions.get(&fp).cloned()` — on authenticate, on
+disconnect, and on every `PresenceAnnounce`). Pile up dead watchers on
+one victim and each of that victim's ordinary state changes becomes
+proportionally more expensive, indefinitely.
+
+And the retained state was *unreadable* the whole time:
+`PresenceSubscribe` requires `fetch_evidence`, which only a successful
+`FetchBundle` against a **published** bundle records — so presence for a
+fingerprint that never published anything could never be queried by
+anyone. It was pure waste, not a feature.
+
+Rated **High**: remotely reachable by an unauthenticated party (becoming
+"authenticated" here is free), needs no relationship with any user, costs
+the attacker almost nothing per identity, and the growth is permanent —
+the only recovery is restarting the process.
+
+### Confirmation
+
+Two real end-to-end tests in
+`server/tests/unbounded_presence_growth.rs`, both driving an actually
+bound `dratchet_server::app()` over real WebSockets:
+
+- `throwaway_identities_do_not_accumulate_presence_entries_forever`
+  authenticates 25 throwaway identities and one real (bundle-publishing)
+  account, asserts pre-sweep that all 26 are in `presence` — so the
+  post-sweep assertion is not vacuous — then runs one real
+  `pruning::sweep_once` and requires every throwaway to be gone and the
+  real account's `last_seen` to be retained.
+- `a_throwaway_subscriber_does_not_stay_attached_to_a_real_accounts_presence`
+  has a throwaway fetch a real account's bundle, subscribe on the
+  strength of that evidence, and vanish; both its `fetch_evidence` entry
+  and its slot in the victim's subscriber set must be gone after the
+  sweep, while the victim's own live connection is untouched.
+
+Verified pre-fix by disabling only the new `identity_is_durable`
+predicate (made to return `true` unconditionally): both fail with their
+VULNERABILITY assertions.
+
+### Fixed
+
+`pruning::sweep_once` now drops per-identity state for any identity that
+is **neither a directory resident nor currently connected**, via the new
+`identity_is_durable(fingerprint, directory, connections)`:
+
+- `presence` — only `Offline` entries are candidates; `Online`/`Away`
+  belong to a live connection and are left alone.
+- `fetch_evidence` — the whole entry, keyed by fetcher.
+- `subscriptions` — individual subscribers, filtered by the
+  *subscriber's* durability rather than the target's, with now-empty
+  target sets removed.
+
+`SweepSummary` gains three counts (never a fingerprint or a presence
+state, per this module's existing no-presence-logging constraint).
+
+The load-bearing assumption is stated plainly in the module doc: a real
+client publishes its bundle on startup
+(`app::publish_under_candidates`), so every real account is a directory
+resident, and `directory` is itself never pruned. `SERVERS.md` §1.3's
+retained `last_seen`, and the "a relationship survives the subscriber's
+own reconnects" intent, therefore hold unchanged for every account they
+can actually be observed for.
+
+### Known residual scope
+
+- **Growth within one sweep interval is still unbounded.** The sweep runs
+  on a timer; between two passes an attacker can still add entries as
+  fast as it can complete handshakes. This bounds the steady state, not
+  the peak. A hard cap on `presence` (or a connection-rate limit keyed by
+  source address rather than identity) would bound the peak too, and is
+  the natural follow-up.
+- **The durability test is an approximation.** An identity that publishes
+  a bundle is treated as real forever, because `directory` is never
+  pruned. An attacker willing to pay the registration proof-of-work
+  (`abuse::REGISTRATION_POW_DIFFICULTY_BITS`, ~2^12 hashes) per identity
+  can therefore still buy permanent state — at a real cost per identity
+  rather than none, which is the point of that proof-of-work, but the
+  directory's own unbounded growth remains untouched here and is tracked
+  as intentional by `pruning.rs`.
+- **`otp_exhaustion_attempts` is not swept.** It is keyed by *target*
+  fingerprint, so only directory residents can appear in it; it grows
+  with the directory rather than independently of it.
+
+## DRA-0045: the rendezvous relay had no relationship check and no rate limit, and pushed into an unbounded per-client queue — any stranger could flood any online user (penetration test round 7, denial of service + unsolicited contact; confirmed real, fixed) — **HIGH**
+
+Penetration-test round 7, auditing `ws.rs`'s `RendezvousOffer` /
+`RendezvousAnswer` arms. Both relay a client-supplied payload straight
+into another connected identity's outbound channel, addressed by a
+`peer_fingerprint` the *sender* chooses freely.
+
+DRA-0026 capped how large one such payload may be. Its own doc comment on
+`validate_rendezvous_payload` records, accurately, what it did not close:
+the relay happened "with no relationship check and no rate limit either."
+Both were still missing.
+
+Three things compounded:
+
+1. **No relationship check.** Nothing required the sender to have any
+   prior contact with, evidence about, or consent from the target. A
+   public fingerprint was the entire addressing requirement.
+2. **No rate limit.** `MailboxWrite` is metered (DRA-0018) and
+   `FetchBundle` is metered, but this path — the only one that spends
+   *another* party's resources — was not.
+3. **An unbounded outbound queue.** `OutboundSender` was
+   `mpsc::UnboundedSender<Vec<u8>>`. Frames were pushed as fast as the
+   attacker wrote and drained only as fast as the victim's socket read.
+
+At up to `MAX_SDP_LEN` + `MAX_ICE_CANDIDATES × MAX_ICE_CANDIDATE_LEN`
+(~320 KiB) per frame, one sender in a loop could grow a single victim's
+queue into gigabytes of server memory — and combined with DRA-0044, the
+sender needn't even be a real user. The same reach also makes it an
+unsolicited-contact channel: ring anyone, whenever, as often as you like.
+
+Rated **High**: remotely reachable, no relationship or consent required,
+trivially cheap per frame, amplified onto a third party's memory, and
+targeted at a victim of the attacker's choosing.
+
+### Confirmation
+
+Three real end-to-end tests in
+`server/tests/unsolicited_rendezvous_relay.rs`:
+
+- `a_stranger_cannot_ring_an_online_user_it_has_no_relationship_with` —
+  an identity that published nothing and never fetched the victim's
+  bundle sends an offer; the server must refuse the sender **and**
+  nothing may reach the victim (asserted with a real timeout, so "no
+  frame" means no frame).
+- `ringing_is_rate_limited_even_for_a_legitimate_peer` — 3× the budget in
+  back-to-back offers from a peer that *did* fetch the bundle; some must
+  be refused.
+- `a_real_peer_that_fetched_the_bundle_can_still_ring` — the
+  non-regression guard: a genuine caller's offer is relayed, attributed
+  to the real sender, and acked.
+
+Verified pre-fix by stubbing only the new `authorize_rendezvous` body to
+`Ok(())`: the first two fail with their VULNERABILITY assertions while
+the third keeps passing, which is exactly the shape a correct gate should
+have.
+
+### Fixed
+
+- **Relationship gate.** New `authorize_rendezvous` requires the sender
+  to hold `fetch_evidence` for the target — the same evidence
+  `PresenceSubscribe` already demands (`SERVERS.md` §1.3's "only for
+  accounts it has an established or attempted session with"). Any real
+  caller has it: fetching the bundle is how you obtain the keys for the
+  session a call runs over. Checked *before* `relay_to_peer`, so a
+  refused frame never touches the target's channel.
+- **Rate limit.** New `abuse::RendezvousRateLimiter`, same token-bucket
+  shape as the two existing limiters — capacity 10, refilling one every
+  5 seconds. Keyed by **sender**, not by (sender, target), so spreading a
+  flood across many victims buys no extra budget.
+- **Bounded queue.** `OutboundSender` is now
+  `mpsc::Sender<Vec<u8>>` with `MAX_QUEUED_OUTBOUND_FRAMES` (64), and
+  every push uses `try_send`. A client that stops draining gets frames
+  refused instead of buffered without limit.
+
+### Known residual scope
+
+- **`fetch_evidence` is a cheap gate, not a strong one.** The directory
+  is public, so an attacker can fetch any bundle by handle and earn
+  evidence. What the gate buys is that ringing now costs a rate-limited
+  `FetchBundle` per target and leaves a record, instead of being free and
+  anonymous. Real consent (a callee-side allowlist, or requiring an
+  established session rather than an attempted one) is a protocol change,
+  not a bounded fix.
+- **`try_send` drops frames silently.** A client whose queue is full
+  loses whatever was being pushed, including acks and bundle results.
+  That is strictly better than unbounded growth, and 64 frames is far
+  beyond what a client answering its own request/response traffic
+  accumulates — but closing the connection on a full queue, so the client
+  reconnects and re-fetches rather than silently missing a frame, is the
+  more correct behaviour and is left as follow-up.
+- **The cap is per connection, not global.** `MAX_QUEUED_OUTBOUND_FRAMES
+  × MAX_CONCURRENT_CONNECTIONS` is still a large number in the worst
+  case; bounding total queued bytes across the process would be tighter.
+
+## DRA-0046: `MailboxFetch` created the mailbox it was reading, routing around the rate limiter built to meter mailbox creation (penetration test round 7, denial of service; confirmed real, fixed) — **MEDIUM**
+
+Penetration-test round 7, auditing `ws.rs`'s `MailboxFetch` arm. It
+reached its entry list with:
+
+```rust
+let entries = inner.mailboxes.entry(mailbox_id).or_default();
+```
+
+`or_default()` **inserts**. So asking whether a mailbox had anything in
+it created that mailbox — for any 16-byte id the caller cared to invent.
+
+That is the exact state DRA-0018 exists to meter. Its
+`NewMailboxRateLimiter` charges a token whenever a `MailboxWrite`
+originates a `mailbox_id` that doesn't already exist, precisely because
+"creating a whole new piece of server-side state" is the expensive part.
+`MailboxFetch` has no rate limit of any kind — so the cheapest way to
+allocate the state that limiter guards ran straight around it, on the
+read path.
+
+`mailbox_id_belongs_to_someone_else` is no obstacle: it rejects only ids
+that are the *bootstrap* id of some other directory resident. Every other
+id in the 2^128 space — including every random one — passes.
+
+Rated **Medium** rather than High because the growth is transient:
+`pruning::sweep_once`'s `retain` already removes mailboxes whose entry
+list is empty, so a sweep reclaims it. But the sweep is periodic, nothing
+throttles the fetches in between, and each empty entry still costs a map
+slot — so it remains a real way for one authenticated identity to inflate
+server memory on demand, bounded only by the sweep interval.
+
+### Confirmation
+
+`server/tests/mailbox_fetch_creates_mailboxes.rs`,
+`fetching_a_mailbox_that_does_not_exist_does_not_create_it`: 64
+invented ids, each fetched once, each correctly reporting an empty entry
+list — and then `inner.mailboxes` must still be empty. Against the
+unfixed code it fails with
+
+> VULNERABILITY: 64 fetches of ids that never existed left 64 mailboxes
+> behind — `MailboxFetch` creates the mailbox it reads, so an unmetered
+> read is the cheapest way to allocate server state, going straight
+> around DRA-0018's new-mailbox rate limiter on the write path
+
+`a_real_mailbox_still_fetches_normally` is the non-regression guard: a
+genuinely written entry still arrives, and its mailbox still exists after
+being read.
+
+### Fixed
+
+`MailboxFetch` now uses `get_mut`, returning an empty list when the
+mailbox does not exist rather than creating it. The observable response
+is unchanged — a fetch of a mailbox nobody wrote to always reported
+nothing; it just no longer leaves a mailbox behind for having asked.
+
+### Known residual scope
+
+- **`MailboxFetch` is still unrated.** Nothing limits how fast one
+  identity may fetch. This finding removes the *allocation* a fetch
+  caused; the request cost itself (a write-lock acquisition and, via
+  `mailbox_id_belongs_to_someone_else`, an O(directory) scan per call) is
+  untouched and is a separate throughput concern worth its own limiter.
+- **The O(directory) ownership scan.** Already flagged in that helper's
+  own doc as worth a cached reverse index; unmetered fetches make that
+  scan the more interesting of the two remaining costs.

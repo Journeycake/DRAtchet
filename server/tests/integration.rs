@@ -318,6 +318,23 @@ async fn rendezvous_offer_is_relayed_to_the_online_peer() {
         .await;
     let (_, _ack): (_, Ack) = bob_c.recv().await;
 
+    // DRA-0045: a rendezvous relay now requires the sender to hold fetch
+    // evidence for the target -- the same gate `PresenceSubscribe` uses.
+    // A real caller always has it, because fetching the callee's bundle
+    // is how it obtains the keys for the session a call runs over.
+    alice_c
+        .send(
+            FrameTag::FetchBundle,
+            &FetchBundle {
+                username: "bob".to_string(),
+                discriminator: 2,
+            },
+        )
+        .await;
+    let (tag, result): (_, BundleResult) = alice_c.recv().await;
+    assert_eq!(tag, FrameTag::BundleResult);
+    assert!(result.bundle.is_some());
+
     alice_c
         .send(
             FrameTag::RendezvousOffer,
@@ -368,6 +385,23 @@ async fn rendezvous_to_an_offline_peer_acks_false_no_store_and_forward() {
             &PublishBundle { bundle: bob_bundle },
         )
         .await;
+
+    // DRA-0045: a rendezvous relay now requires the sender to hold fetch
+    // evidence for the target -- the same gate `PresenceSubscribe` uses.
+    // A real caller always has it, because fetching the callee's bundle
+    // is how it obtains the keys for the session a call runs over.
+    alice_c
+        .send(
+            FrameTag::FetchBundle,
+            &FetchBundle {
+                username: "bob".to_string(),
+                discriminator: 2,
+            },
+        )
+        .await;
+    let (tag, result): (_, BundleResult) = alice_c.recv().await;
+    assert_eq!(tag, FrameTag::BundleResult);
+    assert!(result.bundle.is_some());
 
     alice_c
         .send(

@@ -18,6 +18,14 @@
 //! (64), and `state::MAX_ICE_CANDIDATE_LEN` (4 KiB per candidate),
 //! checked in `ws::validate_rendezvous_payload` before `relay_to_peer`
 //! ever touches the target's connection.
+//!
+//! The "no relationship check and no rate limit" half above stayed open
+//! until **DRA-0045** (round 7), which added both in
+//! `ws::authorize_rendezvous`. The size checks still run first, so the
+//! two rejection tests below are unaffected by it; the
+//! "still relays normally" test now sets up the relationship a real
+//! caller always has, and `server/tests/unsolicited_rendezvous_relay.rs`
+//! covers the gate itself.
 
 mod common;
 
@@ -100,13 +108,39 @@ async fn too_many_ice_candidates_are_rejected() {
 async fn an_ordinary_small_rendezvous_offer_still_relays_normally() {
     let url = spawn_server().await;
 
-    let alice = Account::generate().unwrap();
+    // DRA-0045: the caller must hold fetch evidence for the callee, so
+    // Alice publishes a bundle and Bob fetches it -- exactly what a real
+    // caller does to obtain the keys for the session a call runs over.
+    let (alice, alice_bundle) = fresh_account_and_bundle("callee", 4242, 1);
     let mut alice_conn = TestClient::connect(&url).await;
     alice_conn.authenticate(&alice).await;
+    alice_conn
+        .send(
+            FrameTag::PublishBundle,
+            &PublishBundle {
+                bundle: alice_bundle,
+            },
+        )
+        .await;
+    let (tag, ack): (_, Ack) = alice_conn.recv().await;
+    assert_eq!(tag, FrameTag::Ack);
+    assert!(ack.ok);
 
     let bob = Account::generate().unwrap();
     let mut bob_conn = TestClient::connect(&url).await;
     bob_conn.authenticate(&bob).await;
+    bob_conn
+        .send(
+            FrameTag::FetchBundle,
+            &FetchBundle {
+                username: "callee".to_string(),
+                discriminator: 4242,
+            },
+        )
+        .await;
+    let (tag, result): (_, BundleResult) = bob_conn.recv().await;
+    assert_eq!(tag, FrameTag::BundleResult);
+    assert!(result.bundle.is_some());
 
     bob_conn
         .send(

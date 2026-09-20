@@ -183,9 +183,24 @@ pub struct MailboxEntry {
     pub written_by: Fingerprint,
 }
 
+/// DRA-0045 (`docs/DELIVERY_FAILURE_FINDINGS.md`) — how many frames may
+/// be queued for one client before further pushes are refused.
+///
+/// This channel used to be unbounded, which meant anything that pushes a
+/// frame at *another* client — `ws.rs`'s rendezvous relay above all —
+/// could grow one connection's queue as fast as the sender wrote, with
+/// the victim's socket draining it only as fast as it could read. A cap
+/// turns that from unbounded server memory into a bounded queue plus a
+/// refused send. Deep enough that no real client, which is answering its
+/// own request/response traffic plus the occasional presence update,
+/// ever reaches it.
+pub const MAX_QUEUED_OUTBOUND_FRAMES: usize = 64;
+
 /// One connected client's outbound channel — frames pushed here are written
-/// to that client's WebSocket by its own connection task.
-pub type OutboundSender = mpsc::UnboundedSender<Vec<u8>>;
+/// to that client's WebSocket by its own connection task. Bounded
+/// (DRA-0045); senders use `try_send`, so a client that has stopped
+/// draining gets frames refused rather than buffered without limit.
+pub type OutboundSender = mpsc::Sender<Vec<u8>>;
 
 #[derive(Default)]
 pub struct Inner {
@@ -207,6 +222,9 @@ pub struct Inner {
     /// DRA-0018 — gates how fast one identity can originate brand-new
     /// mailbox ids via `MailboxWrite`. See `crate::abuse::NewMailboxRateLimiter`.
     pub new_mailbox_rate_limiter: crate::abuse::NewMailboxRateLimiter,
+    /// DRA-0045 — gates how fast one identity can have rendezvous frames
+    /// relayed at other clients. See `crate::abuse::RendezvousRateLimiter`.
+    pub rendezvous_rate_limiter: crate::abuse::RendezvousRateLimiter,
     /// target fingerprint -> count of `FetchBundle` calls that found its
     /// one-time-prekey pool already empty — logged past a threshold as a
     /// "someone keeps hitting this account's exhausted pool" signal
