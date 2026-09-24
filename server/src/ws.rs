@@ -47,7 +47,6 @@ use dratchet_core::identity;
 use dratchet_core::prekey::{
     OneTimePrekeyPublic, PrekeyBundle as CorePrekeyBundle, SignedPrekeyPublic,
 };
-use dratchet_core::x3dh::bootstrap_mailbox_id;
 
 use crate::abuse::{self, ConnectionId};
 use crate::error::{Error, Result};
@@ -427,6 +426,11 @@ async fn dispatch(
                 .try_into()
                 .map_err(|_| Error::MalformedFrame("mailbox_id must be 16 bytes"))?;
             let mut inner = state.inner.write().await;
+            // DRA-0049: metered like every other client-driven handler.
+            // Checked first, so a refused fetch does no work at all.
+            if !inner.mailbox_fetch_rate_limiter.allow(fetcher) {
+                return Err(Error::RateLimited);
+            }
             if mailbox_id_belongs_to_someone_else(&inner, &mailbox_id, &fetcher) {
                 return Err(Error::NotMailboxOwner);
             }
@@ -553,13 +557,10 @@ fn mailbox_id_belongs_to_someone_else(
     mailbox_id: &[u8; 16],
     caller: &Fingerprint,
 ) -> bool {
-    if *mailbox_id == bootstrap_mailbox_id(caller) {
-        return false;
-    }
-    inner
-        .directory
-        .keys()
-        .any(|fp| fp != caller && bootstrap_mailbox_id(fp) == *mailbox_id)
+    // DRA-0049: an O(1) index lookup. This used to scan every directory
+    // key on every call, while holding the global write lock, on a
+    // directory that is never pruned.
+    inner.bootstrap_mailbox_belongs_to_another(mailbox_id, caller)
 }
 
 async fn publish_bundle(state: &Arc<AppState>, wire: PrekeyBundleWire) -> Result<()> {
@@ -662,7 +663,7 @@ async fn publish_bundle(state: &Arc<AppState>, wire: PrekeyBundleWire) -> Result
         bundle: wire,
         one_time_prekeys,
     };
-    inner.directory.insert(fp, stored);
+    inner.register_bundle(fp, stored);
     if let Some(persistence) = &state.persistence {
         persistence.save(&fp, inner.directory.get(&fp).expect("just inserted"));
     }

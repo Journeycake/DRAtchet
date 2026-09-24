@@ -297,13 +297,45 @@ impl Db {
     }
 
     /// Every message stored for `conversation_id`, oldest first.
+    /// DRA-0048 (`docs/DELIVERY_FAILURE_FINDINGS.md`): a record that
+    /// cannot be read is *skipped*, not fatal.
+    ///
+    /// This used to decode every record with `?`, so one unreadable record
+    /// took the whole conversation with it. DRA-0041 made that reachable
+    /// deliberately -- binding the record key as associated data means a
+    /// relocated or rolled-back record now fails its AEAD check instead of
+    /// decrypting into the wrong place -- which handed anyone able to
+    /// write to the database file a way to deny the owner an entire
+    /// conversation's history by planting a single junk record, without
+    /// reading any of it.
+    ///
+    /// Losing one damaged message is strictly better than losing all of
+    /// them, and an attacker who can write the file could have deleted
+    /// that record outright anyway. The skip is counted and logged (never
+    /// with content) so genuine corruption is still visible rather than
+    /// silently swallowed.
     pub fn list_messages(&self, conversation_id: [u8; 16]) -> Result<Vec<Message>> {
         let mut messages = Vec::new();
+        let mut unreadable = 0usize;
         for key in self.keys_with_prefix(&message_key_prefix(conversation_id))? {
-            let bytes = self
-                .get_encrypted(Scope::Content, &key)?
-                .ok_or(Error::MalformedRecord("message key listed but not found"))?;
-            messages.push(decode_message(&bytes)?);
+            match self.get_encrypted(Scope::Content, &key) {
+                Ok(Some(bytes)) => match decode_message(&bytes) {
+                    Ok(message) => messages.push(message),
+                    Err(_) => unreadable += 1,
+                },
+                // Listed but absent, or undecryptable: both mean this one
+                // record is unusable, and neither says anything about the
+                // rest of the conversation.
+                Ok(None) | Err(_) => unreadable += 1,
+            }
+        }
+        if unreadable > 0 {
+            tracing::warn!(
+                conversation = %crate::db::hex(&conversation_id),
+                unreadable,
+                "skipped unreadable message records while listing a conversation — \
+                 possible tampering or corruption of the local database",
+            );
         }
         messages.sort_by_key(|m| (m.timestamp, m.sequence));
         Ok(messages)
@@ -443,6 +475,59 @@ mod tests {
         let mut buf = [0u8; 16];
         OsRng.fill_bytes(&mut buf);
         buf.to_vec()
+    }
+
+    /// Penetration-test finding DRA-0048: one unreadable record must not
+    /// take the whole conversation down with it.
+    ///
+    /// `list_messages` decoded every record with `?`, so a single record
+    /// that failed to decrypt propagated straight out and the caller got
+    /// an error instead of a message list -- every other message in that
+    /// conversation included. DRA-0041 made that reachable on purpose:
+    /// binding the record key as associated data means a relocated or
+    /// rolled-back record now fails its AEAD check rather than decrypting
+    /// into the wrong place. Anyone who can write to the `.redb` file can
+    /// therefore plant one junk record and permanently deny the owner
+    /// access to an entire conversation's history, without being able to
+    /// read a single byte of it.
+    #[test]
+    fn one_unreadable_record_does_not_deny_access_to_the_whole_conversation() {
+        let db = temp_db();
+        let conv = [7u8; 16];
+
+        let keep_one = sample_message_with_sequence(100, 0, "first");
+        let planted = sample_message_with_sequence(200, 1, "second");
+        let keep_two = sample_message_with_sequence(300, 2, "third");
+        db.save_message(conv, &keep_one).unwrap();
+        db.save_message(conv, &planted).unwrap();
+        db.save_message(conv, &keep_two).unwrap();
+        assert_eq!(db.list_messages(conv).unwrap().len(), 3);
+
+        // An attacker with the database file overwrites one record's bytes
+        // with something that cannot decrypt. No key, no plaintext, no
+        // ability to read anything -- just a write.
+        let victim_key = message_key(conv, &planted.id);
+        {
+            let write_txn = db.database.begin_write().unwrap();
+            {
+                let mut table = write_txn.open_table(crate::db::RECORDS).unwrap();
+                table.insert(victim_key.as_str(), &b"garbage"[..]).unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+
+        let surviving = db.list_messages(conv).expect(
+            "VULNERABILITY: a single unreadable record makes the entire conversation's history \
+             unreadable -- anyone able to write one junk record into the database file can deny \
+             the owner access to every message in that conversation without decrypting any of it",
+        );
+
+        let contents: Vec<&[u8]> = surviving.iter().map(|m| m.content.as_slice()).collect();
+        assert_eq!(
+            contents,
+            vec![&b"first"[..], &b"third"[..]],
+            "every still-readable message must survive, in order; only the damaged one is lost"
+        );
     }
 
     fn sample_message(timestamp: u64, content: &str) -> Message {

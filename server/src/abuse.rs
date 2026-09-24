@@ -243,6 +243,73 @@ impl RendezvousRateLimiter {
     }
 }
 
+/// DRA-0049 (`docs/DELIVERY_FAILURE_FINDINGS.md`) — gates how fast one
+/// identity may issue `MailboxFetch`.
+///
+/// Every other client-driven handler was already metered — `MailboxWrite`
+/// by [`NewMailboxRateLimiter`], `FetchBundle` by [`FetchRateLimiter`],
+/// the rendezvous relay by [`RendezvousRateLimiter`] (DRA-0045). Fetch was
+/// the one left open, and it is the most expensive call the server
+/// serves: it takes the global write lock for its whole duration.
+/// Polling for new mail is a normal, frequent client action, so this is
+/// deliberately the most generous of the four.
+#[derive(Default)]
+pub struct MailboxFetchRateLimiter {
+    buckets: HashMap<Fingerprint, RateBucket>,
+}
+
+/// Burst capacity, and deliberately the most generous of the four
+/// limiters.
+///
+/// The primary fix for DRA-0049 is the O(1) ownership lookup
+/// (`Inner::bootstrap_mailbox_index`), which removed the amplification
+/// that made a fetch expensive in the first place. This limiter is a
+/// backstop against sheer volume, not the load-bearing defence, so it is
+/// tuned to sit well clear of real traffic rather than as close to it as
+/// possible.
+///
+/// The number matters: an initial value of 60 broke
+/// `app/tests/hundred_round_delivery_ack_exchange.rs`, a *legitimate*
+/// 100-round bidirectional conversation, at round 68. A busy
+/// conversation or a client draining a backlog after reconnecting really
+/// does fetch this often, so the budget has to clear that by a wide
+/// margin or it is a correctness bug wearing a security hat.
+pub const MAILBOX_FETCH_RATE_LIMIT_CAPACITY: f64 = 600.0;
+/// Refill rate: 50 fetches per second sustained — orders of magnitude
+/// above `app`'s multi-second per-conversation poll cadence, while still
+/// bounding what was previously an entirely unbounded handler.
+const MAILBOX_FETCH_RATE_LIMIT_REFILL_PER_SEC: f64 = 50.0;
+
+impl MailboxFetchRateLimiter {
+    /// Returns `true` (and consumes one token) if `fetcher` may fetch
+    /// again right now.
+    pub fn allow(&mut self, fetcher: Fingerprint) -> bool {
+        let now = Instant::now();
+        let bucket = self.buckets.entry(fetcher).or_insert_with(|| RateBucket {
+            tokens: MAILBOX_FETCH_RATE_LIMIT_CAPACITY,
+            last_refill: now,
+        });
+        let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * MAILBOX_FETCH_RATE_LIMIT_REFILL_PER_SEC)
+            .min(MAILBOX_FETCH_RATE_LIMIT_CAPACITY);
+        bucket.last_refill = now;
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Same reasoning as the other limiters' `sweep_stale`.
+    pub fn sweep_stale(&mut self, older_than: std::time::Duration, now: Instant) -> usize {
+        let before = self.buckets.len();
+        self.buckets
+            .retain(|_, bucket| now.duration_since(bucket.last_refill) < older_than);
+        before - self.buckets.len()
+    }
+}
+
 /// How many leading zero bits a solution's hash must have. ~2^12 average
 /// hash attempts to find one — sub-millisecond for a legitimate client
 /// registering one username, but a real (if deliberately modest, per the

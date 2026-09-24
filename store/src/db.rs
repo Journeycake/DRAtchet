@@ -155,7 +155,7 @@ impl Db {
             Err(Error::DecryptionFailed) => return Err(Error::WrongPassphraseOrCorrupted),
             Err(e) => return Err(e),
         };
-        if checked != KDF_CHECK_PLAINTEXT {
+        if checked.as_slice() != KDF_CHECK_PLAINTEXT {
             return Err(Error::WrongPassphraseOrCorrupted);
         }
 
@@ -225,7 +225,11 @@ impl Db {
 
     /// Fetch and decrypt (under `scope`'s DEK) the value stored under
     /// `key`, if any.
-    pub(crate) fn get_encrypted(&self, scope: Scope, key: &str) -> Result<Option<Vec<u8>>> {
+    pub(crate) fn get_encrypted(
+        &self,
+        scope: Scope,
+        key: &str,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>> {
         // Read the raw bytes out and drop the read transaction before
         // decrypting: the legacy-format upgrade below opens a write
         // transaction, and holding a reader across it is needless.
@@ -484,7 +488,12 @@ fn encrypt(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
     out
 }
 
-fn decrypt(key: &[u8; 32], aad: &[u8], stored: &[u8]) -> Result<Vec<u8>> {
+/// DRA-0047: the recovered plaintext comes back in a [`Zeroizing`]
+/// buffer. Every scope's plaintext passes through here — the account's
+/// whole secret hierarchy, ratchet root/chain/skipped keys, and message
+/// bodies — so leaving it in a bare `Vec` meant a copy of all of it was
+/// freed unwiped on every read.
+fn decrypt(key: &[u8; 32], aad: &[u8], stored: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     if stored.len() < NONCE_LEN {
         return Err(Error::MalformedRecord("stored value shorter than a nonce"));
     }
@@ -498,6 +507,7 @@ fn decrypt(key: &[u8; 32], aad: &[u8], stored: &[u8]) -> Result<Vec<u8>> {
                 aad,
             },
         )
+        .map(Zeroizing::new)
         .map_err(|_| Error::DecryptionFailed)
 }
 
@@ -510,7 +520,11 @@ fn decrypt(key: &[u8; 32], aad: &[u8], stored: &[u8]) -> Result<Vec<u8>> {
 /// the record in the new format on the spot -- every record is upgraded
 /// the first time it is read, and a database that has been fully read
 /// once holds no unbound records at all.
-fn decrypt_record(key: &[u8; 32], record_key: &str, stored: &[u8]) -> Result<(Vec<u8>, bool)> {
+fn decrypt_record(
+    key: &[u8; 32],
+    record_key: &str,
+    stored: &[u8],
+) -> Result<(Zeroizing<Vec<u8>>, bool)> {
     match decrypt(key, record_key.as_bytes(), stored) {
         Ok(plaintext) => Ok((plaintext, false)),
         Err(_) => decrypt(key, &[], stored).map(|plaintext| (plaintext, true)),
@@ -543,7 +557,7 @@ fn read_master_encrypted(
     database: &Database,
     master_key: &Zeroizing<[u8; 32]>,
     key: &str,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<Option<Zeroizing<Vec<u8>>>> {
     let raw = {
         let read_txn = database.begin_read()?;
         let table = read_txn.open_table(RECORDS)?;
@@ -730,8 +744,9 @@ mod tests {
         assert_eq!(
             db.get_encrypted(Scope::Content, "some-record")
                 .unwrap()
-                .unwrap(),
-            b"a value from before".to_vec(),
+                .unwrap()
+                .as_slice(),
+            b"a value from before",
             "a record written before DRA-0041 must still be readable"
         );
 
@@ -788,14 +803,20 @@ mod tests {
         db.put_encrypted(Scope::Content, "k", b"hello world")
             .unwrap();
         assert_eq!(
-            db.get_encrypted(Scope::Content, "k").unwrap().unwrap(),
+            db.get_encrypted(Scope::Content, "k")
+                .unwrap()
+                .unwrap()
+                .as_slice(),
             b"hello world"
         );
         drop(db);
 
         let db = Db::open(&path, "correct horse battery staple").unwrap();
         assert_eq!(
-            db.get_encrypted(Scope::Content, "k").unwrap().unwrap(),
+            db.get_encrypted(Scope::Content, "k")
+                .unwrap()
+                .unwrap()
+                .as_slice(),
             b"hello world"
         );
     }

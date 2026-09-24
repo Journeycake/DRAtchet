@@ -205,6 +205,19 @@ pub type OutboundSender = mpsc::Sender<Vec<u8>>;
 #[derive(Default)]
 pub struct Inner {
     pub directory: HashMap<Fingerprint, StoredBundle>,
+    /// DRA-0049 — reverse index `bootstrap_mailbox_id -> Fingerprint`,
+    /// maintained alongside every `directory` insertion.
+    ///
+    /// `ws::mailbox_id_belongs_to_someone_else` used to answer "is this
+    /// mailbox id some *other* account's bootstrap id?" by scanning every
+    /// directory key, on every `MailboxFetch`/`MailboxDelete`, while
+    /// holding the global write lock. The directory is never pruned, so
+    /// that per-call cost only ever grew. This makes the same question an
+    /// O(1) lookup.
+    ///
+    /// Must be written wherever `directory` is: [`Inner::register_bundle`]
+    /// is the only way to do so, precisely so the two cannot drift.
+    pub bootstrap_mailbox_index: HashMap<MailboxId, Fingerprint>,
     pub username_index: HashMap<UsernameKey, Fingerprint>,
     pub presence: HashMap<Fingerprint, PresenceState>,
     /// target fingerprint -> set of subscriber fingerprints watching it.
@@ -225,12 +238,43 @@ pub struct Inner {
     /// DRA-0045 — gates how fast one identity can have rendezvous frames
     /// relayed at other clients. See `crate::abuse::RendezvousRateLimiter`.
     pub rendezvous_rate_limiter: crate::abuse::RendezvousRateLimiter,
+    /// DRA-0049 — gates how fast one identity can issue `MailboxFetch`.
+    /// See `crate::abuse::MailboxFetchRateLimiter`.
+    pub mailbox_fetch_rate_limiter: crate::abuse::MailboxFetchRateLimiter,
     /// target fingerprint -> count of `FetchBundle` calls that found its
     /// one-time-prekey pool already empty — logged past a threshold as a
     /// "someone keeps hitting this account's exhausted pool" signal
     /// (`ARCHITECTURE.md` §11.8); surfacing it to the affected user is
     /// future client work, not something this server-only phase can do.
     pub otp_exhaustion_attempts: HashMap<Fingerprint, u32>,
+}
+
+impl Inner {
+    /// The only sanctioned way to put a bundle into the directory
+    /// (DRA-0049). Keeps [`Inner::bootstrap_mailbox_index`] in step with
+    /// [`Inner::directory`] — the index is what makes the mailbox
+    /// ownership check O(1) instead of a full directory scan under the
+    /// global write lock, and an index that drifted from the directory
+    /// would silently stop protecting the accounts it missed.
+    pub fn register_bundle(&mut self, fingerprint: Fingerprint, stored: StoredBundle) {
+        self.bootstrap_mailbox_index.insert(
+            dratchet_core::x3dh::bootstrap_mailbox_id(&fingerprint),
+            fingerprint,
+        );
+        self.directory.insert(fingerprint, stored);
+    }
+
+    /// DRA-0049: is `mailbox_id` the bootstrap mailbox of an account other
+    /// than `caller`? An O(1) lookup against the index above.
+    pub fn bootstrap_mailbox_belongs_to_another(
+        &self,
+        mailbox_id: &MailboxId,
+        caller: &Fingerprint,
+    ) -> bool {
+        self.bootstrap_mailbox_index
+            .get(mailbox_id)
+            .is_some_and(|owner| owner != caller)
+    }
 }
 
 pub struct AppState {
@@ -290,7 +334,7 @@ impl AppState {
                 discriminator: stored.bundle.discriminator,
             };
             inner.username_index.insert(username_key, fp);
-            inner.directory.insert(fp, stored);
+            inner.register_bundle(fp, stored);
         }
         tracing::info!(
             recovered = inner.directory.len(),

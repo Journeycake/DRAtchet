@@ -466,12 +466,18 @@ impl RatchetState {
     /// own**: this is exactly the key material forward secrecy protects, so
     /// a caller persisting these bytes (`store/`'s local database) must
     /// encrypt them first and never write them anywhere unencrypted.
-    pub fn export(&self) -> Vec<u8> {
+    ///
+    /// DRA-0047 (`docs/DELIVERY_FAILURE_FINDINGS.md`): the returned buffer
+    /// is [`Zeroizing`], so this material -- which the paragraph above
+    /// correctly calls "exactly the key material forward secrecy
+    /// protects" -- is wiped when the caller drops it instead of being
+    /// left in freed heap memory for a core dump or debugger.
+    pub fn export(&self) -> Zeroizing<Vec<u8>> {
         let exported = ExportedRatchetState::from(self);
         let mut bytes = Vec::new();
         ciborium::into_writer(&exported, &mut bytes)
             .expect("CBOR encoding of a well-formed struct cannot fail");
-        bytes
+        Zeroizing::new(bytes)
     }
 
     /// The inverse of [`RatchetState::export`] — reconstructs a ratchet

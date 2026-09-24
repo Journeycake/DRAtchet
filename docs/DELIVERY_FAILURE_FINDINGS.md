@@ -3387,3 +3387,316 @@ nothing; it just no longer leaves a mailbox behind for having asked.
 - **The O(directory) ownership scan.** Already flagged in that helper's
   own doc as worth a cached reverse index; unmetered fetches make that
   scan the more interesting of the two remaining costs.
+
+## DRA-0047: the entire secret key hierarchy was serialized into buffers that were freed without being wiped, contradicting `ARCHITECTURE.md` §3.4's explicit zeroization promise (penetration test round 8, data extraction; confirmed real, fixed) — **MEDIUM**
+
+Penetration-test round 8. This one was found by taking a documented
+guarantee and following it into the code rather than by reading the code
+first. `ARCHITECTURE.md` §3.4 states:
+
+> **"Discarded" means zeroized in memory, not just dropped from scope** …
+> both overwrite their storage on drop rather than leaving key material
+> sitting in freed memory for a debugger or core dump to find.
+
+That held for the live structs. `RatchetState` wraps its root key, both
+chain keys and every skipped-message key in `Zeroizing`, and the X25519
+secrets zeroize themselves. The promise was silently lost the moment any
+of it was **persisted**:
+
+```rust
+pub fn export(&self) -> Vec<u8>          // core/src/account.rs
+pub fn export(&self) -> Vec<u8>          // core/src/ratchet.rs
+fn get_encrypted(..) -> Result<Option<Vec<u8>>>   // store/src/db.rs
+```
+
+Each returns a plain `Vec<u8>` holding plaintext key material, which is
+freed without being overwritten when it goes out of scope.
+
+What is in those buffers:
+
+- `Account::export` — the Ed25519 identity secret, the X3DH identity DH
+  secret, the signed prekey secret, and **every unused one-time prekey
+  secret**. The complete long-term hierarchy, in one contiguous
+  allocation.
+- `RatchetState::export` — the root key, both chain keys, the current DH
+  ratchet secret, and the whole skipped-message-key cache. Its own doc
+  comment already calls this "exactly the key material forward secrecy
+  protects" and warns a caller never to write it anywhere unencrypted —
+  then hands it over in a buffer that does not clean up after itself.
+- `get_encrypted` — the read side of both of the above, plus every
+  decrypted message body.
+
+This is not a rare path. `save_ratchet` runs on **every message sent or
+received**, and `load_ratchet`/`load_account` run on every startup and
+every receive cycle. So the process repeatedly allocates, fills and frees
+plaintext copies of its own key hierarchy, each one left intact in the
+heap until the allocator happens to reuse it. That is precisely the
+material §3.4 names a "debugger or core dump" as the threat against — and
+it also reaches swap and hibernation files, which outlive the process
+entirely.
+
+Rated **Medium**. It is not remotely exploitable and it does not weaken
+any cryptographic property on its own: an attacker needs memory access to
+the running process, a core dump, or swap contents. But that is exactly
+the threat the project committed to defending against in writing, the
+exposure repeats thousands of times over a device's life rather than
+once, and the window it opens is the whole key hierarchy at once rather
+than a single session key.
+
+### Confirmation
+
+`core/src/account.rs`,
+`an_exported_account_carries_secret_material_in_a_self_wiping_buffer`.
+
+Reading freed heap memory to observe the residue directly would be
+undefined behaviour, so the test does not attempt it — and a test that
+relied on allocator reuse timing would be flaky besides. It asserts the
+two things that *can* be checked soundly:
+
+1. the buffer genuinely carries raw secret material (it searches the
+   exported bytes for the account's actual X3DH identity DH secret and
+   its signed prekey secret, so there is demonstrably something worth
+   wiping, and more than one live secret at a time);
+2. the buffer's type carries the wipe-on-drop guarantee, via a
+   `fn assert_wipes_on_drop(_: &Zeroizing<Vec<u8>>)`.
+
+Pre-fix evidence is the signatures themselves at the previous commit:
+
+```
+$ git show HEAD:core/src/account.rs | grep "pub fn export"
+227:    pub fn export(&self) -> Vec<u8> {
+$ git show HEAD:core/src/ratchet.rs | grep "pub fn export"
+469:    pub fn export(&self) -> Vec<u8> {
+$ git show HEAD:store/src/db.rs | grep "fn get_encrypted"
+228:    pub(crate) fn get_encrypted(&self, ..) -> Result<Option<Vec<u8>>> {
+```
+
+Against that code the guard does not compile, which is a stronger
+rejection than a runtime assertion: the contract is enforced by the type
+system on every future caller, not just on the paths a test happens to
+exercise.
+
+### Fixed
+
+`Account::export`, `RatchetState::export`, `store::db::decrypt`,
+`decrypt_record`, `get_encrypted` and `read_master_encrypted` all now
+return `Zeroizing<Vec<u8>>`. `Zeroizing` derefs to `Vec<u8>`, so every
+existing caller kept working unchanged; the only edit needed elsewhere
+was one `==` comparison against a `&[u8]` literal.
+
+`ARCHITECTURE.md` §3.4 has been extended to state the guarantee at the
+serialization boundary explicitly, and to record that it did not hold
+before this finding.
+
+### Known residual scope
+
+- **The AEAD crate's internal buffers are not covered.** `decrypt`
+  receives its plaintext from `chacha20poly1305`, which allocates it
+  internally before handing it over; whatever intermediate copies that
+  crate makes are outside this fix. Closing that would mean an in-place
+  detached-mode API, which is a larger change.
+- **CBOR serialization scratch space.** `ciborium::into_writer` writes
+  into the `Vec` that is now wrapped, but any internal temporaries it
+  allocates along the way are not.
+- **This does not defend a live process.** An attacker who can read the
+  memory of a *running* client at the moment a ratchet is loaded sees the
+  keys regardless. The fix narrows the window to the time the buffer is
+  actually in use, instead of leaving it open indefinitely after the
+  buffer is freed.
+- **No test observes the wipe at runtime**, for the soundness reason
+  given above. The guarantee is type-level and rests on `zeroize`'s
+  correctness.
+
+## DRA-0048: one unreadable record denied access to an entire conversation's history (penetration test round 8, data destruction / availability; confirmed real, fixed) — **MEDIUM**
+
+Penetration-test round 8, picking up a gap DRA-0041 recorded in its own
+"Known residual scope" as deliberately left open.
+
+`store::messages::list_messages` decoded every record with `?`:
+
+```rust
+let bytes = self.get_encrypted(Scope::Content, &key)?
+    .ok_or(Error::MalformedRecord("message key listed but not found"))?;
+messages.push(decode_message(&bytes)?);
+```
+
+So a single record that failed to decrypt propagated straight out, and
+the caller got an `Err` instead of a message list — losing **every other
+message in that conversation** along with the damaged one.
+
+DRA-0041 is what made this reachable on purpose. Binding the record key
+as associated data means a relocated or rolled-back record now fails its
+AEAD check rather than quietly decrypting in the wrong place — which is
+correct, and is the whole point of that fix. But it turned "attacker
+plants one junk record" from a silent forgery into a **total denial of
+that conversation's history**, and the attacker needs no key, no
+plaintext and no ability to read anything: one write to the `.redb` file
+is enough.
+
+The two findings compose badly in exactly the way a residual-scope note
+exists to flag, which is why DRA-0041 recorded it rather than leaving it
+implicit.
+
+Rated **Medium**: same precondition as DRA-0041 (write access to the
+local database file — a synced or backed-up copy, a shared or rooted
+device, malware without the passphrase), no confidentiality impact, but
+the effect is total and permanent loss of access to a conversation the
+user can still see listed.
+
+### Confirmation
+
+`store/src/messages.rs`,
+`one_unreadable_record_does_not_deny_access_to_the_whole_conversation`:
+saves three messages, confirms all three list, then overwrites the middle
+record's raw bytes with `b"garbage"` directly in the redb table — an
+attacker with the file and nothing else — and requires the other two to
+still come back, in order. Against the unfixed code it fails with
+
+> VULNERABILITY: a single unreadable record makes the entire
+> conversation's history unreadable … : MalformedRecord("stored value
+> shorter than a nonce")
+
+### Fixed
+
+`list_messages` now skips records it cannot read instead of aborting,
+counts them, and emits a `tracing::warn!` naming the conversation and the
+count (never content). Losing one damaged message is strictly better than
+losing all of them, and an attacker able to write the file could have
+deleted that record outright anyway — so the skip concedes nothing that
+was defensible, while removing the amplification from one record to the
+whole conversation.
+
+### Known residual scope
+
+- **Skipping is silent to the user.** The warning goes to the log, not to
+  the interface. A user whose history has been tampered with sees a
+  conversation with a hole in it and no indication why. Surfacing "N
+  messages could not be read" in the UI is the right follow-up and is
+  app/UI work, not a store-layer fix.
+- **Other `list_*` paths were not audited for the same shape in this
+  round.** `list_contacts` in particular walks records the same way;
+  worth a dedicated pass.
+- **This does not restore the damaged record**, which is unrecoverable by
+  construction — the AEAD tag is what tells us it is damaged.
+
+## DRA-0049: `MailboxFetch` was the one unmetered handler, and it held the global write lock while scanning the entire directory (penetration test round 8, denial of service; confirmed real, fixed) — **HIGH**
+
+Penetration-test round 8, picking up the request-cost gap DRA-0046
+recorded as still open after it closed the allocation half.
+
+Every other client-driven handler is metered — `MailboxWrite` by
+`NewMailboxRateLimiter` (DRA-0018), `FetchBundle` by `FetchRateLimiter`,
+the rendezvous relay by `RendezvousRateLimiter` (DRA-0045).
+`MailboxFetch` had no limiter of any kind, and it is the most expensive
+call the server serves:
+
+```rust
+let mut inner = state.inner.write().await;          // GLOBAL, exclusive
+if mailbox_id_belongs_to_someone_else(&inner, &mailbox_id, &fetcher) { … }
+```
+
+and that helper was:
+
+```rust
+inner.directory.keys()
+    .any(|fp| fp != caller && bootstrap_mailbox_id(fp) == *mailbox_id)
+```
+
+— an O(directory) scan, computing a hash per entry, **inside the
+exclusive lock**. Three properties compound:
+
+1. **No rate limit.** One authenticated identity can issue fetches as
+   fast as it can write frames. Authenticating is free (DRA-0044), so
+   "authenticated" is not a meaningful barrier.
+2. **The lock is global and exclusive.** Every other client's writes,
+   fetches, presence updates and relays queue behind it. This is not one
+   victim's resources being spent — it is *everyone's*.
+3. **The per-call cost only grows.** `pruning.rs` documents that the
+   directory is never pruned, so the scan gets more expensive for the
+   life of the deployment and never recovers.
+
+Rated **High**: remotely reachable by any authenticated identity at
+negligible cost to the attacker, degrading service for every other user
+of the deployment simultaneously, and getting worse over time rather than
+better.
+
+### Confirmation
+
+`server/tests/unmetered_mailbox_fetch.rs`, driving a really-bound
+`dratchet_server::app()` over real WebSockets:
+
+- `fetching_a_mailbox_is_rate_limited` issues 3× the budget in
+  back-to-back fetches against a mailbox the caller is entitled to (so
+  the ownership check cannot be what refuses them) and requires some to
+  be refused. Pre-fix — verified by stubbing only the new limiter call —
+  it fails with
+
+  > VULNERABILITY: 180 back-to-back mailbox fetches were all served —
+  > nothing rate-limits a handler that takes the global write lock and
+  > scans the entire directory on every call
+
+- `ownership_is_still_enforced_against_a_populated_directory` is the
+  non-regression guard, and it guards the *other* half of the fix: with
+  five real directory residents, a stranger must still be refused another
+  account's bootstrap mailbox (DRA-0014's guarantee) and the rightful
+  owner must still be able to read their own. An index that drifted from
+  the directory would silently stop protecting the accounts it missed, so
+  this asserts the lookup picks the right owner rather than trivially
+  matching a single entry. It passes both pre- and post-fix, which is the
+  correct shape for a guard.
+
+### Fixed
+
+Two independent changes, because the finding has two independent causes:
+
+- **The scan is gone.** New `Inner::bootstrap_mailbox_index`
+  (`bootstrap_mailbox_id -> Fingerprint`) makes the ownership question an
+  O(1) lookup. To stop it drifting from `directory` — which would be a
+  silent authorization failure, not a visible bug — the index is only
+  writable through the new `Inner::register_bundle`, and both places that
+  ever inserted into the directory (`ws::publish_bundle` and
+  `AppState::with_persistence`'s restore loop) now go through it.
+- **The handler is metered.** New `abuse::MailboxFetchRateLimiter`, same
+  token-bucket shape as the other three: capacity 600, refilling
+  50/second. Checked *before* the ownership lookup, so a refused fetch
+  does no work at all.
+
+  The index is the load-bearing fix; this limiter is a backstop against
+  sheer volume, which is why it is tuned to sit well clear of real
+  traffic rather than as close to it as possible. **The first attempt at
+  it was a regression, and that is worth recording.** Capacity 60 /
+  2-per-second looked defensible in isolation and broke
+  `app/tests/hundred_round_delivery_ack_exchange.rs` — a legitimate
+  100-round bidirectional conversation — at round 68. A busy
+  conversation, or a client draining a backlog after reconnecting, really
+  does fetch that often. A limit that rejects real traffic is a
+  correctness bug wearing a security hat, so the budget was raised until
+  it cleared the workload by a wide margin instead of the test being
+  adjusted to suit the limit.
+
+### Known residual scope
+
+- **`MailboxDelete` still scans.** It calls the same helper, so it
+  inherits the O(1) lookup — but it has no rate limiter of its own. It is
+  far cheaper per call than fetch (no pruning, no entry serialization),
+  and a delete only ever removes the caller's own reachable entries, so
+  this was left out of scope rather than widening the patch. Worth its
+  own pass.
+- **The limiter is per identity, and identities are free** (DRA-0044).
+  An attacker cycling fresh identities gets a fresh bucket each time.
+  DRA-0044's sweep bounds the *memory* that costs, not the request rate;
+  bounding that properly needs a limiter keyed by source address rather
+  than identity, which is the same follow-up DRA-0044 named.
+- **A rate-limited client reports a confusing error.** The regression
+  above surfaced client-side as `malformed frame: body did not decode as
+  expected CBOR shape`, because `client` expects `MailboxEntries` in
+  reply to a fetch and got an `Error` frame. That is pre-existing
+  behaviour for any error reply to a fetch, not something this finding
+  introduced, but this finding made it reachable — a throttled client
+  should get a clear, retryable signal rather than a decode failure.
+  Worth its own fix in `client/src/net.rs`.
+- **The global write lock is still global.** Making the fetch path cheap
+  removes the amplification, but any handler taking `inner.write()`
+  serialises the server for its duration. Splitting `Inner` into
+  independently-locked regions is a real design change, not a bounded
+  fix.

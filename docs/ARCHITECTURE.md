@@ -159,7 +159,7 @@ Once the root key exists, per-message crypto is entirely symmetric:
 | One-time prekey | Single session handshake | Immediately after session establishment |
 | DH ratchet keypair | Until the peer's next reply | Replaced by next DH ratchet step |
 | Per-message symmetric key | Single message | Immediately after that message is encrypted/decrypted |
-| Remote pairing code (§6.4) | Single verification attempt, ~10 min TTL | On first successful match, or expiry — whichever first |
+| Remote pairing code (§6.4) | Up to `PAIRING_CODE_MAX_ATTEMPTS` (5) verification attempts, ~10 min TTL | On first successful match, on exhausting the attempt budget, or at expiry — whichever comes first |
 | Conversation recovery key (§7, only while the *effective* policy is A or B) | Life of the conversation's effective recovery policy | Automatically, the moment the effective policy reaches Profile C (§7.2/7.3) — individual stored entries are also auto-purged at that point, not just the key |
 
 **"Discarded" means zeroized in memory, not just dropped from scope**
@@ -168,6 +168,17 @@ keys are wrapped in `zeroize::Zeroizing`, and DH secrets (`StaticSecret`,
 `SharedSecret`) zeroize themselves via x25519-dalek's `"zeroize"` feature —
 both overwrite their storage on drop rather than leaving key material
 sitting in freed memory for a debugger or core dump to find.
+
+That guarantee extends to the **serialization boundary**, which is where
+all of this material exists in the clear at once (DRA-0047,
+`docs/DELIVERY_FAILURE_FINDINGS.md`). `Account::export`,
+`RatchetState::export` and the store's decrypt path
+(`store::db::get_encrypted`) all hand back `Zeroizing<Vec<u8>>`, not a
+bare `Vec<u8>` — so the plaintext copy made on every save and every load
+is wiped when the caller drops it, rather than being freed intact. Until
+DRA-0047 it was not: the promise above held for the live structs and was
+silently lost the moment they were persisted, which happens on every
+message.
 
 **Replenishment.** A published bundle's one-time prekeys (`PublishBundle`,
 `ONE_TIME_PREKEY_BATCH = 10`, `app/src/lib.rs`) are consumed one per

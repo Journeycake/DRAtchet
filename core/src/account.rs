@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 use rand_core::OsRng;
 use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
 use crate::identity::Identity;
@@ -224,12 +225,18 @@ impl Account {
     /// prekey secret. Like `RatchetState::export`, **not an at-rest-safe
     /// format on its own**: local storage must encrypt these bytes before
     /// persisting them and decrypt before calling [`Account::import`].
-    pub fn export(&self) -> Vec<u8> {
+    /// DRA-0047 (`docs/DELIVERY_FAILURE_FINDINGS.md`): the returned buffer
+    /// is [`Zeroizing`], so the plaintext secret hierarchy it carries is
+    /// overwritten when the caller drops it rather than left in freed
+    /// heap memory. `ARCHITECTURE.md` §3.4 promises exactly that of this
+    /// material, and this is the one place all of it exists in the clear
+    /// at once.
+    pub fn export(&self) -> Zeroizing<Vec<u8>> {
         let exported = ExportedAccount::from(self);
         let mut bytes = Vec::new();
         ciborium::into_writer(&exported, &mut bytes)
             .expect("CBOR encoding of a well-formed struct cannot fail");
-        bytes
+        Zeroizing::new(bytes)
     }
 
     /// The inverse of [`Account::export`].
@@ -554,6 +561,46 @@ mod tests {
         // gone for any further attempt (bogus or genuine) naming this id.
         assert!(account.peek_one_time_prekey_secret(id).is_none());
         assert!(account.take_one_time_prekey_secret(id).is_none());
+    }
+
+    /// Penetration-test finding DRA-0047: `ARCHITECTURE.md` §3.4 promises
+    /// that "discarded" key material is "zeroized in memory, not just
+    /// dropped from scope" -- and names exactly the threat it is
+    /// protecting against, "a debugger or core dump". `export` serialises
+    /// the entire secret hierarchy (the Ed25519 identity secret, the X3DH
+    /// identity DH secret, the signed prekey secret, and every unused
+    /// one-time prekey secret) into a buffer, and that buffer used to be
+    /// a plain `Vec<u8>` -- freed without being wiped, on every single
+    /// save.
+    ///
+    /// Observing freed heap memory directly would be undefined behaviour,
+    /// so this does not attempt it. It asserts the two things that can be
+    /// checked soundly: that the buffer genuinely carries raw secret key
+    /// material (so there is something worth wiping), and that its type
+    /// carries the wipe-on-drop guarantee. If `export` ever goes back to
+    /// returning a bare `Vec<u8>`, this stops compiling.
+    #[test]
+    fn an_exported_account_carries_secret_material_in_a_self_wiping_buffer() {
+        fn assert_wipes_on_drop(_: &Zeroizing<Vec<u8>>) {}
+
+        let account = Account::generate().unwrap();
+        let identity_dh_secret = account.identity_dh_secret().to_bytes();
+        let signed_prekey_secret = account.signed_prekey_secret().to_bytes();
+
+        let exported = account.export();
+        assert_wipes_on_drop(&exported);
+
+        assert!(
+            exported.windows(32).any(|w| w == identity_dh_secret),
+            "VULNERABILITY: the export carries the raw X3DH identity DH secret in a buffer that \
+             is freed without being wiped -- ARCHITECTURE.md §3.4 promises this material is \
+             zeroized in memory, not merely dropped"
+        );
+        assert!(
+            exported.windows(32).any(|w| w == signed_prekey_secret),
+            "the export also carries the signed prekey secret, so the buffer holds more than one \
+             live secret at a time"
+        );
     }
 
     /// Penetration-test finding DRA-0040: a freshly generated account's
