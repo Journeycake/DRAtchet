@@ -489,6 +489,11 @@ async fn dispatch(
                 .try_into()
                 .map_err(|_| Error::MalformedFrame("entry_id must be 16 bytes"))?;
             let mut inner = state.inner.write().await;
+            // DRA-0050: metered like MailboxFetch (DRA-0049). Checked
+            // first, so a refused delete does no further work.
+            if !inner.mailbox_delete_rate_limiter.allow(deleter) {
+                return Err(Error::RateLimited);
+            }
             if mailbox_id_belongs_to_someone_else(&inner, &mailbox_id, &deleter) {
                 return Err(Error::NotMailboxOwner);
             }

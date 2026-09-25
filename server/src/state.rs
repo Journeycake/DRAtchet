@@ -241,6 +241,9 @@ pub struct Inner {
     /// DRA-0049 — gates how fast one identity can issue `MailboxFetch`.
     /// See `crate::abuse::MailboxFetchRateLimiter`.
     pub mailbox_fetch_rate_limiter: crate::abuse::MailboxFetchRateLimiter,
+    /// DRA-0050 — gates how fast one identity can issue `MailboxDelete`.
+    /// See `crate::abuse::MailboxDeleteRateLimiter`.
+    pub mailbox_delete_rate_limiter: crate::abuse::MailboxDeleteRateLimiter,
     /// target fingerprint -> count of `FetchBundle` calls that found its
     /// one-time-prekey pool already empty — logged past a threshold as a
     /// "someone keeps hitting this account's exhausted pool" signal

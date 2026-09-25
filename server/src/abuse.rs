@@ -310,6 +310,63 @@ impl MailboxFetchRateLimiter {
     }
 }
 
+/// DRA-0050 (`docs/DELIVERY_FAILURE_FINDINGS.md`) — gates how fast one
+/// identity may issue `MailboxDelete`.
+///
+/// DRA-0049 closed `MailboxFetch`'s gap but left this one open on
+/// purpose, on the reasoning that a delete is far cheaper per call (no
+/// pruning, no entry serialization, and it only ever removes the
+/// caller's own reachable entries). That is true of the *work inside the
+/// lock* — but the handler still takes `state.inner`'s global exclusive
+/// write lock for its whole duration, same as fetch did, and nothing
+/// bounded how often one identity could acquire it. Cheap-per-call and
+/// unmetered still adds up to unbounded lock-contention volume.
+#[derive(Default)]
+pub struct MailboxDeleteRateLimiter {
+    buckets: HashMap<Fingerprint, RateBucket>,
+}
+
+/// Burst capacity. A real client deletes one entry per message it just
+/// finished processing — bursty only up to the size of a backlog drained
+/// after reconnecting, the same shape `MailboxFetch`'s budget already
+/// accommodates. Matches `MAILBOX_FETCH_RATE_LIMIT_CAPACITY` /
+/// `..._REFILL_PER_SEC` deliberately: a client that fetches N entries in
+/// a burst goes on to delete roughly N of them, so giving delete a
+/// tighter budget than fetch would just move the false-positive risk
+/// DRA-0049 already paid down once.
+pub const MAILBOX_DELETE_RATE_LIMIT_CAPACITY: f64 = 600.0;
+const MAILBOX_DELETE_RATE_LIMIT_REFILL_PER_SEC: f64 = 50.0;
+
+impl MailboxDeleteRateLimiter {
+    /// Returns `true` (and consumes one token) if `deleter` may delete
+    /// again right now.
+    pub fn allow(&mut self, deleter: Fingerprint) -> bool {
+        let now = Instant::now();
+        let bucket = self.buckets.entry(deleter).or_insert_with(|| RateBucket {
+            tokens: MAILBOX_DELETE_RATE_LIMIT_CAPACITY,
+            last_refill: now,
+        });
+        let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * MAILBOX_DELETE_RATE_LIMIT_REFILL_PER_SEC)
+            .min(MAILBOX_DELETE_RATE_LIMIT_CAPACITY);
+        bucket.last_refill = now;
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Same reasoning as the other limiters' `sweep_stale`.
+    pub fn sweep_stale(&mut self, older_than: std::time::Duration, now: Instant) -> usize {
+        let before = self.buckets.len();
+        self.buckets
+            .retain(|_, bucket| now.duration_since(bucket.last_refill) < older_than);
+        before - self.buckets.len()
+    }
+}
+
 /// How many leading zero bits a solution's hash must have. ~2^12 average
 /// hash attempts to find one — sub-millisecond for a legitimate client
 /// registering one username, but a real (if deliberately modest, per the

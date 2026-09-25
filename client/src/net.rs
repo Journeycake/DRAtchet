@@ -47,9 +47,22 @@ impl Connection {
         }
     }
 
+    /// DRA-0052 (`docs/DELIVERY_FAILURE_FINDINGS.md`): if the server
+    /// replied with `FrameTag::Error`, that is reported as such —
+    /// carrying its real `ErrorFrame.message` — instead of being handed
+    /// to `decode_body::<T>`, which would simply fail to parse an
+    /// `ErrorFrame`'s bytes as whatever type the caller expected and
+    /// report a generic, indistinguishable-from-corruption decode
+    /// failure. A genuine, expected server refusal (rate limited, not
+    /// the resource owner, anything else `Error` covers) must never look
+    /// the same to a caller as the wire protocol being broken.
     pub async fn recv<T: DeserializeOwned>(&mut self) -> Result<(FrameTag, T), String> {
         let raw = self.recv_raw().await?;
         let (tag, body) = split_tag(&raw).map_err(|e| e.to_string())?;
+        if tag == FrameTag::Error {
+            let err: ErrorFrame = decode_body(body).map_err(|e| e.to_string())?;
+            return Err(format!("server refused the request: {}", err.message));
+        }
         let parsed: T = decode_body(body).map_err(|e| e.to_string())?;
         Ok((tag, parsed))
     }

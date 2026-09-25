@@ -3700,3 +3700,87 @@ Two independent changes, because the finding has two independent causes:
   serialises the server for its duration. Splitting `Inner` into
   independently-locked regions is a real design change, not a bounded
   fix.
+
+## DRA-0050: `MailboxDelete` was the last unmetered handler holding the global write lock (penetration test round 9, denial of service; confirmed real, fixed) — **MEDIUM**
+
+Penetration-test round 9, picking up the exact follow-up DRA-0049 recorded as deliberately deferred: "`MailboxDelete` still scans... it has no rate limiter of its own... worth its own pass." DRA-0049's O(1) index fix (`bootstrap_mailbox_index`) already applies to delete too, since both handlers share `mailbox_id_belongs_to_someone_else`. What remained was the rate limit.
+
+`MailboxDelete` takes `state.inner`'s global exclusive write lock for its whole duration — the same lock `MailboxFetch` was metered over in DRA-0049, for the same reason (ownership must be checked under it). DRA-0049 reasoned this one away as lower priority because the *work inside* the lock is cheap for delete (no pruning, no entry serialization, and a delete only ever removes the caller's own reachable entries). That reasoning is correct about per-call cost — but says nothing about *rate*. An unmetered handler that still acquires a global exclusive lock lets one identity serialise the whole server behind back-to-back lock acquisitions, whatever the work inside each one costs.
+
+Rated **Medium**, not High like DRA-0049: the per-call cost genuinely is cheap (no O(n) scan since the index fix), so the amplification factor is smaller — this is lock-contention volume, not lock-contention-times-scan-cost.
+
+### Confirmation
+
+`server/tests/unmetered_mailbox_delete.rs`: `deleting_from_a_mailbox_is_rate_limited` issues 3× the intended budget in back-to-back deletes against the caller's own bootstrap mailbox (so only a rate limiter, never the ownership check, could be refusing them) and requires some to be refused. Verified pre-fix by disabling only the new limiter call (`if false && !inner.mailbox_delete_rate_limiter.allow(deleter)`): fails with
+
+> VULNERABILITY: 1800 back-to-back mailbox deletes were all served — nothing rate-limits a handler that takes the global write lock on every call, so one identity can serialise the whole server behind its own deletes
+
+`ordinary_deletes_and_ownership_checks_still_work` is the non-regression guard — and it caught a real bug in my own first draft, worth recording: I initially tested "stranger can't delete from an arbitrary shared mailbox id," which is not a security boundary at all — `mailbox_id_belongs_to_someone_else` only protects a *bootstrap*-derived id (`ARCHITECTURE.md` §11.1's bidirectional mailbox model deliberately leaves a custom/shared id open to both paired parties). Rewritten to use a real, published bootstrap mailbox id, matching `unmetered_mailbox_fetch.rs`'s own pattern.
+
+### Fixed
+
+New `abuse::MailboxDeleteRateLimiter`, same token-bucket shape and budget as DRA-0049's fetch limiter (capacity 600, refilling 50/second) — matched deliberately, since a client that fetches N entries in a burst goes on to delete roughly N of them, so giving delete a tighter budget than fetch would just reopen the false-positive risk DRA-0049 already paid down once. Checked before the ownership lookup, so a refused delete does no further work.
+
+### Known residual scope
+
+- **The global write lock is still global.** Same accepted limitation DRA-0049 recorded: any handler taking `inner.write()` serialises the server for its duration. Two handlers are now individually metered; the architecture itself is unchanged.
+- **The limiter is per identity, and identities are free** (DRA-0044). Same follow-up already named there and in DRA-0049: a limiter keyed by source address would close this properly.
+
+## DRA-0051: one unreadable contact record denied the entire contact list (penetration test round 9, data destruction / availability; confirmed real, fixed) — **MEDIUM**
+
+Penetration-test round 9, the same shape as DRA-0048 in a different module — flagged explicitly in DRA-0048's own "Known residual scope": "other `list_*` paths were not audited for the same shape this round... worth a dedicated pass."
+
+`store::contacts::list_contacts` collected every record through `?` inside a `.collect::<Result<Vec<_>>>()`, so one record that failed to decrypt short-circuited the whole collection. Same root cause as DRA-0048: DRA-0041 bound each record's own key as AEAD associated data, so a relocated or rolled-back record now fails its AEAD check outright — which is correct — but a single planted junk contact record denied the owner their *entire* contact list: every conversation, every verification state, needing no key and no plaintext, just write access to the `.redb` file.
+
+Rated **Medium**, matching DRA-0048: same precondition, no confidentiality impact, effect is total loss of the contact list rather than one message thread — arguably a wider blast radius than DRA-0048 (the contact list gates which conversations exist at all), but the same class.
+
+### Confirmation
+
+`store/src/contacts.rs`, `one_unreadable_contact_does_not_deny_the_whole_contact_list`: saves three contacts, confirms all three list, overwrites the middle record's raw bytes with `b"garbage"` directly in the redb table, requires the other two to still come back. Fails pre-fix with its VULNERABILITY assertion.
+
+### Fixed
+
+`list_contacts` now skips records it cannot read instead of aborting the whole collection, counts them, and emits a `tracing::warn!` (never with content) — the same fix DRA-0048 applied to `messages::list_messages`, same reasoning: losing one damaged contact is strictly better than losing all of them, and an attacker able to write the file could have deleted that record outright anyway.
+
+### Known residual scope
+
+Identical to DRA-0048's: skipping is silent to the user (log only, not surfaced in the UI); this does not restore the damaged record, which is unrecoverable by construction. Between this and DRA-0048, `list_*` in `store/` has now had a dedicated pass — no other `list_*` function walks records the same way (checked: `list_messages`, `list_contacts` were the only two collecting through `?`).
+
+## DRA-0052: the client's generic frame decoder reported every server refusal as indistinguishable from wire corruption, discarding the server's actual reason (penetration test round 9, availability/robustness; confirmed real, fixed) — **LOW**
+
+Penetration-test round 9, the third item DRA-0049's "Known residual scope" named directly: "a rate-limited client reports a confusing error... worth its own fix in `client/src/net.rs`."
+
+`net::Connection::recv<T>` decoded every response body as the caller's expected type with no check of the frame's tag first:
+
+```rust
+pub async fn recv<T: DeserializeOwned>(&mut self) -> Result<(FrameTag, T), String> {
+    let raw = self.recv_raw().await?;
+    let (tag, body) = split_tag(&raw).map_err(|e| e.to_string())?;
+    let parsed: T = decode_body(body).map_err(|e| e.to_string())?;   // <- no tag check
+    Ok((tag, parsed))
+}
+```
+
+When the server genuinely refuses a request — rate limited, not the resource owner, anything `Error` covers — it replies with an `Error` frame carrying the real reason in `ErrorFrame.message`. A caller expecting `Ack`/`MailboxEntries`/`BundleResult`/etc. then tried to decode that `Error` frame's body as its own type, which fails, discarding the server's actual message and surfacing a generic `malformed frame: body did not decode as expected CBOR shape` instead. Every one of `app/src/lib.rs`'s roughly fourteen typed `recv()` call sites shared this exact shape — this is systemic across the whole client/app boundary, not a one-off.
+
+This is availability-relevant, not cosmetic: DRA-0049 and DRA-0050 made rate limiting a normal, *expected* response on busy paths this round. Without this fix, the app layer cannot tell "the server is asking me to slow down" apart from "the wire protocol is corrupted," and is pushed toward treating a transient, self-correcting refusal as a fatal error rather than implementing correct backoff-and-retry.
+
+Rated **Low**: it discards diagnostic information and degrades error handling, but it does not itself grant unauthorized access, corrupt data, or exhaust a resource — the underlying refusal was already correct, only its reporting was wrong.
+
+### Confirmation
+
+`client/tests/error_frame_masking.rs`,
+`a_genuine_server_refusal_is_not_reported_as_a_decode_failure`: publishes a real target bundle, then has a real stranger `MailboxFetch` the target's bootstrap mailbox through a real `net::Connection` against a really-bound server — a genuine, well-formed request the identity has no right to, refused via a real `Error` frame, not a hand-built malformed one. Against the unfixed client it fails with exactly the production message this finding was named after:
+
+> VULNERABILITY: a genuine server refusal (an Error frame) is reported to the caller as a CBOR decode failure, discarding the server's actual reason ("malformed frame: body did not decode as expected CBOR shape")
+
+`an_ordinary_successful_reply_still_decodes_normally` is the non-regression guard: a genuine successful `Ack` still decodes exactly as before.
+
+### Fixed
+
+`recv<T>` now checks `tag == FrameTag::Error` before attempting to decode as `T`; on a match it decodes the body as `ErrorFrame` instead and returns `Err(format!("server refused the request: {}", err.message))`. Every existing caller already propagates this `Result` with `?`, so no call site needed to change — the fix is entirely inside the shared primitive every typed frame exchange in the client goes through.
+
+### Known residual scope
+
+- **`server/tests/common/mod.rs::TestClient::recv` has the identical shape**, and is what actually surfaced this finding in the first place (while debugging this very round's `MailboxDelete` non-regression test, a genuinely-allowed server response tripped the same masking in the *test harness*, not the product). Left unfixed deliberately: it is test-only code, never shipped, and every test in the suite already either expects success or explicitly branches on `FrameTag::Error` before decoding when a refusal is the expected outcome — the harness's callers, unlike the app's, already know which shape they're getting into. Worth a matching fix anyway for the same clarity `client::net::Connection::recv` just gained, but out of scope for a shipped-code finding.
+- **The new error string is not machine-distinguishable from other `String` errors.** `app`/UI code that wants to specifically detect "the server rate-limited me" (to drive a backoff) still has to string-match `"server refused the request:"` plus the message text, since `Connection::recv`'s return type is `Result<_, String>` throughout, not a typed error enum. A typed client-side error (mirroring `server::error::Error`) would let callers match on it properly; that's a larger interface change than this fix's scope.

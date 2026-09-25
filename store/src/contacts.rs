@@ -124,16 +124,35 @@ impl Db {
         self.delete(&contact_key(fingerprint))
     }
 
+    /// DRA-0051 (`docs/DELIVERY_FAILURE_FINDINGS.md`): a record that
+    /// cannot be read is *skipped*, not fatal -- the same fix DRA-0048
+    /// applied to `messages::list_messages`, for the same reason. This
+    /// used to `collect::<Result<Vec<_>>>()` through `?`, so one
+    /// unreadable contact took the whole list with it. Losing one
+    /// damaged contact is strictly better than losing all of them, and
+    /// an attacker able to write the file could have deleted that record
+    /// outright anyway. The skip is counted and logged (never with
+    /// content) so genuine corruption stays visible.
     pub fn list_contacts(&self) -> Result<Vec<Contact>> {
-        self.keys_with_prefix(CONTACT_KEY_PREFIX)?
-            .into_iter()
-            .map(|key| {
-                let bytes = self
-                    .get_encrypted(Scope::Contacts, &key)?
-                    .ok_or(Error::MalformedRecord("contact key listed but not found"))?;
-                decode_contact(&bytes)
-            })
-            .collect()
+        let mut contacts = Vec::new();
+        let mut unreadable = 0usize;
+        for key in self.keys_with_prefix(CONTACT_KEY_PREFIX)? {
+            match self.get_encrypted(Scope::Contacts, &key) {
+                Ok(Some(bytes)) => match decode_contact(&bytes) {
+                    Ok(contact) => contacts.push(contact),
+                    Err(_) => unreadable += 1,
+                },
+                Ok(None) | Err(_) => unreadable += 1,
+            }
+        }
+        if unreadable > 0 {
+            tracing::warn!(
+                unreadable,
+                "skipped unreadable contact records while listing contacts — possible \
+                 tampering or corruption of the local database",
+            );
+        }
+        Ok(contacts)
     }
 }
 
@@ -172,6 +191,60 @@ mod tests {
             peer_wipe_boundary_timestamp: None,
             peer_wipe_boundary_sequence: None,
         }
+    }
+
+    /// Penetration-test finding DRA-0051: same shape as DRA-0048
+    /// (`docs/DELIVERY_FAILURE_FINDINGS.md`), for the contact list rather
+    /// than a conversation's messages.
+    ///
+    /// `list_contacts` decoded every record with `?` inside a
+    /// `.collect::<Result<Vec<_>>>()`, so one record that failed to
+    /// decrypt short-circuited the whole collection -- losing every
+    /// other saved contact along with the damaged one. Since DRA-0041
+    /// bound each record's own key as AEAD associated data, a relocated
+    /// or rolled-back record fails its AEAD check outright rather than
+    /// decrypting into the wrong place, so planting one junk contact
+    /// record denies the owner their entire contact list -- every
+    /// conversation, every verification state -- needing no key and no
+    /// plaintext, just write access to the `.redb` file.
+    #[test]
+    fn one_unreadable_contact_does_not_deny_the_whole_contact_list() {
+        let db = temp_db();
+
+        let keep_one = sample_contact(1);
+        let planted = sample_contact(2);
+        let keep_two = sample_contact(3);
+        db.save_contact(&keep_one).unwrap();
+        db.save_contact(&planted).unwrap();
+        db.save_contact(&keep_two).unwrap();
+        assert_eq!(db.list_contacts().unwrap().len(), 3);
+
+        // An attacker with the database file overwrites one contact
+        // record's bytes with something that cannot decrypt. No key, no
+        // plaintext, no ability to read anything -- just a write.
+        let victim_key = contact_key(&planted.fingerprint);
+        {
+            let write_txn = db.database.begin_write().unwrap();
+            {
+                let mut table = write_txn.open_table(crate::db::RECORDS).unwrap();
+                table.insert(victim_key.as_str(), &b"garbage"[..]).unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+
+        let surviving = db.list_contacts().expect(
+            "VULNERABILITY: a single unreadable contact record makes the entire contact list \
+             unreadable -- anyone able to write one junk record into the database file can deny \
+             the owner access to every saved contact without decrypting any of them",
+        );
+
+        let mut fingerprints: Vec<u8> = surviving.iter().map(|c| c.fingerprint[0]).collect();
+        fingerprints.sort();
+        assert_eq!(
+            fingerprints,
+            vec![1, 3],
+            "every still-readable contact must survive; only the damaged one is lost"
+        );
     }
 
     #[test]
