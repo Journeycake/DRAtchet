@@ -229,18 +229,38 @@ mod hex {
     }
 }
 
+/// DRA-0054: `unreadable` is how many stored contact records were skipped
+/// because they could not be read (damage or tampering, DRA-0051). The
+/// frontend shows a notice when it is non-zero instead of the contact
+/// silently vanishing from the list.
+#[derive(Serialize)]
+struct ContactListDto {
+    contacts: Vec<ContactDto>,
+    unreadable: usize,
+}
+
+/// DRA-0054: the message-list counterpart of [`ContactListDto`] (DRA-0048).
+#[derive(Serialize)]
+struct MessageListDto {
+    messages: Vec<MessageDto>,
+    unreadable: usize,
+}
+
 #[tauri::command]
-fn list_contacts(state: State<AppState>) -> Result<Vec<ContactDto>, String> {
-    dratchet_app::list_contacts(&state.db)
-        .map(|contacts| contacts.iter().map(to_contact_dto).collect())
-        .map_err(|e| e.to_string())
+fn list_contacts(state: State<AppState>) -> Result<ContactListDto, String> {
+    let (contacts, unreadable) =
+        dratchet_app::list_contacts_counting_unreadable(&state.db).map_err(|e| e.to_string())?;
+    Ok(ContactListDto {
+        contacts: contacts.iter().map(to_contact_dto).collect(),
+        unreadable,
+    })
 }
 
 #[tauri::command]
 async fn list_messages(
     state: State<'_, AppState>,
     fingerprint: String,
-) -> Result<Vec<MessageDto>, String> {
+) -> Result<MessageListDto, String> {
     let fp = hex::decode(&fingerprint)?;
     let contact = state
         .db
@@ -248,9 +268,13 @@ async fn list_messages(
         .map_err(|e| e.to_string())?
         .ok_or("no such contact")?;
     let account = state.account.lock().await;
-    let messages =
-        dratchet_app::list_messages(&state.db, &account, &contact).map_err(|e| e.to_string())?;
-    Ok(messages.iter().map(to_message_dto).collect())
+    let (messages, unreadable) =
+        dratchet_app::list_messages_counting_unreadable(&state.db, &account, &contact)
+            .map_err(|e| e.to_string())?;
+    Ok(MessageListDto {
+        messages: messages.iter().map(to_message_dto).collect(),
+        unreadable,
+    })
 }
 
 #[tauri::command]
@@ -1282,5 +1306,27 @@ mod tests {
             "VULNERABILITY: device_passphrase handed back a secret it failed to save; a \
              database created with it could never be reopened"
         );
+    }
+
+    /// DRA-0054: `+page.svelte` reads `contacts`/`messages` and
+    /// `unreadable` off these two responses by name; a renamed field would
+    /// silently hide the notice again, so pin the wire shape.
+    #[test]
+    fn list_dtos_carry_the_unreadable_count_under_the_names_the_frontend_reads() {
+        let contacts = serde_json::to_value(ContactListDto {
+            contacts: Vec::new(),
+            unreadable: 2,
+        })
+        .unwrap();
+        assert_eq!(contacts["unreadable"], 2);
+        assert!(contacts["contacts"].is_array());
+
+        let messages = serde_json::to_value(MessageListDto {
+            messages: Vec::new(),
+            unreadable: 1,
+        })
+        .unwrap();
+        assert_eq!(messages["unreadable"], 1);
+        assert!(messages["messages"].is_array());
     }
 }

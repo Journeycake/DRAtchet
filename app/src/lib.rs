@@ -78,6 +78,24 @@ pub fn list_messages(db: &Db, account: &Account, contact: &Contact) -> Result<Ve
     Ok(db.list_messages(conv_id)?)
 }
 
+/// [`list_contacts`], plus how many stored contact records could not be
+/// read and were skipped (DRA-0054) -- non-zero means the local database
+/// is damaged or was tampered with, and the user should be told.
+pub fn list_contacts_counting_unreadable(db: &Db) -> Result<(Vec<Contact>, usize)> {
+    Ok(db.list_contacts_counting_unreadable()?)
+}
+
+/// [`list_messages`], plus how many of this conversation's stored message
+/// records could not be read and were skipped (DRA-0054).
+pub fn list_messages_counting_unreadable(
+    db: &Db,
+    account: &Account,
+    contact: &Contact,
+) -> Result<(Vec<Message>, usize)> {
+    let conv_id = conversation_id_for(account, contact);
+    Ok(db.list_messages_counting_unreadable(conv_id)?)
+}
+
 /// Marks every currently undelivered, locally-sent message across every
 /// conversation as `uncertain` (`dratchet_store::Message::uncertain`'s
 /// doc) — called once right after this device detects and recovers from

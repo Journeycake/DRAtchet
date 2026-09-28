@@ -315,6 +315,17 @@ impl Db {
     /// with content) so genuine corruption is still visible rather than
     /// silently swallowed.
     pub fn list_messages(&self, conversation_id: [u8; 16]) -> Result<Vec<Message>> {
+        Ok(self.list_messages_counting_unreadable(conversation_id)?.0)
+    }
+
+    /// [`list_messages`](Self::list_messages), plus how many records were
+    /// skipped as unreadable. DRA-0054: the log line alone left the user
+    /// looking at a conversation with a silent hole in it; this count is
+    /// what lets the app say so.
+    pub fn list_messages_counting_unreadable(
+        &self,
+        conversation_id: [u8; 16],
+    ) -> Result<(Vec<Message>, usize)> {
         let mut messages = Vec::new();
         let mut unreadable = 0usize;
         for key in self.keys_with_prefix(&message_key_prefix(conversation_id))? {
@@ -338,7 +349,7 @@ impl Db {
             );
         }
         messages.sort_by_key(|m| (m.timestamp, m.sequence));
-        Ok(messages)
+        Ok((messages, unreadable))
     }
 
     /// Handle an incoming `DeliveryAck` (`dratchet_core::payload::DeliveryAck`,
@@ -897,5 +908,42 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(updated.id, first.id);
+    }
+
+    /// DRA-0054: DRA-0048 kept the readable messages but only logged the
+    /// skip, so the user saw a conversation with a silent hole in it. The
+    /// caller must be told how many records were lost -- and a healthy
+    /// conversation must report zero, so the notice never cries wolf.
+    #[test]
+    fn an_unreadable_message_record_is_counted_for_the_caller() {
+        let db = temp_db();
+        let conv = [8u8; 16];
+        let keep = sample_message_with_sequence(100, 0, "kept");
+        let planted = sample_message_with_sequence(200, 1, "lost");
+        db.save_message(conv, &keep).unwrap();
+        db.save_message(conv, &planted).unwrap();
+        assert_eq!(
+            db.list_messages_counting_unreadable(conv).unwrap().1,
+            0,
+            "a healthy conversation must report no unreadable records"
+        );
+
+        let victim_key = message_key(conv, &planted.id);
+        {
+            let write_txn = db.database.begin_write().unwrap();
+            {
+                let mut table = write_txn.open_table(crate::db::RECORDS).unwrap();
+                table.insert(victim_key.as_str(), &b"garbage"[..]).unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+
+        let (messages, unreadable) = db.list_messages_counting_unreadable(conv).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            unreadable, 1,
+            "VULNERABILITY: a damaged or tampered message record is dropped without the caller \
+             ever learning of it -- the user sees a conversation with a silent hole in it"
+        );
     }
 }

@@ -134,6 +134,13 @@ impl Db {
     /// outright anyway. The skip is counted and logged (never with
     /// content) so genuine corruption stays visible.
     pub fn list_contacts(&self) -> Result<Vec<Contact>> {
+        Ok(self.list_contacts_counting_unreadable()?.0)
+    }
+
+    /// [`list_contacts`](Self::list_contacts), plus how many records were
+    /// skipped as unreadable (DRA-0054), so the app can tell the user
+    /// rather than only logging it.
+    pub fn list_contacts_counting_unreadable(&self) -> Result<(Vec<Contact>, usize)> {
         let mut contacts = Vec::new();
         let mut unreadable = 0usize;
         for key in self.keys_with_prefix(CONTACT_KEY_PREFIX)? {
@@ -152,7 +159,7 @@ impl Db {
                  tampering or corruption of the local database",
             );
         }
-        Ok(contacts)
+        Ok((contacts, unreadable))
     }
 }
 
@@ -303,5 +310,40 @@ mod tests {
         db.save_contact(&contact).unwrap();
         db.delete_contact(&contact.fingerprint).unwrap();
         assert!(db.load_contact(&contact.fingerprint).unwrap().is_none());
+    }
+
+    /// DRA-0054: the DRA-0051 counterpart -- a skipped contact record
+    /// must be reported to the caller, not only logged, and a healthy
+    /// contact list must report zero.
+    #[test]
+    fn an_unreadable_contact_record_is_counted_for_the_caller() {
+        let db = temp_db();
+        let keep = sample_contact(1);
+        let planted = sample_contact(2);
+        db.save_contact(&keep).unwrap();
+        db.save_contact(&planted).unwrap();
+        assert_eq!(
+            db.list_contacts_counting_unreadable().unwrap().1,
+            0,
+            "a healthy contact list must report no unreadable records"
+        );
+
+        let victim_key = contact_key(&planted.fingerprint);
+        {
+            let write_txn = db.database.begin_write().unwrap();
+            {
+                let mut table = write_txn.open_table(crate::db::RECORDS).unwrap();
+                table.insert(victim_key.as_str(), &b"garbage"[..]).unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+
+        let (contacts, unreadable) = db.list_contacts_counting_unreadable().unwrap();
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(
+            unreadable, 1,
+            "VULNERABILITY: a damaged or tampered contact record vanishes from the list without \
+             the caller ever learning of it -- a whole conversation silently disappears"
+        );
     }
 }

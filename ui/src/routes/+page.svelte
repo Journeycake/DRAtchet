@@ -74,6 +74,11 @@
   let contacts = $state<ContactDto[]>([]);
   let selected = $state<ContactDto | null>(null);
   let messages = $state<MessageDto[]>([]);
+  // DRA-0054: how many stored records the last list call had to skip
+  // because they could not be read (damage or tampering). Non-zero shows
+  // a notice rather than letting the gap go unexplained.
+  let unreadableContacts = $state(0);
+  let unreadableMessages = $state(0);
   let loadError = $state("");
   let draft = $state("");
   let sendError = $state("");
@@ -157,6 +162,7 @@
   async function selectContact(contact: ContactDto) {
     selected = contact;
     messages = [];
+    unreadableMessages = 0;
     sendError = "";
     conversationMenuOpen = false;
     clearArmed = false;
@@ -168,9 +174,12 @@
     pendingWipeError = "";
     if (!contact.verified) return;
     try {
-      messages = await invoke<MessageDto[]>("list_messages", {
-        fingerprint: contact.fingerprint,
-      });
+      const listed = await invoke<{ messages: MessageDto[]; unreadable: number }>(
+        "list_messages",
+        { fingerprint: contact.fingerprint },
+      );
+      messages = listed.messages;
+      unreadableMessages = listed.unreadable;
     } catch (e) {
       loadError = String(e);
     }
@@ -179,7 +188,11 @@
   async function refetch() {
     const previouslySelected = selected?.fingerprint;
     try {
-      contacts = await invoke<ContactDto[]>("list_contacts");
+      const listed = await invoke<{ contacts: ContactDto[]; unreadable: number }>(
+        "list_contacts",
+      );
+      contacts = listed.contacts;
+      unreadableContacts = listed.unreadable;
     } catch (e) {
       loadError = String(e);
       return;
@@ -561,6 +574,14 @@
       <button class="settings-button" onclick={openSettings} aria-label="Settings">⚙</button>
     </div>
     <div class="search">Search conversations</div>
+    {#if unreadableContacts > 0}
+      <div class="unreadable-notice" role="status">
+        {unreadableContacts}
+        {unreadableContacts === 1 ? "saved contact" : "saved contacts"} could not be read and
+        {unreadableContacts === 1 ? "is" : "are"} not shown. The local database may be damaged
+        or have been tampered with.
+      </div>
+    {/if}
     <ul class="conversations">
       {#each contacts as contact (contact.fingerprint)}
         <li>
@@ -681,6 +702,14 @@
         </div>
       {/if}
       <div class="messages">
+        {#if unreadableMessages > 0}
+          <div class="unreadable-notice" role="status">
+            {unreadableMessages}
+            {unreadableMessages === 1 ? "message" : "messages"} in this conversation could not
+            be read and {unreadableMessages === 1 ? "is" : "are"} not shown. The local database
+            may be damaged or have been tampered with.
+          </div>
+        {/if}
         {#each messages as message (message.id)}
           <div class="bubble" class:local={message.sender_is_local}>
             {message.content}
@@ -1139,6 +1168,15 @@
 
   .error {
     color: var(--red);
+  }
+
+  .unreadable-notice {
+    margin: 8px 12px;
+    padding: 8px 12px;
+    border: 1px solid var(--red);
+    border-radius: 6px;
+    color: var(--red);
+    font-size: 13px;
   }
 
   .conversation-header {

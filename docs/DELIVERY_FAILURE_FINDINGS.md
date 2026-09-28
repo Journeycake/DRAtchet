@@ -95,6 +95,7 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0051 | Medium | `store/src/contacts.rs:136 (list_contacts)` | [`be8f0c1`](https://github.com/Journeycake/dratchet/commit/be8f0c16ee2d6c149a76bfcce6d2d9f3c28a3b84) | this doc |
 | DRA-0052 | Low | `client/src/net.rs:59 (Connection::recv)` | [`be8f0c1`](https://github.com/Journeycake/dratchet/commit/be8f0c16ee2d6c149a76bfcce6d2d9f3c28a3b84) | this doc |
 | DRA-0053 | Medium | `ui/src-tauri/src/lib.rs:832 (device_passphrase); restrict_to_owner` | [`708c22b`](https://github.com/Journeycake/dratchet/commit/708c22b70f4380c7543d99af102838c0726fc765) | this doc |
+| DRA-0054 | Low | `store/src/messages.rs:325 (list_messages_counting_unreadable); store/src/contacts.rs:143 (list_contacts_counting_unreadable); ui/src-tauri/src/lib.rs:250 (list_contacts/list_messages commands); ui/src/routes/+page.svelte (unreadable-notice)` | this commit | this doc |
 
 
 ## Summary
@@ -3992,4 +3993,38 @@ DRA-0019 noted that `identity_key`, `identity_dh_signature` and `signed_prekey_s
 - **Windows.** `restrict_to_owner` is a no-op off Unix. Windows ACLs on the user profile directory are the only protection there.
 - **Same disk as the database.** DRA-0033's residual still stands: an attacker who can read files as the *same* user gets both the keyfile and the database. A user-entered passphrase is the real fix.
 - **Other DRA residual items not attempted this round:** per-source-address limits (DRA-0031/0044/0050; they need a decision on how to identify clients behind a reverse proxy), surfacing unreadable-record counts in the UI (DRA-0048/0051), migrating legacy records at open (DRA-0041), validating at `ProfileAnnounce::decode` (DRA-0043), and the test harness's `TestClient::recv` (DRA-0052).
+
+## DRA-0054: records skipped as unreadable were only logged, never shown to the user (residual-scope follow-up to DRA-0048/DRA-0051; confirmed real, fixed) — **LOW**
+
+> **DRA-0054** · Location: `store/src/messages.rs:325 (list_messages_counting_unreadable); store/src/contacts.rs:143 (list_contacts_counting_unreadable); ui/src-tauri/src/lib.rs:250 (list_contacts/list_messages commands); ui/src/routes/+page.svelte (unreadable-notice)` · Fix: this commit
+
+DRA-0048 and DRA-0051 stopped one unreadable record from taking down a whole conversation or the whole contact list. Both left the same residual: the skip went to the log (`tracing::warn!`) and nowhere else. A user whose database was damaged or tampered with saw a conversation with messages missing, or a contact gone from the list, with no explanation.
+
+Rated **Low**: it adds no new way to cause damage. It closes an observability gap on top of damage that already requires write access to the database file.
+
+### Confirmation
+
+Two store tests, each failing with its `VULNERABILITY:` assertion when only the new count is disabled (reported as 0, which is what callers effectively got before):
+
+- `store/src/messages.rs`, `an_unreadable_message_record_is_counted_for_the_caller`
+- `store/src/contacts.rs`, `an_unreadable_contact_record_is_counted_for_the_caller`
+
+Each also asserts that a healthy database reports 0, so the notice never shows falsely.
+
+### Fixed
+
+- **Store:** new `list_messages_counting_unreadable` and `list_contacts_counting_unreadable` return `(items, unreadable)`. `list_messages`/`list_contacts` are now thin wrappers over them, so their other callers (delivery marking, profile collision checks, the poll loop) are unchanged.
+- **App:** matching `dratchet_app::list_*_counting_unreadable` wrappers.
+- **Tauri:** the `list_contacts` and `list_messages` commands return `ContactListDto { contacts, unreadable }` / `MessageListDto { messages, unreadable }`. A guard test (`list_dtos_carry_the_unreadable_count_under_the_names_the_frontend_reads`) pins the field names the frontend reads.
+- **UI:** `+page.svelte` shows a notice above the contact list or the message list whenever the count is non-zero, saying how many records could not be read and that the local database may be damaged or tampered with.
+
+**Contract change, called out:** the two Tauri commands' response shape changed from a bare array to an object. The only callers are the two `invoke` sites in `+page.svelte`, updated in the same commit.
+
+Validation: main workspace `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` (310 passed). `ui/src-tauri` fmt, clippy and `cargo test` (14 passed). `npm run check` (svelte-check: 0 errors, 0 warnings).
+
+### Known residual scope
+
+- **No recovery action.** The notice explains the gap but offers no way to act on it. The damaged records are unrecoverable by construction (DRA-0048). A "remove unreadable records" action would be a UI feature.
+- **Not verified in a running window.** The notice was type-checked, not viewed in a live Tauri window this round.
+- **Only the two list views.** Other paths that read single records (`load_contact`, ratchet state) still return an error for a damaged record rather than a count. That's appropriate for single-record reads, but it isn't surfaced any differently than before.
 
