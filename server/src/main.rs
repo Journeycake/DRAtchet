@@ -27,6 +27,15 @@ struct Args {
         env = "DRATCHETD_DIRECTORY_DB"
     )]
     directory_db: PathBuf,
+
+    /// Comma-separated CIDR ranges of reverse proxies in front of this
+    /// server (e.g. an Ingress controller's pod range). Only connections
+    /// from these addresses have their X-Forwarded-For header believed
+    /// when applying per-address connection limits (DRA-0055). Leave empty
+    /// when clients connect directly (NodePort, LoadBalancer without a
+    /// proxy); the TCP peer address is then used and can't be spoofed.
+    #[arg(long, default_value = "", env = "DRATCHETD_TRUSTED_PROXIES")]
+    trusted_proxies: String,
 }
 
 /// How often the background pruning sweep (`dratchet_server::pruning`)
@@ -54,6 +63,9 @@ async fn main() {
         .init();
 
     let args = Args::parse();
+    let trusted_proxies =
+        dratchet_server::address::TrustedProxies::parse_list(&args.trusted_proxies)
+            .unwrap_or_else(|e| panic!("invalid --trusted-proxies: {e}"));
     let (router, state) = dratchet_server::app_with_directory_db(&args.directory_db)
         .unwrap_or_else(|e| {
             panic!(
@@ -61,6 +73,13 @@ async fn main() {
                 args.directory_db.display()
             )
         });
+    if !trusted_proxies.is_empty() {
+        tracing::info!(
+            "per-address limits will read X-Forwarded-For from: {}",
+            args.trusted_proxies
+        );
+    }
+    *state.trusted_proxies.write().expect("trusted proxies lock") = trusted_proxies;
     dratchet_server::pruning::spawn_pruning_sweep(
         state,
         PRUNING_SWEEP_INTERVAL,
@@ -73,10 +92,15 @@ async fn main() {
     tracing::info!("dratchetd listening on {}", args.bind);
     tracing::info!("WebSocket endpoint: ws://{}/v1/ws", args.bind);
 
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .expect("server error");
+    // DRA-0055: connect info carries each connection's peer address to
+    // `ws_handler` for the per-address limits.
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .expect("server error");
 }
 
 /// Waits for either Ctrl-C (`SIGINT`, local/interactive use) or `SIGTERM`

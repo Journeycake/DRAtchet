@@ -60,6 +60,8 @@ pub struct SweepSummary {
     /// because the *subscriber* is non-durable. Counts subscribers, not
     /// targets.
     pub stale_subscribers_pruned: usize,
+    /// DRA-0055: idle per-source-address limiter entries dropped.
+    pub address_entries_pruned: usize,
 }
 
 /// DRA-0044: whether per-identity state for `fingerprint` is worth
@@ -158,6 +160,13 @@ pub async fn sweep_once(state: &AppState, rate_limit_bucket_stale_after: Duratio
     let new_mailbox_rate_limit_buckets_pruned = inner
         .new_mailbox_rate_limiter
         .sweep_stale(rate_limit_bucket_stale_after, Instant::now());
+    drop(inner);
+    // DRA-0055: idle per-address entries, same staleness rule.
+    let address_entries_pruned = state
+        .address_limiter
+        .lock()
+        .expect("address limiter lock")
+        .sweep_stale(rate_limit_bucket_stale_after, Instant::now());
 
     SweepSummary {
         mailbox_entries_pruned,
@@ -167,6 +176,7 @@ pub async fn sweep_once(state: &AppState, rate_limit_bucket_stale_after: Duratio
         presence_entries_pruned,
         fetch_evidence_entries_pruned,
         stale_subscribers_pruned,
+        address_entries_pruned,
     }
 }
 
@@ -196,6 +206,7 @@ pub fn spawn_pruning_sweep(
                 presence_entries_pruned = summary.presence_entries_pruned,
                 fetch_evidence_entries_pruned = summary.fetch_evidence_entries_pruned,
                 stale_subscribers_pruned = summary.stale_subscribers_pruned,
+                address_entries_pruned = summary.address_entries_pruned,
                 "pruning sweep completed"
             );
         }

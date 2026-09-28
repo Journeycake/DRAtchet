@@ -96,6 +96,7 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0052 | Low | `client/src/net.rs:59 (Connection::recv)` | [`be8f0c1`](https://github.com/Journeycake/dratchet/commit/be8f0c16ee2d6c149a76bfcce6d2d9f3c28a3b84) | this doc |
 | DRA-0053 | Medium | `ui/src-tauri/src/lib.rs:832 (device_passphrase); restrict_to_owner` | [`708c22b`](https://github.com/Journeycake/dratchet/commit/708c22b70f4380c7543d99af102838c0726fc765) | this doc |
 | DRA-0054 | Low | `store/src/messages.rs:325 (list_messages_counting_unreadable); store/src/contacts.rs:143 (list_contacts_counting_unreadable); ui/src-tauri/src/lib.rs:250 (list_contacts/list_messages commands); ui/src/routes/+page.svelte (unreadable-notice)` | [`2d214d8`](https://github.com/Journeycake/dratchet/commit/2d214d8abef21405d687ddafdbf843337fb47952) | this doc |
+| DRA-0055 | Medium | `server/src/address.rs:219 (AddressLimiter, TrustedProxies::client_ip); server/src/ws.rs:86 (ws_handler); server/src/main.rs (--trusted-proxies, connect info)` | this commit | this doc |
 
 
 ## Summary
@@ -4027,4 +4028,45 @@ Validation: main workspace `cargo fmt --check`, `cargo clippy --workspace --all-
 - **No recovery action.** The notice explains the gap but offers no way to act on it. The damaged records are unrecoverable by construction (DRA-0048). A "remove unreadable records" action would be a UI feature.
 - **Not verified in a running window.** The notice was type-checked, not viewed in a live Tauri window this round.
 - **Only the two list views.** Other paths that read single records (`load_contact`, ratchet state) still return an error for a damaged record rather than a count. That's appropriate for single-record reads, but it isn't surfaced any differently than before.
+
+## DRA-0055: nothing limited connections per source address, so one client could fill the global cap and mint unlimited identities (residual-scope follow-up to DRA-0031/DRA-0044/DRA-0050; confirmed real, fixed) — **MEDIUM**
+
+> **DRA-0055** · Location: `server/src/address.rs:219 (AddressLimiter, TrustedProxies::client_ip); server/src/ws.rs:86 (ws_handler); server/src/main.rs (--trusted-proxies, connect info)` · Fix: this commit
+
+Three earlier findings each recorded the same residual scope from a different angle:
+
+- **DRA-0031:** the 10,000-connection cap is global, so one source can hold all of it and deny service to everyone else.
+- **DRA-0044:** throwaway identities still pile up between pruning sweeps.
+- **DRA-0050:** every handler limiter is per identity, and identities are free. Authentication is self-certifying, so any connection can come online as a brand-new keypair.
+
+The server had no way to attribute connections to their source. `axum::serve` was given the bare router, so the peer address never reached `ws_handler`.
+
+Rated **Medium**, matching DRA-0050: a denial of service against every user, but one that needs sustained connection volume from the attacker.
+
+### Confirmation
+
+`server/tests/per_address_connection_limits.rs`, served with connect info exactly as `src/main.rs` now does. With only the new check disabled (the limiter's verdict discarded), both confirming tests fail with their `VULNERABILITY:` assertion:
+
+- `one_address_cannot_hold_an_unbounded_share_of_connections`: "address held 32 connections and was still admitted another".
+- `one_address_cannot_mint_identities_as_fast_as_it_can_connect`: "120 back-to-back connections from one address each came online as a new identity with none refused".
+
+### Fixed
+
+- **New module `server/src/address.rs`.** An `AddressLimiter` allows at most `MAX_CONNECTIONS_PER_ADDRESS` (32) concurrent connections per address. It also runs a token bucket on opening connections: a burst of 60, then 1 per second. A connection can authenticate only once, so this also caps how fast one address can bring new identities online. IPv6 addresses are grouped by /64, since one host normally holds a whole /64.
+- **Which address is used.** By default, the TCP peer address, which can't be spoofed. That's correct for NodePort, and for LoadBalancer deployments with no proxy in front. Behind the chart's optional Ingress, the operator sets `--trusted-proxies` / `DRATCHETD_TRUSTED_PROXIES` (chart value `config.trustedProxies`) to the controller's address range. Only for a connection *from* a trusted proxy is `X-Forwarded-For` read, walked right to left past further trusted hops. The header is ignored from anyone else, and an unparseable entry falls back to the peer rather than guessing.
+- **`ws_handler`** checks the limit before the upgrade, next to DRA-0031's global cap, and answers `429` with a body naming which limit fired. The concurrent slot is held by a guard moved into the upgrade callback, so it's released when the connection ends, or immediately if the upgrade never completes.
+- **`src/main.rs`** serves with `into_make_service_with_connect_info::<SocketAddr>()`. If a router is ever served without connect info, the limits are skipped and a warning is logged once. That path exists only for in-process tests.
+- **Pruning:** idle per-address entries (no live connections, bucket refilled) are swept on the existing pruning timer.
+
+**Contract change, called out:** `ws_handler` takes two more extractors (optional connect info, headers). Its route and wire behaviour are unchanged for existing callers. `server/tests/common/mod.rs` gained two additive helpers, `TestClient::from_stream` and `TestClient::close`.
+
+Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (319 passed, including 6 new unit tests in `address.rs` and the 3 integration tests). `ui/src-tauri` fmt/clippy/test (14 passed). Smoke test against the real `dratchetd` binary: 45 parallel upgrade requests from one address gave 32 × `101` and 13 × `429`, and the "no peer address" warning never appeared.
+
+### Known residual scope
+
+- **Many addresses still add up.** An attacker with many source addresses (a botnet, or cheap IPv6 /64s) gets a separate budget for each. The global cap (DRA-0031) is still the backstop.
+- **Shared addresses share a budget.** Users behind one carrier-grade NAT share 32 concurrent connections. The limits are constants in `address.rs`, not settings. Make them configurable if a real deployment hits them.
+- **Misconfigured `trustedProxies` breaks the limit.** Leaving it empty behind an Ingress counts every client as the controller's one address. Listing a range clients can reach directly lets them spoof their address. The chart and README both say this; nothing enforces it.
+- **In-process routers skip the check.** A router served without connect info (tests only today) runs without per-address limits, with a one-time warning.
+- **Chart template not rendered here.** `helm` isn't installed in this environment; the change is one quoted `ConfigMap` value.
 

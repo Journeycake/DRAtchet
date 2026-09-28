@@ -31,12 +31,13 @@
 //! they have no reason to ever be discoverable by `username#NNNN`, only to
 //! authenticate to read/write the Tier 1 mailbox they already agreed on.
 
+use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::{ConnectInfo, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
@@ -63,7 +64,12 @@ use crate::state::{
 /// exhausted one here).
 const OTP_EXHAUSTION_ALERT_THRESHOLD: u32 = 10;
 
-pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> Response {
+pub async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
     // DRA-0031: a hard ceiling on total concurrent connections, checked
     // before the HTTP upgrade completes -- otherwise an attacker can open
     // an unbounded number of bare, unauthenticated connections, each
@@ -73,6 +79,47 @@ pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>
         return (StatusCode::SERVICE_UNAVAILABLE, "too many connections").into_response();
     }
 
+    // DRA-0055: per-source-address limits (`crate::address`), also before
+    // the upgrade. The slot is held by `address_slot`, which moves into
+    // the upgrade callback, so it is released when the connection ends --
+    // or straight away if the upgrade never completes.
+    let address_slot = match connect_info {
+        Some(ConnectInfo(peer)) => {
+            let client = state
+                .trusted_proxies
+                .read()
+                .expect("trusted proxies lock")
+                .client_ip(peer.ip(), &headers);
+            let key = crate::address::AddressKey::of(client);
+            let admitted = state
+                .address_limiter
+                .lock()
+                .expect("address limiter lock")
+                .try_acquire(key, std::time::Instant::now());
+            if let Err(refusal) = admitted {
+                tracing::warn!(?refusal, "connection refused: per-address limit (DRA-0055)");
+                return (StatusCode::TOO_MANY_REQUESTS, refusal.message()).into_response();
+            }
+            Some(AddressSlot {
+                state: state.clone(),
+                key,
+            })
+        }
+        None => {
+            // Only reachable when the router is served without
+            // `into_make_service_with_connect_info` (in-process tests).
+            // `src/main.rs` always provides it; say so loudly if not.
+            static WARN_ONCE: Once = Once::new();
+            WARN_ONCE.call_once(|| {
+                tracing::warn!(
+                    "no peer address available: per-address connection limits are disabled \
+                     (serve with into_make_service_with_connect_info::<SocketAddr>())"
+                )
+            });
+            None
+        }
+    };
+
     // DRA-0030: without an explicit ceiling here, axum/tokio-tungstenite
     // defaults to a 64 MiB per-message limit -- enforced transport-side,
     // before any application-layer cap in `state.rs` (MAX_ENVELOPE_LEN,
@@ -80,8 +127,26 @@ pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>
     // TCP connection whether or not it has authenticated.
     ws.max_message_size(crate::state::MAX_WS_MESSAGE_BYTES)
         .max_frame_size(crate::state::MAX_WS_MESSAGE_BYTES)
-        .on_upgrade(move |socket| handle_socket(socket, state))
+        .on_upgrade(move |socket| async move {
+            let _address_slot = address_slot;
+            handle_socket(socket, state).await
+        })
         .into_response()
+}
+
+/// DRA-0055: one per-address concurrent-connection slot, handed back to
+/// `AppState::address_limiter` on drop.
+struct AddressSlot {
+    state: Arc<AppState>,
+    key: crate::address::AddressKey,
+}
+
+impl Drop for AddressSlot {
+    fn drop(&mut self) {
+        if let Ok(mut limiter) = self.state.address_limiter.lock() {
+            limiter.release(self.key);
+        }
+    }
 }
 
 /// Decrements `AppState::active_connections` when dropped — guarantees the

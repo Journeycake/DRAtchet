@@ -5,6 +5,7 @@
 //! bound to a real port or driven in-process.
 
 pub mod abuse;
+pub mod address;
 pub mod error;
 pub mod persistence;
 pub mod protocol;

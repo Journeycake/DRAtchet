@@ -7,3 +7,4 @@ metadata:
 data:
   DRATCHETD_BIND: "0.0.0.0:{{ .Values.service.port }}"
   RUST_LOG: {{ .Values.config.logLevel | quote }}
+  DRATCHETD_TRUSTED_PROXIES: {{ .Values.config.trustedProxies | quote }}

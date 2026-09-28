@@ -103,6 +103,7 @@ the protocol itself, not tunable at deploy time.
 |---|---|---|---|
 | Bind address | `--bind <addr>` | `DRATCHETD_BIND` | `127.0.0.1:8787` |
 | Directory database path | `--directory-db <path>` | `DRATCHETD_DIRECTORY_DB` | `dratchetd-directory.redb` |
+| Trusted reverse proxies (CIDRs) | `--trusted-proxies <list>` | `DRATCHETD_TRUSTED_PROXIES` | empty (use the TCP peer address) |
 
 ```sh
 # Listen on all interfaces, a non-default port, via the flag:
@@ -276,6 +277,7 @@ helm test dratchet
 | `replicaCount` | `1` | See the scaling warning above — change with care. |
 | `service.port` | `8787` | Also becomes `DRATCHETD_BIND`'s port via the chart's `ConfigMap`. |
 | `config.logLevel` | `"info"` | `RUST_LOG` value passed to the container. |
+| `config.trustedProxies` | `""` | `DRATCHETD_TRUSTED_PROXIES`. Set to the ingress controller's pod CIDR when `ingress.enabled: true`, so per-address connection limits see real client addresses (DRA-0055). |
 | `resources` | `50m`/`32Mi` requests, `500m`/`256Mi` limits | Conservative starting points — use `tests/stress.rs`'s load pattern as a starting point for load-testing your own limits before tuning these. |
 | `probes.liveness` / `probes.readiness` | both hit `/healthz` | Identical by design — there's no dependency (database, external call) for readiness to check that liveness doesn't already cover. |
 | `terminationGracePeriodSeconds` | `30` | Time given to `SIGTERM`-triggered graceful shutdown (see above) to let in-flight WebSocket connections wind down before a forced kill. |

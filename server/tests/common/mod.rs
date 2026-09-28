@@ -44,6 +44,20 @@ impl TestClient {
         TestClient { ws }
     }
 
+    /// Wrap an already-connected stream, for a test that needs to inspect
+    /// the connect result itself first.
+    #[allow(dead_code)]
+    pub fn from_stream(ws: WsStream) -> Self {
+        TestClient { ws }
+    }
+
+    /// Close the connection cleanly (a WebSocket Close frame), so the
+    /// server sees the disconnect promptly.
+    #[allow(dead_code)]
+    pub async fn close(mut self) {
+        let _ = self.ws.close(None).await;
+    }
+
     pub async fn send<T: Serialize>(&mut self, tag: FrameTag, body: &T) {
         let frame = encode(tag, body);
         self.ws

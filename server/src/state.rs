@@ -299,6 +299,13 @@ pub struct AppState {
     /// is actually enforced without needing to open thousands of real
     /// connections against the real 10,000 default.
     pub connection_cap: usize,
+    /// DRA-0055 — per-source-address concurrent and new-connection limits
+    /// (`crate::address`). A plain mutex outside `inner`: touched once per
+    /// connect and once per disconnect, never while holding `inner`.
+    pub address_limiter: std::sync::Mutex<crate::address::AddressLimiter>,
+    /// DRA-0055 — reverse proxies whose `X-Forwarded-For` is believed.
+    /// Empty by default; set once at startup by `src/main.rs`.
+    pub trusted_proxies: std::sync::RwLock<crate::address::TrustedProxies>,
 }
 
 impl AppState {
@@ -308,6 +315,8 @@ impl AppState {
             persistence: None,
             active_connections: AtomicUsize::new(0),
             connection_cap: MAX_CONCURRENT_CONNECTIONS,
+            address_limiter: Default::default(),
+            trusted_proxies: Default::default(),
         })
     }
 
@@ -322,6 +331,8 @@ impl AppState {
             persistence: None,
             active_connections: AtomicUsize::new(0),
             connection_cap: cap,
+            address_limiter: Default::default(),
+            trusted_proxies: Default::default(),
         })
     }
 
@@ -348,6 +359,8 @@ impl AppState {
             persistence: Some(persistence),
             active_connections: AtomicUsize::new(0),
             connection_cap: MAX_CONCURRENT_CONNECTIONS,
+            address_limiter: Default::default(),
+            trusted_proxies: Default::default(),
         })
     }
 }
