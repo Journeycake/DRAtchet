@@ -820,24 +820,65 @@ fn device_passphrase_path(db_path: &std::path::Path) -> std::path::PathBuf {
 /// per-device secret: this was a live loose end DRA-0033 itself left
 /// behind, caught reviewing that fix's own memory-handling discipline
 /// against the rest of this codebase's established pattern.
-fn device_passphrase(db_path: &std::path::Path) -> zeroize::Zeroizing<String> {
+///
+/// DRA-0053: the keyfile is owner-only (0600 on Unix) -- created that
+/// way, and tightened if an earlier build left it at the default
+/// umask-derived mode -- since anyone who can read it can decrypt the
+/// database. A failure to persist a newly generated passphrase is an
+/// error, not something to shrug off: the caller would otherwise create
+/// a database under a secret that is gone on the next launch. Every
+/// intermediate copy (the file contents as read, the raw random bytes,
+/// the hex encoding) is `Zeroizing` too, closing DRA-0036's residual.
+fn device_passphrase(db_path: &std::path::Path) -> std::io::Result<zeroize::Zeroizing<String>> {
+    use zeroize::Zeroizing;
+
     let keyfile_path = device_passphrase_path(db_path);
     if let Ok(existing) = std::fs::read_to_string(&keyfile_path) {
+        let existing = Zeroizing::new(existing);
         let trimmed = existing.trim();
         if !trimmed.is_empty() {
-            return zeroize::Zeroizing::new(trimmed.to_string());
+            restrict_to_owner(&keyfile_path)?;
+            return Ok(Zeroizing::new(trimmed.to_string()));
         }
     }
-    let random_bytes = dratchet_client::handshake::random_routing_id();
-    let passphrase: String = random_bytes.iter().map(|b| format!("{b:02x}")).collect();
-    let _ = std::fs::write(&keyfile_path, &passphrase);
-    zeroize::Zeroizing::new(passphrase)
+    let random_bytes = Zeroizing::new(dratchet_client::handshake::random_routing_id());
+    let mut passphrase = Zeroizing::new(String::with_capacity(random_bytes.len() * 2));
+    for b in random_bytes.iter() {
+        for nibble in [b >> 4, b & 0x0f] {
+            passphrase.push(char::from_digit(u32::from(nibble), 16).expect("nibble < 16"));
+        }
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(&keyfile_path)?;
+    // `mode` only applies when the file is newly created; an existing
+    // (empty) keyfile keeps whatever it had until this.
+    restrict_to_owner(&keyfile_path)?;
+    std::io::Write::write_all(&mut file, passphrase.as_bytes())?;
+    file.sync_all()?;
+    Ok(passphrase)
+}
+
+/// DRA-0053: owner read/write only. A no-op off Unix, where file
+/// permissions don't use mode bits.
+fn restrict_to_owner(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let db_path = dev_db_path();
-    let passphrase = device_passphrase(&db_path);
+    let passphrase = device_passphrase(&db_path).expect("persist the device keyfile");
     let db = if db_path.exists() {
         Db::open(&db_path, &passphrase).expect("open dev db")
     } else {
@@ -1115,7 +1156,7 @@ mod tests {
     fn device_passphrase_is_high_entropy_and_not_the_old_shared_constant() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("a.redb");
-        let passphrase = device_passphrase(&db_path);
+        let passphrase = device_passphrase(&db_path).unwrap();
         assert_ne!(
             passphrase.as_str(),
             "dev",
@@ -1137,8 +1178,8 @@ mod tests {
     fn device_passphrase_persists_across_calls_for_the_same_path() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("a.redb");
-        let first = device_passphrase(&db_path);
-        let second = device_passphrase(&db_path);
+        let first = device_passphrase(&db_path).unwrap();
+        let second = device_passphrase(&db_path).unwrap();
         assert_eq!(
             first, second,
             "the same db path must always get back the same passphrase, or a real database \
@@ -1152,8 +1193,8 @@ mod tests {
     #[test]
     fn different_db_paths_get_different_passphrases() {
         let dir = tempfile::tempdir().unwrap();
-        let a = device_passphrase(&dir.path().join("a.redb"));
-        let b = device_passphrase(&dir.path().join("b.redb"));
+        let a = device_passphrase(&dir.path().join("a.redb")).unwrap();
+        let b = device_passphrase(&dir.path().join("b.redb")).unwrap();
         assert_ne!(a, b);
     }
 
@@ -1166,7 +1207,7 @@ mod tests {
     fn device_passphrase_path_matches_what_full_wipes_cleanup_removes() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("a.redb");
-        let _ = device_passphrase(&db_path);
+        device_passphrase(&db_path).unwrap();
         let keyfile = device_passphrase_path(&db_path);
         assert!(
             keyfile.exists(),
@@ -1177,6 +1218,69 @@ mod tests {
             !keyfile.exists(),
             "VULNERABILITY: full_wipe's cleanup path must actually match where \
              device_passphrase writes the keyfile, or a duress wipe leaves it behind"
+        );
+    }
+
+    /// DRA-0053: the keyfile holds the secret that decrypts the whole
+    /// local database, so no other local account may read it.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_keyfile_is_readable_only_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("a.redb");
+        device_passphrase(&db_path).unwrap();
+        let mode = std::fs::metadata(device_passphrase_path(&db_path))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "VULNERABILITY: keyfile mode is {mode:o} -- group/other can read the secret that \
+             decrypts the local database"
+        );
+    }
+
+    /// DRA-0053: a keyfile an earlier build wrote with the default mode
+    /// is tightened the next time it is read, not left exposed forever.
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_world_readable_keyfile_is_tightened_on_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("a.redb");
+        let keyfile = device_passphrase_path(&db_path);
+        std::fs::write(&keyfile, "ab".repeat(32)).unwrap();
+        std::fs::set_permissions(&keyfile, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let passphrase = device_passphrase(&db_path).unwrap();
+        assert_eq!(
+            passphrase.as_str(),
+            "ab".repeat(32),
+            "existing secret is kept"
+        );
+        let mode = std::fs::metadata(&keyfile).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "VULNERABILITY: a pre-existing keyfile stays at mode {mode:o}, readable by other \
+             local accounts"
+        );
+    }
+
+    /// DRA-0053: if the new passphrase can't be persisted, the caller
+    /// must hear about it -- otherwise a database gets created under a
+    /// secret that no longer exists on the next launch.
+    #[test]
+    fn a_passphrase_that_cannot_be_persisted_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("missing-dir").join("a.redb");
+        let result = device_passphrase(&db_path);
+        assert!(
+            result.is_err(),
+            "VULNERABILITY: device_passphrase handed back a secret it failed to save; a \
+             database created with it could never be reopened"
         );
     }
 }

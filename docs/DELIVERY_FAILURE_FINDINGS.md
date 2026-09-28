@@ -94,6 +94,7 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0050 | Medium | `server/src/abuse.rs:325 (MailboxDeleteRateLimiter); server/src/ws.rs:494` | [`be8f0c1`](https://github.com/Journeycake/dratchet/commit/be8f0c16ee2d6c149a76bfcce6d2d9f3c28a3b84) | this doc |
 | DRA-0051 | Medium | `store/src/contacts.rs:136 (list_contacts)` | [`be8f0c1`](https://github.com/Journeycake/dratchet/commit/be8f0c16ee2d6c149a76bfcce6d2d9f3c28a3b84) | this doc |
 | DRA-0052 | Low | `client/src/net.rs:59 (Connection::recv)` | [`be8f0c1`](https://github.com/Journeycake/dratchet/commit/be8f0c16ee2d6c149a76bfcce6d2d9f3c28a3b84) | this doc |
+| DRA-0053 | Medium | `ui/src-tauri/src/lib.rs:832 (device_passphrase); restrict_to_owner` | this commit | this doc |
 
 
 ## Summary
@@ -3952,3 +3953,43 @@ Rated **Low**: it discards diagnostic information and degrades error handling, b
 
 - **`server/tests/common/mod.rs::TestClient::recv` has the identical shape**, and is what actually surfaced this finding in the first place (while debugging this very round's `MailboxDelete` non-regression test, a genuinely-allowed server response tripped the same masking in the *test harness*, not the product). Left unfixed deliberately: it is test-only code, never shipped, and every test in the suite already either expects success or explicitly branches on `FrameTag::Error` before decoding when a refusal is the expected outcome — the harness's callers, unlike the app's, already know which shape they're getting into. Worth a matching fix anyway for the same clarity `client::net::Connection::recv` just gained, but out of scope for a shipped-code finding.
 - **The new error string is not machine-distinguishable from other `String` errors.** `app`/UI code that wants to specifically detect "the server rate-limited me" (to drive a backoff) still has to string-match `"server refused the request:"` plus the message text, since `Connection::recv`'s return type is `Result<_, String>` throughout, not a typed error enum. A typed client-side error (mirroring `server::error::Error`) would let callers match on it properly; that's a larger interface change than this fix's scope.
+
+## DRA-0053: the device keyfile was created readable by other local accounts, and a failed write was silently ignored (residual-scope follow-up to DRA-0033/DRA-0036; confirmed real, fixed) — **MEDIUM**
+
+> **DRA-0053** · Location: `ui/src-tauri/src/lib.rs:832 (device_passphrase); restrict_to_owner` · Fix: this commit
+
+Found while closing DRA-0036's residual scope (non-zeroized intermediate copies in `device_passphrase`). Reviewing that function turned up two further defects at the same write call:
+
+- **Default permissions.** `std::fs::write` created the keyfile with the process umask's default mode (typically 0644 on Unix). The keyfile holds the passphrase that decrypts the entire local database, so any other local account could read it and decrypt the database.
+- **Ignored write failure.** `let _ = std::fs::write(...)` discarded the result. If the write failed, the caller still got a passphrase and created the database under it, but nothing was persisted, so the database could not be reopened on the next launch.
+
+Rated **Medium**: it needs a local account on the same machine (or a failed write), and it does not affect remote parties.
+
+### Confirmation
+
+Three tests in `ui/src-tauri/src/lib.rs`, each failing with its `VULNERABILITY:` assertion when only the new safeguards are disabled (mode back to 0644, no tightening, open/write failure ignored):
+
+- `a_new_keyfile_is_readable_only_by_its_owner` — observed mode 100644 pre-fix.
+- `an_existing_world_readable_keyfile_is_tightened_on_read` — a keyfile left at 0644 by an earlier build stayed at 0644 pre-fix.
+- `a_passphrase_that_cannot_be_persisted_is_an_error` — a keyfile path in a missing directory still returned a passphrase pre-fix.
+
+### Fixed
+
+- The keyfile is opened with mode 0600 on Unix, and `restrict_to_owner` tightens an existing keyfile to 0600 whenever it is read or rewritten.
+- `device_passphrase` now returns `std::io::Result`. Open, write and `sync_all` failures propagate. `run()` treats a failure as fatal, matching its existing `Db::open`/`Db::create` handling.
+- DRA-0036 residual closed: the file contents as read, the raw random bytes and the hex encoding are all `Zeroizing`. The hex string is built in a pre-sized buffer, so it never reallocates and leaves no stray copy behind.
+
+**Contract change, called out:** `device_passphrase`'s return type changed from `Zeroizing<String>` to `io::Result<Zeroizing<String>>`. The four existing DRA-0033/DRA-0035 tests now `.unwrap()` it. Their assertions are unchanged.
+
+Validation: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` in `ui/src-tauri` (13 passed). The main workspace is untouched by this change and its full suite passed at `35625df`.
+
+### Also reviewed this round: DRA-0019's residual scope
+
+DRA-0019 noted that `identity_key`, `identity_dh_signature` and `signed_prekey_sig` are not length-checked at the publish site. They are checked before anything is stored: `PrekeyBundle::verify()` goes through `identity::verify_signature`, which rejects a public key that isn't exactly 32 bytes and a signature that isn't exactly 64 bytes before the bundle reaches the directory. DRA-0030's 1 MiB frame ceiling bounds the transient parsing cost. No code change needed.
+
+### Known residual scope
+
+- **Windows.** `restrict_to_owner` is a no-op off Unix. Windows ACLs on the user profile directory are the only protection there.
+- **Same disk as the database.** DRA-0033's residual still stands: an attacker who can read files as the *same* user gets both the keyfile and the database. A user-entered passphrase is the real fix.
+- **Other DRA residual items not attempted this round:** per-source-address limits (DRA-0031/0044/0050; they need a decision on how to identify clients behind a reverse proxy), surfacing unreadable-record counts in the UI (DRA-0048/0051), migrating legacy records at open (DRA-0041), validating at `ProfileAnnounce::decode` (DRA-0043), and the test harness's `TestClient::recv` (DRA-0052).
+
