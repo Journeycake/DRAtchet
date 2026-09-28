@@ -95,7 +95,7 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0051 | Medium | `store/src/contacts.rs:136 (list_contacts)` | [`be8f0c1`](https://github.com/Journeycake/dratchet/commit/be8f0c16ee2d6c149a76bfcce6d2d9f3c28a3b84) | this doc |
 | DRA-0052 | Low | `client/src/net.rs:59 (Connection::recv)` | [`be8f0c1`](https://github.com/Journeycake/dratchet/commit/be8f0c16ee2d6c149a76bfcce6d2d9f3c28a3b84) | this doc |
 | DRA-0053 | Medium | `ui/src-tauri/src/lib.rs:832 (device_passphrase); restrict_to_owner` | [`708c22b`](https://github.com/Journeycake/dratchet/commit/708c22b70f4380c7543d99af102838c0726fc765) | this doc |
-| DRA-0054 | Low | `store/src/messages.rs:325 (list_messages_counting_unreadable); store/src/contacts.rs:143 (list_contacts_counting_unreadable); ui/src-tauri/src/lib.rs:250 (list_contacts/list_messages commands); ui/src/routes/+page.svelte (unreadable-notice)` | this commit | this doc |
+| DRA-0054 | Low | `store/src/messages.rs:325 (list_messages_counting_unreadable); store/src/contacts.rs:143 (list_contacts_counting_unreadable); ui/src-tauri/src/lib.rs:250 (list_contacts/list_messages commands); ui/src/routes/+page.svelte (unreadable-notice)` | [`2d214d8`](https://github.com/Journeycake/dratchet/commit/2d214d8abef21405d687ddafdbf843337fb47952) | this doc |
 
 
 ## Summary
@@ -3996,7 +3996,7 @@ DRA-0019 noted that `identity_key`, `identity_dh_signature` and `signed_prekey_s
 
 ## DRA-0054: records skipped as unreadable were only logged, never shown to the user (residual-scope follow-up to DRA-0048/DRA-0051; confirmed real, fixed) — **LOW**
 
-> **DRA-0054** · Location: `store/src/messages.rs:325 (list_messages_counting_unreadable); store/src/contacts.rs:143 (list_contacts_counting_unreadable); ui/src-tauri/src/lib.rs:250 (list_contacts/list_messages commands); ui/src/routes/+page.svelte (unreadable-notice)` · Fix: this commit
+> **DRA-0054** · Location: `store/src/messages.rs:325 (list_messages_counting_unreadable); store/src/contacts.rs:143 (list_contacts_counting_unreadable); ui/src-tauri/src/lib.rs:250 (list_contacts/list_messages commands); ui/src/routes/+page.svelte (unreadable-notice)` · Fix: [`2d214d8`](https://github.com/Journeycake/dratchet/commit/2d214d8abef21405d687ddafdbf843337fb47952)
 
 DRA-0048 and DRA-0051 stopped one unreadable record from taking down a whole conversation or the whole contact list. Both left the same residual: the skip went to the log (`tracing::warn!`) and nowhere else. A user whose database was damaged or tampered with saw a conversation with messages missing, or a contact gone from the list, with no explanation.
 
