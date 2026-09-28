@@ -36,6 +36,66 @@ layer), `core/src/ratchet.rs`'s `tests` module (ratchet layer, new cases
 added alongside the many that already existed), `app/tests/delivery_failures.rs`
 (app layer).
 
+## Finding index
+
+Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion Bugs database. Locations are `path:line (symbol)` as of commit `be8f0c1`. Line numbers drift as the code changes, so treat the symbol as authoritative. DRA-0001–DRA-0011 and DRA-0013 predate DRA numbering; their write-ups are the numbered sections below.
+
+| ID | Severity | Location | Fix | Write-up |
+|---|---|---|---|---|
+| DRA-0001 | High | `ui/src-tauri/src/lib.rs:640 (poll_loop); :549 (connect_authenticate_and_reconcile)` | [`0effc50`](https://github.com/Journeycake/dratchet/commit/0effc50880264ff46a1046669276660c348796cf) | #23 |
+| DRA-0002 | Medium | `store/src/messages.rs:317 (list_messages); store/src/db.rs (Db::message_sequence)` | [`779c449`](https://github.com/Journeycake/dratchet/commit/779c4498c83576b83a32b660873f9f8a91e122ab) | #26 |
+| DRA-0003 | High | `server/src/ws.rs:459 (MailboxFetch written_by filter)` | [`d745e2b`](https://github.com/Journeycake/dratchet/commit/d745e2bddf2431a06452a8211482aa0a352a368f) | #27 |
+| DRA-0004 | Medium | `store/src/messages.rs:360 (mark_message_delivered); core/src/payload.rs (DeliveryAck)` | [`890f3f6`](https://github.com/Journeycake/dratchet/commit/890f3f607125b4281d462ccc4536778a5973238e) | #28 |
+| DRA-0005 | High | `core/src/ratchet.rs:106 (content_delivered_contiguous), :393` | [`30f2f04`](https://github.com/Journeycake/dratchet/commit/30f2f04d2fa6f49b79e64fb6de545f8d69d9e40e) | #29 |
+| DRA-0006 | High | `app/src/lib.rs:1507 (request_conversation_wipe)` | [`4502476`](https://github.com/Journeycake/dratchet/commit/450247610a52bcb996e59a33ec84694c5f382558) | #30 |
+| DRA-0007 | High | `app/src/lib.rs:1102 (apply_entry), :1217 (fresh load_contact)` | [`992a6ab`](https://github.com/Journeycake/dratchet/commit/992a6abf7d122f1a4ec8b800dcebe3a1e12f3a3e) | #31 |
+| DRA-0008 | High | `store/src/db.rs:287 (delete_many); store/src/wipe_policy.rs:132 (wipe_conversation_since)` | [`992a6ab`](https://github.com/Journeycake/dratchet/commit/992a6abf7d122f1a4ec8b800dcebe3a1e12f3a3e) | #32 |
+| DRA-0009 | Medium | `store/src/db.rs:132 (Db::open, recover_message_sequence)` | [`992a6ab`](https://github.com/Journeycake/dratchet/commit/992a6abf7d122f1a4ec8b800dcebe3a1e12f3a3e) | #33 |
+| DRA-0010 | High | `store/src/db.rs:391 (quick_wipe), :441 (full_wipe)` | [`65ba07f`](https://github.com/Journeycake/dratchet/commit/65ba07f03537cd976651ed5cf14243c370556f22) | #34 |
+| DRA-0011 | Low | `ui/src/routes/+page.svelte:151 (clearInFlight)` | [`27de04a`](https://github.com/Journeycake/dratchet/commit/27de04a52635b9f9b1b70eaca5dbb39dae9116e0) | UI double-fire section |
+| DRA-0012 | Medium | `store/src/db.rs:199 (receive_lock); app/src/lib.rs:902 (receive_pending)` | [`92e625b`](https://github.com/Journeycake/dratchet/commit/92e625b02cd3c61aad10f961bc142932786066a6) | this doc |
+| DRA-0013 | Low | `store/src/db.rs:287 (delete_many) -- environment-level, no code defect` | — | #34, environment-level sub-finding |
+| DRA-0014 | High | `server/src/ws.rs:560 (mailbox_id_belongs_to_someone_else); server/src/state.rs:272 (bootstrap_mailbox_belongs_to_another)` | [`d98e295`](https://github.com/Journeycake/dratchet/commit/d98e29582e39a35106acd6eb0a4b24b3139ca900) | this doc |
+| DRA-0015 | Medium | `server/src/state.rs:32 (MAX_ENVELOPE_LEN), :43 (MAX_MAILBOX_ENTRIES); server/src/ws.rs:375, :403 (MailboxWrite)` | [`284f261`](https://github.com/Journeycake/dratchet/commit/284f261178867b5a6e88e446f821e3732ed24a40) | this doc |
+| DRA-0016 | Medium | `store/src/profile.rs:49 (record_peer_profile)` | [`28caaf3`](https://github.com/Journeycake/dratchet/commit/28caaf338cdbb99bc0e98fedea9576fe770a8975) | this doc |
+| DRA-0017 | Medium | `server/src/state.rs:57 (MAX_ENTRIES_PER_WRITER_PER_MAILBOX); server/src/ws.rs:410` | [`b4a9ef7`](https://github.com/Journeycake/dratchet/commit/b4a9ef7d2dcc719fd3cae36e2c719cf96e697b61) | this doc |
+| DRA-0018 | High | `server/src/abuse.rs:136 (NewMailboxRateLimiter); server/src/ws.rs:396` | [`a09714b`](https://github.com/Journeycake/dratchet/commit/a09714bcd5b24fd3cb79c31f2d37be7490764109) | this doc |
+| DRA-0019 | High | `server/src/state.rs:67 (MAX_ONE_TIME_PREKEYS_PER_PUBLISH); server/src/ws.rs:576-585 (publish_bundle checks)` | [`a4dfa53`](https://github.com/Journeycake/dratchet/commit/a4dfa53322e4659066df45086fb998071f40d6ff) | this doc |
+| DRA-0020 | High | `app/src/lib.rs:1552 (confirm_pending_wipe)` | [`3b1c523`](https://github.com/Journeycake/dratchet/commit/3b1c523c9e344187d4d6b573b1a2d5226e5f1444) | this doc |
+| DRA-0021 | High | `app/src/lib.rs:1231 (apply_entry, WIPE_REQUEST arm)` | [`9d456fb`](https://github.com/Journeycake/dratchet/commit/9d456fb1cfcd9537460b3930aa2a37eb7116831c) | this doc |
+| DRA-0022 | Critical | `client/src/handshake.rs:171 (respond), :192 (response_signature check)` | [`39ab88b`](https://github.com/Journeycake/dratchet/commit/39ab88b080ac0e260049ccff173f52a8b0bfdff5) | this doc |
+| DRA-0023 | High | `core/src/account.rs:161 (peek_one_time_prekey_secret); app/src/lib.rs:678 (try_accept_first_contact), :759` | [`3d0ab36`](https://github.com/Journeycake/dratchet/commit/3d0ab36da2460d9b95824b45bec831fc78d9f33e) | this doc |
+| DRA-0024 | High | `core/src/username.rs:36 (has_only_allowed_characters); server/src/ws.rs:582` | [`2bb19ab`](https://github.com/Journeycake/dratchet/commit/2bb19ab70c45d997b6acbdf2dd1a24cbf16bbdad) | this doc |
+| DRA-0025 | High | `store/src/profile.rs:49 (record_peer_profile); core/src/username.rs:36` | [`fa8f59a`](https://github.com/Journeycake/dratchet/commit/fa8f59ae5d8770927cca1321b468481dcea98378) | this doc |
+| DRA-0026 | High | `server/src/ws.rs:786 (validate_rendezvous_payload)` | [`fa8f59a`](https://github.com/Journeycake/dratchet/commit/fa8f59ae5d8770927cca1321b468481dcea98378) | this doc |
+| DRA-0027 | Medium | `ui/src-tauri/tauri.conf.json:21 (csp)` | [`aff9cc9`](https://github.com/Journeycake/dratchet/commit/aff9cc900dc97340b6d558d469b69c8040f7f7c7) | this doc |
+| DRA-0028 | Low | `ui/src-tauri/capabilities/default.json:6 (permissions)` | [`39c2fb7`](https://github.com/Journeycake/dratchet/commit/39c2fb7d98afd9953fe5fb0454b20207e2f9184d) | this doc |
+| DRA-0029 | Low | `ui/package.json:30 (overrides: cookie ^0.7.2)` | [`72e7254`](https://github.com/Journeycake/dratchet/commit/72e72549f83fd2ddd8549981fa7a8039d9c6f847) | this doc |
+| DRA-0030 | High | `server/src/state.rs:141 (MAX_WS_MESSAGE_BYTES); server/src/ws.rs:81` | [`70ff977`](https://github.com/Journeycake/dratchet/commit/70ff9773d847624ee75a897becbffe72af55427a) | this doc |
+| DRA-0031 | High | `server/src/state.rs:126 (MAX_CONCURRENT_CONNECTIONS); server/src/ws.rs:72 (ws_handler)` | [`b2ebf6a`](https://github.com/Journeycake/dratchet/commit/b2ebf6a2b889e72d91e6c095c1869c6e20551b7d) | this doc |
+| DRA-0032 | High | `app/src/lib.rs:1179 (apply_entry, WIPE_POLICY_ANNOUNCE arm)` | [`888ef85`](https://github.com/Journeycake/dratchet/commit/888ef85d330b72067c8ccea6cfe89dd5650dabfa) | this doc |
+| DRA-0033 | Critical | `ui/src-tauri/src/lib.rs:823 (device_passphrase)` | [`555e476`](https://github.com/Journeycake/dratchet/commit/555e476bbcc5a29a4ba35e830d3a82ebe17cb4f4) | this doc |
+| DRA-0034 | Medium | `scripts/deploy-rke2-test.sh:114 (remote_tarball)` | [`5700a76`](https://github.com/Journeycake/dratchet/commit/5700a766f12c99390caf4b871d6b2985fa76cfc2) | this doc |
+| DRA-0035 | Low | `ui/src-tauri/src/lib.rs:807 (device_passphrase_path), :522 (full_wipe)` | [`e0cbb0a`](https://github.com/Journeycake/dratchet/commit/e0cbb0a83cfe461d1088aaf7622bed876ab6bb45) | this doc |
+| DRA-0036 | Low | `ui/src-tauri/src/lib.rs:823 (device_passphrase -> Zeroizing<String>)` | [`f0dd0c5`](https://github.com/Journeycake/dratchet/commit/f0dd0c5514f6cb60490ac2c670a1042a556e4515) | this doc |
+| DRA-0037 | Critical | `core/src/x3dh.rs:122 (reject_non_contributory), :52` | [`d2eee23`](https://github.com/Journeycake/dratchet/commit/d2eee233d9089861d00f75bafb42e0d9ebf20870) | this doc |
+| DRA-0038 | Critical | `core/src/ratchet.rs:774 (compute_dh_ratchet_step)` | [`d2eee23`](https://github.com/Journeycake/dratchet/commit/d2eee233d9089861d00f75bafb42e0d9ebf20870) | this doc |
+| DRA-0039 | Critical | `core/src/identity.rs:110 (sign_auth_challenge), :186 (AUTH_CHALLENGE_DOMAIN_TAG)` | [`d2eee23`](https://github.com/Journeycake/dratchet/commit/d2eee233d9089861d00f75bafb42e0d9ebf20870) | this doc |
+| DRA-0040 | High | `core/src/account.rs:25 (SIGNED_PREKEY_ROTATION_SECS), :215 (rotate_signed_prekey)` | [`8548a39`](https://github.com/Journeycake/dratchet/commit/8548a391aaac1b946868c12a625bcd5a80098c62) | this doc |
+| DRA-0041 | High | `store/src/db.rs:472 (encrypt), :523 (decrypt_record)` | [`58b8e2c`](https://github.com/Journeycake/dratchet/commit/58b8e2c99d9735a98e302ed97ac8dac4678e84c5) | this doc |
+| DRA-0042 | Low | `core/src/ratchet.rs:237 (decrypt_raw), :253 (ConversationIdMismatch)` | [`238bfb1`](https://github.com/Journeycake/dratchet/commit/238bfb15eac8dd7e41eda4aac06791815bd1b5b0) | this doc |
+| DRA-0043 | Medium | `core/src/username.rs:32 (is_acceptable); store/src/profile.rs:49` | [`92d719c`](https://github.com/Journeycake/dratchet/commit/92d719cb03f50e5b9ca0fea67f09c0e3411334d9) | this doc |
+| DRA-0044 | High | `server/src/pruning.rs:73 (identity_is_durable)` | [`a68adf1`](https://github.com/Journeycake/dratchet/commit/a68adf1247a96a993fb346552f51f650a252504e) | this doc |
+| DRA-0045 | High | `server/src/ws.rs:820 (authorize_rendezvous); server/src/state.rs:197 (MAX_QUEUED_OUTBOUND_FRAMES)` | [`a68adf1`](https://github.com/Journeycake/dratchet/commit/a68adf1247a96a993fb346552f51f650a252504e) | this doc |
+| DRA-0046 | Medium | `server/src/ws.rs:437 (MailboxFetch get_mut)` | [`a68adf1`](https://github.com/Journeycake/dratchet/commit/a68adf1247a96a993fb346552f51f650a252504e) | this doc |
+| DRA-0047 | Medium | `core/src/account.rs:234 (Account::export); core/src/ratchet.rs:475 (RatchetState::export); store/src/db.rs:523 (decrypt_record)` | [`b34f9c3`](https://github.com/Journeycake/dratchet/commit/b34f9c3a6e977d0394e49755daef5b5a1d082f16) | this doc |
+| DRA-0048 | Medium | `store/src/messages.rs:317 (list_messages)` | [`b34f9c3`](https://github.com/Journeycake/dratchet/commit/b34f9c3a6e977d0394e49755daef5b5a1d082f16) | this doc |
+| DRA-0049 | High | `server/src/abuse.rs:257 (MailboxFetchRateLimiter); server/src/state.rs:262 (register_bundle); server/src/ws.rs:431` | [`b34f9c3`](https://github.com/Journeycake/dratchet/commit/b34f9c3a6e977d0394e49755daef5b5a1d082f16) | this doc |
+| DRA-0050 | Medium | `server/src/abuse.rs:325 (MailboxDeleteRateLimiter); server/src/ws.rs:494` | [`be8f0c1`](https://github.com/Journeycake/dratchet/commit/be8f0c16ee2d6c149a76bfcce6d2d9f3c28a3b84) | this doc |
+| DRA-0051 | Medium | `store/src/contacts.rs:136 (list_contacts)` | [`be8f0c1`](https://github.com/Journeycake/dratchet/commit/be8f0c16ee2d6c149a76bfcce6d2d9f3c28a3b84) | this doc |
+| DRA-0052 | Low | `client/src/net.rs:59 (Connection::recv)` | [`be8f0c1`](https://github.com/Journeycake/dratchet/commit/be8f0c16ee2d6c149a76bfcce6d2d9f3c28a3b84) | this doc |
+
+
 ## Summary
 
 | # | Scenario | Method | Verdict |
@@ -292,6 +352,9 @@ note that the *safety* here is emergent, not to be relied on if the
 persistence strategy ever changes.
 
 ### 23. `poll_loop` never reconnects after a connection failure — **fixed**
+
+> **DRA-0001** · Location: `ui/src-tauri/src/lib.rs:640 (poll_loop); :549 (connect_authenticate_and_reconcile)` · Fix: [`0effc50`](https://github.com/Journeycake/dratchet/commit/0effc50880264ff46a1046669276660c348796cf)
+
 **Originally analyzed, now fixed and tested.** `ui/src-tauri/src/lib.rs`:
 `Connection::connect` used to be called exactly once, synchronously, in
 `run()` before `poll_loop` was spawned, and every error path in the loop
@@ -386,6 +449,9 @@ race.
 ## App / display layer (found by the 100-message functionality test)
 
 ### 26. Same-second messages sort by random key order, not send order
+
+> **DRA-0002** · Location: `store/src/messages.rs:317 (list_messages); store/src/db.rs (Db::message_sequence)` · Fix: [`779c449`](https://github.com/Journeycake/dratchet/commit/779c4498c83576b83a32b660873f9f8a91e122ab)
+
 **Tested (new)**: found by `app/tests/full_conversation_100_messages.rs`,
 the real two-client 100-message functionality test requested outside
 this 25-scenario pass but documented here since it's the same class of
@@ -457,6 +523,9 @@ listed first):
 ## `DeliveryAck` (found building and testing `ARCHITECTURE.md` §4.6)
 
 ### 27. A writer's own not-yet-collected mailbox entry is fetchable by the writer itself
+
+> **DRA-0003** · Location: `server/src/ws.rs:459 (MailboxFetch written_by filter)` · Fix: [`d745e2b`](https://github.com/Journeycake/dratchet/commit/d745e2bddf2431a06452a8211482aa0a352a368f)
+
 **Tested (new)**: found while building `DeliveryAck`, then reproduced and
 fixed at the layer it actually lives in — the server's mailbox, not the
 app. `ARCHITECTURE.md` §11.1's final adopted fix makes a conversation's
@@ -535,6 +604,9 @@ connection.
    has the right information.
 
 ### 28. `DeliveryAck.acked_n` collides across sending chains
+
+> **DRA-0004** · Location: `store/src/messages.rs:360 (mark_message_delivered); core/src/payload.rs (DeliveryAck)` · Fix: [`890f3f6`](https://github.com/Journeycake/dratchet/commit/890f3f607125b4281d462ccc4536778a5973238e)
+
 **Analyzed + tested, then fixed**: a real, previously-open limitation in
 `DeliveryAck` itself (`core::payload::DeliveryAck`, `docs/MESSAGE_SCHEMA.md`
 §7), closed in a follow-up pass after being recorded here.
@@ -609,6 +681,8 @@ is transparent to the ordinary, non-colliding case.
 
 ### 29. `PiggybackAck.highest_n` could claim a permanently-skipped message as delivered — **fixed**
 
+> **DRA-0005** · Location: `core/src/ratchet.rs:106 (content_delivered_contiguous), :393` · Fix: [`30f2f04`](https://github.com/Journeycake/dratchet/commit/30f2f04d2fa6f49b79e64fb6de545f8d69d9e40e)
+
 **Severity: high** — a false *positive* delivery confirmation, not a false
 negative. Every other finding in this document is some form of "a genuinely
 delivered message reads as undelivered" (annoying, but the sender still
@@ -670,6 +744,8 @@ this strictly, and only for the remainder of that one chain's lifetime
 
 ### 30. An un-announced `include_session` preference desynced the two sides' ratchets — **fixed**
 
+> **DRA-0006** · Location: `app/src/lib.rs:1507 (request_conversation_wipe)` · Fix: [`4502476`](https://github.com/Journeycake/dratchet/commit/450247610a52bcb996e59a33ec84694c5f382558)
+
 **Severity: high** — a real, silent, *unrecoverable* session desync, not
 a delivery-status cosmetic. `store::wipe_policy`'s own doc states
 `effective_wipe_include_session` is "most-restrictive-wins": either side
@@ -730,6 +806,8 @@ before real harm, unlike the fully automatic auto-comply path.
 
 ### 31. A policy announcement and the wipe request it gates, landing in the same poll, silently downgraded to the old unscoped behavior — **fixed**
 
+> **DRA-0007** · Location: `app/src/lib.rs:1102 (apply_entry), :1217 (fresh load_contact)` · Fix: [`992a6ab`](https://github.com/Journeycake/dratchet/commit/992a6abf7d122f1a4ec8b800dcebe3a1e12f3a3e)
+
 **Severity: high.** The boundary-scoped wipe (protecting messages a peer
 already had before they learned of a policy change) and the older
 ask-before-delete gate both depend on `Contact` fields a
@@ -784,6 +862,8 @@ fix existed.
 
 ### 32. A crash mid-wipe left conversations genuinely half-wiped, with no signal anything was wrong — **fixed**
 
+> **DRA-0008** · Location: `store/src/db.rs:287 (delete_many); store/src/wipe_policy.rs:132 (wipe_conversation_since)` · Fix: [`992a6ab`](https://github.com/Journeycake/dratchet/commit/992a6abf7d122f1a4ec8b800dcebe3a1e12f3a3e)
+
 **Severity: high.** `wipe_conversation`/`wipe_conversation_since`
 (`store/src/wipe_policy.rs`) looped and called `delete_message` once per
 message. `Db::delete` opens and commits its own `write_txn` per call
@@ -823,6 +903,8 @@ future regression here would need someone to notice it wasn't run, not
 rediscover the bug from scratch.
 
 ### 33. `Db::message_sequence` resetting to 0 on `open` broke its own tie-break guarantee across a same-second restart — **fixed**
+
+> **DRA-0009** · Location: `store/src/db.rs:132 (Db::open, recover_message_sequence)` · Fix: [`992a6ab`](https://github.com/Journeycake/dratchet/commit/992a6abf7d122f1a4ec8b800dcebe3a1e12f3a3e)
 
 **Severity: medium**, but a real, reproducible flake, not hypothetical —
 first surfaced as an intermittent failure in
@@ -877,6 +959,8 @@ produced zero partial outcomes across every trial.
 
 ### 34. `quick_wipe`/`full_wipe` rotated or destroyed their keys *last*, so a crash mid-call could leave content still recoverable under the still-live original key — **fixed**
 
+> **DRA-0010** · Location: `store/src/db.rs:391 (quick_wipe), :441 (full_wipe)` · Fix: [`65ba07f`](https://github.com/Journeycake/dratchet/commit/65ba07f03537cd976651ed5cf14243c370556f22)
+
 **Severity: high.** Both duress-wipe entry points (`store/src/db.rs`) did
 their bulk deletion first and their actual security-establishing step
 last, "belt-and-suspenders" style:
@@ -920,6 +1004,8 @@ reordering — this is a pure ordering fix, not a behavior change any
 existing test observes from the outside.
 
 ### A separate, environment-level finding surfaced while proving #34, out of scope for this fix
+
+> **DRA-0013** · Location: `store/src/db.rs:287 (delete_many) -- environment-level, no code defect` · Fix: none (environment-level)
 
 Building a real-`SIGKILL` regression test for #34
 (`store/tests/duress_wipe_crash_consistency.rs`, same self-re-exec
@@ -1006,6 +1092,8 @@ was needed; this is a confirmation, not a fix.
 
 ## DRA-0012: Concurrent `receive_pending` calls (item 3 of the same edge-case sweep — confirmed real, now fixed in two layers)
 
+> **DRA-0012** · Location: `store/src/db.rs:199 (receive_lock); app/src/lib.rs:902 (receive_pending)` · Fix: [`92e625b`](https://github.com/Journeycake/dratchet/commit/92e625b02cd3c61aad10f961bc142932786066a6)
+
 Probed the type-level question directly: does anything about
 `app::receive_pending`'s own signature rule out two overlapping calls for
 the same conversation, the way `&mut Db` would if that were the
@@ -1076,6 +1164,8 @@ this change.
 
 ## UI double-fire on the "Confirm clear" wipe button (item 4 of the same edge-case sweep — confirmed narrow, fixed)
 
+> **DRA-0011** · Location: `ui/src/routes/+page.svelte:151 (clearInFlight)` · Fix: [`27de04a`](https://github.com/Journeycake/dratchet/commit/27de04a52635b9f9b1b70eaca5dbb39dae9116e0)
+
 `clearConversation` (`ui/src/routes/+page.svelte`)'s second click — the
 one that actually calls `request_conversation_wipe` — guarded against a
 double-fire with `disabled={clearBusy}`, a reactive `$state` binding set
@@ -1119,6 +1209,8 @@ here closes the gap because it was cheap and fully proven, not because
 the alternative was unsafe.
 
 ## DRA-0014: Any registered identity could read and delete another identity's pending first-contact mail (penetration test, priority 1: access; confirmed real, fixed)
+
+> **DRA-0014** · Location: `server/src/ws.rs:560 (mailbox_id_belongs_to_someone_else); server/src/state.rs:272 (bootstrap_mailbox_belongs_to_another)` · Fix: [`d98e295`](https://github.com/Journeycake/dratchet/commit/d98e29582e39a35106acd6eb0a4b24b3139ca900)
 
 Penetration-test pass, priority 1 ("gaining access to individual messages
 or entire conversations"). Audited `server/src/ws.rs`'s `MailboxWrite`/
@@ -1201,6 +1293,8 @@ requires a fingerprint leak this protocol doesn't otherwise cause.
 
 ## DRA-0015: No per-mailbox entry-count or envelope-size cap (penetration test, priority 2: denial of service; already documented as scenario 5/6, now fixed)
 
+> **DRA-0015** · Location: `server/src/state.rs:32 (MAX_ENVELOPE_LEN), :43 (MAX_MAILBOX_ENTRIES); server/src/ws.rs:375, :403 (MailboxWrite)` · Fix: [`284f261`](https://github.com/Journeycake/dratchet/commit/284f261178867b5a6e88e446f821e3732ed24a40)
+
 Penetration-test pass, priority 2 (denial of service). This gap was
 already characterized earlier this session as scenario 5/6 (item 5&6
 above): `ws.rs`'s `MailboxWrite` handler pushed to an unbounded `Vec`
@@ -1259,6 +1353,8 @@ per-mailbox cap already closes the specific, demonstrated worst case
 (one flooded mailbox) at a fraction of the risk.
 
 ## DRA-0016: A contact could spoof another known contact's exact displayed handle (penetration test, priority 3: poisoning/corrupting a conversation's identity; confirmed real, fixed)
+
+> **DRA-0016** · Location: `store/src/profile.rs:49 (record_peer_profile)` · Fix: [`28caaf3`](https://github.com/Journeycake/dratchet/commit/28caaf338cdbb99bc0e98fedea9576fe770a8975)
 
 Penetration-test pass, priority 3 (poisoning/corrupting messages or
 conversations) — this time not the ciphertext itself (every AEAD/replay
@@ -1325,6 +1421,8 @@ colliding handle deliberately, not racing a legitimate rename.
 
 ## DRA-0017: One side of a shared mailbox could exhaust the whole entry cap, blocking the other side's own writes (penetration test round 2, priority 3: denial of service for a single conversation; confirmed real, fixed)
 
+> **DRA-0017** · Location: `server/src/state.rs:57 (MAX_ENTRIES_PER_WRITER_PER_MAILBOX); server/src/ws.rs:410` · Fix: [`b4a9ef7`](https://github.com/Journeycake/dratchet/commit/b4a9ef7d2dcc719fd3cae36e2c719cf96e697b61)
+
 Penetration-test round 2, re-examining DRA-0015's own fix rather than a
 fresh area: `MAX_MAILBOX_ENTRIES` closed unbounded growth of one
 mailbox, but the cap is enforced on the mailbox *as a whole*, and a
@@ -1378,6 +1476,8 @@ two's, so the *total* cap (not per-writer) is what ultimately bounds
 that case — already covered by DRA-0015's existing total-cap check.
 
 ## DRA-0018: Unbounded distinct mailbox creation — server-wide denial of service (penetration test round 2, priority 3: denial of service against all clients; confirmed real, fixed)
+
+> **DRA-0018** · Location: `server/src/abuse.rs:136 (NewMailboxRateLimiter); server/src/ws.rs:396` · Fix: [`a09714b`](https://github.com/Journeycake/dratchet/commit/a09714bcd5b24fd3cb79c31f2d37be7490764109)
 
 Penetration-test round 2, closing the residual scope DRA-0015 already
 named but didn't fix: `MAX_MAILBOX_ENTRIES`/`MAX_ENTRIES_PER_WRITER_PER_MAILBOX`
@@ -1448,6 +1548,8 @@ long-term capacity.
 
 ## DRA-0019: Unbounded PublishBundle size — permanent, never-pruned server-wide denial of service (penetration test round 2, priority 3: denial of service against all clients; confirmed real, fixed)
 
+> **DRA-0019** · Location: `server/src/state.rs:67 (MAX_ONE_TIME_PREKEYS_PER_PUBLISH); server/src/ws.rs:576-585 (publish_bundle checks)` · Fix: [`a4dfa53`](https://github.com/Journeycake/dratchet/commit/a4dfa53322e4659066df45086fb998071f40d6ff)
+
 Penetration-test round 2, a second, distinct route to the same class of
 harm as DRA-0018 — this time through the directory rather than
 mailboxes, and arguably worse: `pruning.rs`'s own module doc states
@@ -1512,6 +1614,8 @@ pressure.
 
 ## DRA-0020: confirm_pending_wipe performed a destructive wipe with no check that a request was actually pending (penetration test round 3, priority 2: message poisoning/compromise — unauthorized destructive data loss; confirmed real, fixed)
 
+> **DRA-0020** · Location: `app/src/lib.rs:1552 (confirm_pending_wipe)` · Fix: [`3b1c523`](https://github.com/Journeycake/dratchet/commit/3b1c523c9e344187d4d6b573b1a2d5226e5f1444)
+
 Penetration-test round 3, priority 2 (poisoning/compromise) — after the
 crypto/protocol core came back clean across two full rounds
 (`untag_and_unpad` bounds-checked, per-entry error classification
@@ -1560,6 +1664,8 @@ including every existing wipe test (which all correctly set
 `wipe_request_pending` before calling this, so none needed changes).
 
 ## DRA-0021: a conversation-wipe request from a contact who isn't Verified — including one already flagged Mismatch — was processed anyway (penetration test round 3, priority 2: message poisoning/corruption; confirmed real, fixed)
+
+> **DRA-0021** · Location: `app/src/lib.rs:1231 (apply_entry, WIPE_REQUEST arm)` · Fix: [`9d456fb`](https://github.com/Journeycake/dratchet/commit/9d456fb1cfcd9537460b3930aa2a37eb7116831c)
 
 Penetration-test round 3, priority 2 (poisoning/corruption), continuing
 past DRA-0020. Two investigative dead ends worth recording first, so
@@ -1635,6 +1741,8 @@ narrower, previously-unintended case. Full workspace `cargo fmt
 
 ## DRA-0022: `PairingResponse`'s DH material wasn't bound to its claimed identity, letting an on-path relay MITM the whole session while the later fingerprint check still passed (penetration test round 3, priority 1: gaining access to individual conversations via an active MITM; confirmed real, fixed)
 
+> **DRA-0022** · Location: `client/src/handshake.rs:171 (respond), :192 (response_signature check)` · Fix: [`39ab88b`](https://github.com/Journeycake/dratchet/commit/39ab88b080ac0e260049ccff173f52a8b0bfdff5)
+
 Penetration-test round 3, priority 1 (access), continuing past DRA-0021.
 Audited `client/src/handshake.rs` — Option B's direct, out-of-band
 pairing flow (`ARCHITECTURE.md` §6.3a): two blobs, copy-pasted between
@@ -1705,6 +1813,8 @@ repository today, ahead of whatever UI eventually calls it.
 
 ## DRA-0023: a bogus first-contact attempt with a wrong pairing code still permanently destroyed a real local one-time-prekey secret (penetration test round 3, priority 3: denial of service via local prekey exhaustion; confirmed real, fixed)
 
+> **DRA-0023** · Location: `core/src/account.rs:161 (peek_one_time_prekey_secret); app/src/lib.rs:678 (try_accept_first_contact), :759` · Fix: [`3d0ab36`](https://github.com/Journeycake/dratchet/commit/3d0ab36da2460d9b95824b45bec831fc78d9f33e)
+
 Penetration-test round 3, priority 3 (DoS), continuing past DRA-0022.
 Audited `app::try_accept_first_contact` (`app/src/lib.rs`) — the
 production directory-based first-contact flow (`ARCHITECTURE.md` §6.4) —
@@ -1767,6 +1877,8 @@ workspace `cargo fmt --check` / `cargo clippy --workspace --all-targets
 
 ## DRA-0024: no restriction on `username`'s character set let a Unicode homograph impersonate an already-registered identity (penetration test round 3, priority 1: gaining access to conversations via impersonation; confirmed real, fixed)
 
+> **DRA-0024** · Location: `core/src/username.rs:36 (has_only_allowed_characters); server/src/ws.rs:582` · Fix: [`2bb19ab`](https://github.com/Journeycake/dratchet/commit/2bb19ab70c45d997b6acbdf2dd1a24cbf16bbdad)
+
 Penetration-test round 3, priority 1 (access via impersonation),
 continuing past DRA-0023. `ws.rs`'s `publish_bundle` validates
 `username`'s *length* (`state::MAX_USERNAME_LEN`, DRA-0019) but nothing
@@ -1824,6 +1936,8 @@ already).
 
 ## DRA-0025: the same Unicode homograph impersonation as DRA-0024, reachable through the peer-to-peer `ProfileAnnounce` path DRA-0024's fix doesn't cover (penetration test round 4, data obfuscation; confirmed real, fixed)
 
+> **DRA-0025** · Location: `store/src/profile.rs:49 (record_peer_profile); core/src/username.rs:36` · Fix: [`fa8f59a`](https://github.com/Journeycake/dratchet/commit/fa8f59ae5d8770927cca1321b468481dcea98378)
+
 Penetration-test round 4 (data extraction/destruction/obfuscation/DoS),
 first finding. DRA-0024 closed the homograph-impersonation gap at
 *directory registration* (`server::ws::publish_bundle`) — but that's
@@ -1862,6 +1976,8 @@ non-colliding-rename test, unchanged. Full workspace `cargo fmt --check`
 --workspace` all pass.
 
 ## DRA-0026: `RendezvousOffer`/`RendezvousAnswer` had no size bound, letting any identity force the server to relay an arbitrarily large payload at any other connected client (penetration test round 4, denial of service — amplification; confirmed real, fixed)
+
+> **DRA-0026** · Location: `server/src/ws.rs:786 (validate_rendezvous_payload)` · Fix: [`fa8f59a`](https://github.com/Journeycake/dratchet/commit/fa8f59ae5d8770927cca1321b468481dcea98378)
 
 Penetration-test round 4, continuing past DRA-0025. Every other
 client-supplied payload this server handles has an explicit, deliberate
@@ -1918,6 +2034,8 @@ pattern, not a broader redesign of Tier 0's trust model under time
 pressure.
 
 ## DRA-0027: the Tauri app shipped with no Content-Security-Policy at all (penetration test round 4, data extraction — hardening the blast radius of any future webview XSS; confirmed real, fixed)
+
+> **DRA-0027** · Location: `ui/src-tauri/tauri.conf.json:21 (csp)` · Fix: [`aff9cc9`](https://github.com/Journeycake/dratchet/commit/aff9cc900dc97340b6d558d469b69c8040f7f7c7)
 
 Penetration-test round 4, continuing past DRA-0026. Audited
 `ui/src-tauri/tauri.conf.json` — the production Tauri app's own
@@ -1977,6 +2095,8 @@ end-to-end in the exact shipped artifact.
 
 ## DRA-0028: an unused `opener` capability was granted to the webview, widening the blast radius of any future XSS (penetration test round 4, data extraction — unnecessary IPC surface; confirmed real, fixed)
 
+> **DRA-0028** · Location: `ui/src-tauri/capabilities/default.json:6 (permissions)` · Fix: [`39c2fb7`](https://github.com/Journeycake/dratchet/commit/39c2fb7d98afd9953fe5fb0454b20207e2f9184d)
+
 Penetration-test round 4, continuing past DRA-0027 in the same
 category — a Tauri capability grant is a *separate* trust boundary
 from CSP, not covered by it: CSP's `connect-src` bounds network
@@ -2015,6 +2135,8 @@ No live-UI re-verification needed beyond DRA-0027's: removing an
 unused, never-called capability has no functional surface to regress.
 
 ## DRA-0029: `cookie@0.6.0`, a transitive frontend dependency, shipped a known out-of-bounds-character parsing flaw (penetration test round 4, data obfuscation/extraction — supply chain; confirmed real via GHSA-pxg6-pf52-xh8x, fixed)
+
+> **DRA-0029** · Location: `ui/package.json:30 (overrides: cookie ^0.7.2)` · Fix: [`72e7254`](https://github.com/Journeycake/dratchet/commit/72e72549f83fd2ddd8549981fa7a8039d9c6f847)
 
 Penetration-test round 4, switching categories to the frontend's
 supply chain — `npm audit --json` in `ui/` surfaced a real, named
@@ -2070,6 +2192,8 @@ any dependency, direct or transitive, surface automatically rather
 than depending on a manual pentest pass to catch them.
 
 ## DRA-0030: no WebSocket transport-layer message-size ceiling, letting a pre-auth connection force up to 64 MiB of memory per frame (penetration test round 4, denial of service — transport-layer resource exhaustion; confirmed real, fixed)
+
+> **DRA-0030** · Location: `server/src/state.rs:141 (MAX_WS_MESSAGE_BYTES); server/src/ws.rs:81` · Fix: [`70ff977`](https://github.com/Journeycake/dratchet/commit/70ff9773d847624ee75a897becbffe72af55427a)
 
 Penetration-test round 4, stepping back from the application-layer caps
 this file already documents (`MAX_ENVELOPE_LEN`/DRA-0015,
@@ -2142,6 +2266,8 @@ in this codebase. Closed immediately below as DRA-0031.
 
 ## DRA-0031: no ceiling on total concurrent WebSocket connections (penetration test round 4, denial of service — unbounded connection count; confirmed real, fixed)
 
+> **DRA-0031** · Location: `server/src/state.rs:126 (MAX_CONCURRENT_CONNECTIONS); server/src/ws.rs:72 (ws_handler)` · Fix: [`b2ebf6a`](https://github.com/Journeycake/dratchet/commit/b2ebf6a2b889e72d91e6c095c1869c6e20551b7d)
+
 Penetration-test round 4, closing the residual scope DRA-0030 named but
 didn't fix. DRA-0030 bounds a single message/frame; nothing at all
 bounded how many connections `ws_handler` would accept simultaneously.
@@ -2195,6 +2321,8 @@ work (source-IP extraction behind a real deployment's reverse proxy,
 a second rate-limiter keyed by IP) beyond this bounded fix's scope.
 
 ## DRA-0032: `PAYLOAD_CONVERSATION_WIPE_POLICY_ANNOUNCE` had no verification-state check, unlike its sibling wipe-request arm (penetration test round 4, data destruction; confirmed real, fixed)
+
+> **DRA-0032** · Location: `app/src/lib.rs:1179 (apply_entry, WIPE_POLICY_ANNOUNCE arm)` · Fix: [`888ef85`](https://github.com/Journeycake/dratchet/commit/888ef85d330b72067c8ccea6cfe89dd5650dabfa)
 
 Penetration-test round 4, auditing `app/src/lib.rs`'s `apply_entry` —
 the same function DRA-0021 already hardened for
@@ -2257,6 +2385,8 @@ unchanged; worth a fresh look if any of those payloads' effects are ever
 expanded.
 
 ## DRA-0033: the shipped app's local database used a fixed, hardcoded `"dev"` passphrase for every installation (penetration test round 4, data extraction/compromise; confirmed real, fixed)
+
+> **DRA-0033** · Location: `ui/src-tauri/src/lib.rs:823 (device_passphrase)` · Fix: [`555e476`](https://github.com/Journeycake/dratchet/commit/555e476bbcc5a29a4ba35e830d3a82ebe17cb4f4)
 
 Penetration-test round 4 — auditing `ui/src-tauri/src/lib.rs`'s `run()`,
 the actual entry point (`#[cfg_attr(mobile, tauri::mobile_entry_point)]`)
@@ -2321,6 +2451,8 @@ fix.
 
 ## DRA-0034: `deploy-rke2-test.sh` shipped a container image through a fixed, predictable remote `/tmp` path (penetration test round 4, data extraction/compromise — local privilege escalation on a shared deploy node; confirmed real, fixed)
 
+> **DRA-0034** · Location: `scripts/deploy-rke2-test.sh:114 (remote_tarball)` · Fix: [`5700a76`](https://github.com/Journeycake/dratchet/commit/5700a766f12c99390caf4b871d6b2985fa76cfc2)
+
 Penetration-test round 4 — auditing `scripts/deploy-rke2-test.sh`'s
 `import` ship mode, which `scp`s a locally-built container image tarball
 to each RKE2 node and then `sudo ctr -n k8s.io images import`s it. The
@@ -2370,6 +2502,8 @@ fix; this closes the cheapest, most opportunistic one.
 
 ## DRA-0035: `full_wipe` left DRA-0033's own keyfile behind, breaking its "destroys everything" contract (penetration test round 4, data destruction; confirmed real, fixed)
 
+> **DRA-0035** · Location: `ui/src-tauri/src/lib.rs:807 (device_passphrase_path), :522 (full_wipe)` · Fix: [`e0cbb0a`](https://github.com/Journeycake/dratchet/commit/e0cbb0a83cfe461d1088aaf7622bed876ab6bb45)
+
 Penetration-test round 4, a self-follow-up on this same round's
 DRA-0033 fix — `dratchet_app::full_wipe` (`ARCHITECTURE.md` §11.9's
 device-seizure duress response, its own doc comment says it "destroys
@@ -2403,6 +2537,8 @@ Full `ui/src-tauri` workspace `cargo fmt --check` / `cargo clippy
 --all-targets -- -D warnings` / `cargo test` all pass (10 tests).
 
 ## DRA-0036: `device_passphrase` returned a bare `String`, not `Zeroizing`, unlike every other real secret this codebase holds (penetration test round 4, data extraction/compromise; confirmed real, fixed)
+
+> **DRA-0036** · Location: `ui/src-tauri/src/lib.rs:823 (device_passphrase -> Zeroizing<String>)` · Fix: [`f0dd0c5`](https://github.com/Journeycake/dratchet/commit/f0dd0c5514f6cb60490ac2c670a1042a556e4515)
 
 Penetration-test round 4, a second self-follow-up reviewing this same
 round's DRA-0033 fix against this codebase's own established pattern
@@ -2451,6 +2587,8 @@ that already applies to every other `Zeroizing`-wrapped value in this
 codebase, not something specific to this fix.
 
 ## DRA-0037: X3DH accepted low-order X25519 points, letting an attacker with no key material derive the session root key (penetration test round 5, data compromise — complete handshake authentication bypass; confirmed real, fixed) — **CRITICAL**
+
+> **DRA-0037** · Location: `core/src/x3dh.rs:122 (reject_non_contributory), :52` · Fix: [`d2eee23`](https://github.com/Journeycake/dratchet/commit/d2eee233d9089861d00f75bafb42e0d9ebf20870)
 
 Penetration-test round 5, auditing `core/src/x3dh.rs`'s Diffie-Hellman
 computations directly. `x3dh::respond` ran `diffie_hellman()` against
@@ -2532,6 +2670,8 @@ addition; it is not required to close this finding.
 
 ## DRA-0038: the Double Ratchet's DH step accepted low-order points, permanently defeating break-in recovery (penetration test round 5, data compromise — post-compromise security bypass; confirmed real, fixed) — **CRITICAL**
 
+> **DRA-0038** · Location: `core/src/ratchet.rs:774 (compute_dh_ratchet_step)` · Fix: [`d2eee23`](https://github.com/Journeycake/dratchet/commit/d2eee233d9089861d00f75bafb42e0d9ebf20870)
+
 Penetration-test round 5, immediately after DRA-0037 — the same missing
 check, in a *different* code path, defeating a *different* security
 property, so it gets its own finding rather than being folded in.
@@ -2592,6 +2732,8 @@ keys); what it closes is the escalation from that position to a
 *permanent*, unhealable compromise.
 
 ## DRA-0039: no domain separation between signing contexts — a malicious relay could harvest prekey signatures from the auth handshake and take over any identity (penetration test round 5, data compromise — identity takeover via cross-protocol signature reuse; confirmed real, fixed) — **CRITICAL**
+
+> **DRA-0039** · Location: `core/src/identity.rs:110 (sign_auth_challenge), :186 (AUTH_CHALLENGE_DOMAIN_TAG)` · Fix: [`d2eee23`](https://github.com/Journeycake/dratchet/commit/d2eee233d9089861d00f75bafb42e0d9ebf20870)
 
 Penetration-test round 5, auditing `core/src/identity.rs`'s signing
 payloads. The same Ed25519 identity key signs in two different contexts,
@@ -2677,6 +2819,8 @@ belt-and-braces hardening against a relay sending a needlessly enormous
 nonce.
 
 ## DRA-0040: the signed prekey never rotated and its published expiry was hardcoded to zero — a single device seizure retroactively decrypted every degraded-mode session the account had ever established (penetration test round 6, data extraction; confirmed real, fixed) — **HIGH**
+
+> **DRA-0040** · Location: `core/src/account.rs:25 (SIGNED_PREKEY_ROTATION_SECS), :215 (rotate_signed_prekey)` · Fix: [`8548a39`](https://github.com/Journeycake/dratchet/commit/8548a391aaac1b946868c12a625bcd5a80098c62)
 
 Penetration-test round 6, auditing X3DH key lifetime in
 `core/src/account.rs` and `app/src/lib.rs`. Two independent halves of the
@@ -2828,6 +2972,8 @@ alongside so the predicate isn't trivially true.
 
 ## DRA-0041: the local database authenticated every record's *contents* but never its *location* — anyone able to write to the `.redb` file could relocate ciphertext they could not read, re-attributing messages and rolling conversations onto attacker-chosen ratchet state (penetration test round 6, data obfuscation + data compromise; confirmed real, fixed) — **HIGH**
 
+> **DRA-0041** · Location: `store/src/db.rs:472 (encrypt), :523 (decrypt_record)` · Fix: [`58b8e2c`](https://github.com/Journeycake/dratchet/commit/58b8e2c99d9735a98e302ed97ac8dac4678e84c5)
+
 Penetration-test round 6, auditing `store/src/db.rs`'s encryption
 envelope. Every stored value is `nonce ‖ ChaCha20Poly1305(plaintext)`
 under one of three scope DEKs — correct as far as it goes, but both
@@ -2944,6 +3090,8 @@ record.
 
 ## DRA-0042: a ratchet decrypted any envelope handed to it, including one naming a conversation that was not its own (penetration test round 6, data obfuscation — latent cross-conversation misattribution; confirmed real, fixed) — **LOW**
 
+> **DRA-0042** · Location: `core/src/ratchet.rs:237 (decrypt_raw), :253 (ConversationIdMismatch)` · Fix: [`238bfb1`](https://github.com/Journeycake/dratchet/commit/238bfb15eac8dd7e41eda4aac06791815bd1b5b0)
+
 Penetration-test round 6, auditing `core/src/ratchet.rs`'s `decrypt_raw`
 against `core/src/envelope.rs`'s header. Every envelope carries a
 `conversation_id` in its fixed 61-byte header, and `decrypt_raw` never
@@ -3023,6 +3171,8 @@ it. The test asserts that too.
   to this header in future.
 
 ## DRA-0043: the peer-to-peer `ProfileAnnounce` path never bounded an announced username's length, so DRA-0019's 64-byte cap applied only to the directory (penetration test round 6, denial of service + data obfuscation; confirmed real, fixed) — **MEDIUM**
+
+> **DRA-0043** · Location: `core/src/username.rs:32 (is_acceptable); store/src/profile.rs:49` · Fix: [`92d719c`](https://github.com/Journeycake/dratchet/commit/92d719cb03f50e5b9ca0fea67f09c0e3411334d9)
 
 Penetration-test round 6, auditing the two places a `username#NNNN`
 handle is accepted from an untrusted party. `core/src/username.rs`'s own
@@ -3115,6 +3265,8 @@ peer-to-peer path now read the same constant and cannot drift again.
   finding re-examines whether 64 is the right number.
 
 ## DRA-0044: per-identity server state only ever grew, and minting identities is free — a throwaway-identity flood exhausted server memory permanently (penetration test round 7, denial of service; confirmed real, fixed) — **HIGH**
+
+> **DRA-0044** · Location: `server/src/pruning.rs:73 (identity_is_durable)` · Fix: [`a68adf1`](https://github.com/Journeycake/dratchet/commit/a68adf1247a96a993fb346552f51f650a252504e)
 
 Penetration-test round 7, auditing what an authenticated client leaves
 behind on the Signaling & Presence Service. Three of `Inner`'s maps are
@@ -3230,6 +3382,8 @@ can actually be observed for.
 
 ## DRA-0045: the rendezvous relay had no relationship check and no rate limit, and pushed into an unbounded per-client queue — any stranger could flood any online user (penetration test round 7, denial of service + unsolicited contact; confirmed real, fixed) — **HIGH**
 
+> **DRA-0045** · Location: `server/src/ws.rs:820 (authorize_rendezvous); server/src/state.rs:197 (MAX_QUEUED_OUTBOUND_FRAMES)` · Fix: [`a68adf1`](https://github.com/Journeycake/dratchet/commit/a68adf1247a96a993fb346552f51f650a252504e)
+
 Penetration-test round 7, auditing `ws.rs`'s `RendezvousOffer` /
 `RendezvousAnswer` arms. Both relay a client-supplied payload straight
 into another connected identity's outbound channel, addressed by a
@@ -3324,6 +3478,8 @@ have.
 
 ## DRA-0046: `MailboxFetch` created the mailbox it was reading, routing around the rate limiter built to meter mailbox creation (penetration test round 7, denial of service; confirmed real, fixed) — **MEDIUM**
 
+> **DRA-0046** · Location: `server/src/ws.rs:437 (MailboxFetch get_mut)` · Fix: [`a68adf1`](https://github.com/Journeycake/dratchet/commit/a68adf1247a96a993fb346552f51f650a252504e)
+
 Penetration-test round 7, auditing `ws.rs`'s `MailboxFetch` arm. It
 reached its entry list with:
 
@@ -3389,6 +3545,8 @@ nothing; it just no longer leaves a mailbox behind for having asked.
   scan the more interesting of the two remaining costs.
 
 ## DRA-0047: the entire secret key hierarchy was serialized into buffers that were freed without being wiped, contradicting `ARCHITECTURE.md` §3.4's explicit zeroization promise (penetration test round 8, data extraction; confirmed real, fixed) — **MEDIUM**
+
+> **DRA-0047** · Location: `core/src/account.rs:234 (Account::export); core/src/ratchet.rs:475 (RatchetState::export); store/src/db.rs:523 (decrypt_record)` · Fix: [`b34f9c3`](https://github.com/Journeycake/dratchet/commit/b34f9c3a6e977d0394e49755daef5b5a1d082f16)
 
 Penetration-test round 8. This one was found by taking a documented
 guarantee and following it into the code rather than by reading the code
@@ -3509,6 +3667,8 @@ before this finding.
 
 ## DRA-0048: one unreadable record denied access to an entire conversation's history (penetration test round 8, data destruction / availability; confirmed real, fixed) — **MEDIUM**
 
+> **DRA-0048** · Location: `store/src/messages.rs:317 (list_messages)` · Fix: [`b34f9c3`](https://github.com/Journeycake/dratchet/commit/b34f9c3a6e977d0394e49755daef5b5a1d082f16)
+
 Penetration-test round 8, picking up a gap DRA-0041 recorded in its own
 "Known residual scope" as deliberately left open.
 
@@ -3580,6 +3740,8 @@ whole conversation.
   construction — the AEAD tag is what tells us it is damaged.
 
 ## DRA-0049: `MailboxFetch` was the one unmetered handler, and it held the global write lock while scanning the entire directory (penetration test round 8, denial of service; confirmed real, fixed) — **HIGH**
+
+> **DRA-0049** · Location: `server/src/abuse.rs:257 (MailboxFetchRateLimiter); server/src/state.rs:262 (register_bundle); server/src/ws.rs:431` · Fix: [`b34f9c3`](https://github.com/Journeycake/dratchet/commit/b34f9c3a6e977d0394e49755daef5b5a1d082f16)
 
 Penetration-test round 8, picking up the request-cost gap DRA-0046
 recorded as still open after it closed the allocation half.
@@ -3703,6 +3865,8 @@ Two independent changes, because the finding has two independent causes:
 
 ## DRA-0050: `MailboxDelete` was the last unmetered handler holding the global write lock (penetration test round 9, denial of service; confirmed real, fixed) — **MEDIUM**
 
+> **DRA-0050** · Location: `server/src/abuse.rs:325 (MailboxDeleteRateLimiter); server/src/ws.rs:494` · Fix: [`be8f0c1`](https://github.com/Journeycake/dratchet/commit/be8f0c16ee2d6c149a76bfcce6d2d9f3c28a3b84)
+
 Penetration-test round 9, picking up the exact follow-up DRA-0049 recorded as deliberately deferred: "`MailboxDelete` still scans... it has no rate limiter of its own... worth its own pass." DRA-0049's O(1) index fix (`bootstrap_mailbox_index`) already applies to delete too, since both handlers share `mailbox_id_belongs_to_someone_else`. What remained was the rate limit.
 
 `MailboxDelete` takes `state.inner`'s global exclusive write lock for its whole duration — the same lock `MailboxFetch` was metered over in DRA-0049, for the same reason (ownership must be checked under it). DRA-0049 reasoned this one away as lower priority because the *work inside* the lock is cheap for delete (no pruning, no entry serialization, and a delete only ever removes the caller's own reachable entries). That reasoning is correct about per-call cost — but says nothing about *rate*. An unmetered handler that still acquires a global exclusive lock lets one identity serialise the whole server behind back-to-back lock acquisitions, whatever the work inside each one costs.
@@ -3728,6 +3892,8 @@ New `abuse::MailboxDeleteRateLimiter`, same token-bucket shape and budget as DRA
 
 ## DRA-0051: one unreadable contact record denied the entire contact list (penetration test round 9, data destruction / availability; confirmed real, fixed) — **MEDIUM**
 
+> **DRA-0051** · Location: `store/src/contacts.rs:136 (list_contacts)` · Fix: [`be8f0c1`](https://github.com/Journeycake/dratchet/commit/be8f0c16ee2d6c149a76bfcce6d2d9f3c28a3b84)
+
 Penetration-test round 9, the same shape as DRA-0048 in a different module — flagged explicitly in DRA-0048's own "Known residual scope": "other `list_*` paths were not audited for the same shape this round... worth a dedicated pass."
 
 `store::contacts::list_contacts` collected every record through `?` inside a `.collect::<Result<Vec<_>>>()`, so one record that failed to decrypt short-circuited the whole collection. Same root cause as DRA-0048: DRA-0041 bound each record's own key as AEAD associated data, so a relocated or rolled-back record now fails its AEAD check outright — which is correct — but a single planted junk contact record denied the owner their *entire* contact list: every conversation, every verification state, needing no key and no plaintext, just write access to the `.redb` file.
@@ -3747,6 +3913,8 @@ Rated **Medium**, matching DRA-0048: same precondition, no confidentiality impac
 Identical to DRA-0048's: skipping is silent to the user (log only, not surfaced in the UI); this does not restore the damaged record, which is unrecoverable by construction. Between this and DRA-0048, `list_*` in `store/` has now had a dedicated pass — no other `list_*` function walks records the same way (checked: `list_messages`, `list_contacts` were the only two collecting through `?`).
 
 ## DRA-0052: the client's generic frame decoder reported every server refusal as indistinguishable from wire corruption, discarding the server's actual reason (penetration test round 9, availability/robustness; confirmed real, fixed) — **LOW**
+
+> **DRA-0052** · Location: `client/src/net.rs:59 (Connection::recv)` · Fix: [`be8f0c1`](https://github.com/Journeycake/dratchet/commit/be8f0c16ee2d6c149a76bfcce6d2d9f3c28a3b84)
 
 Penetration-test round 9, the third item DRA-0049's "Known residual scope" named directly: "a rate-limited client reports a confusing error... worth its own fix in `client/src/net.rs`."
 
