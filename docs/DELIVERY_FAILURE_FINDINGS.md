@@ -96,7 +96,7 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0052 | Low | `client/src/net.rs:59 (Connection::recv)` | [`be8f0c1`](https://github.com/Journeycake/dratchet/commit/be8f0c16ee2d6c149a76bfcce6d2d9f3c28a3b84) | this doc |
 | DRA-0053 | Medium | `ui/src-tauri/src/lib.rs:832 (device_passphrase); restrict_to_owner` | [`708c22b`](https://github.com/Journeycake/dratchet/commit/708c22b70f4380c7543d99af102838c0726fc765) | this doc |
 | DRA-0054 | Low | `store/src/messages.rs:325 (list_messages_counting_unreadable); store/src/contacts.rs:143 (list_contacts_counting_unreadable); ui/src-tauri/src/lib.rs:250 (list_contacts/list_messages commands); ui/src/routes/+page.svelte (unreadable-notice)` | [`2d214d8`](https://github.com/Journeycake/dratchet/commit/2d214d8abef21405d687ddafdbf843337fb47952) | this doc |
-| DRA-0055 | Medium | `server/src/address.rs:219 (AddressLimiter, TrustedProxies::client_ip); server/src/ws.rs:86 (ws_handler); server/src/main.rs (--trusted-proxies, connect info)` | this commit | this doc |
+| DRA-0055 | Medium | `server/src/address.rs:219 (AddressLimiter, TrustedProxies::client_ip); server/src/ws.rs:86 (ws_handler); server/src/main.rs (--trusted-proxies, connect info)` | [`9776154`](https://github.com/Journeycake/dratchet/commit/9776154748fe646a950f0bbfa54a52704e2e80be) | this doc |
 
 
 ## Summary
@@ -4031,7 +4031,7 @@ Validation: main workspace `cargo fmt --check`, `cargo clippy --workspace --all-
 
 ## DRA-0055: nothing limited connections per source address, so one client could fill the global cap and mint unlimited identities (residual-scope follow-up to DRA-0031/DRA-0044/DRA-0050; confirmed real, fixed) — **MEDIUM**
 
-> **DRA-0055** · Location: `server/src/address.rs:219 (AddressLimiter, TrustedProxies::client_ip); server/src/ws.rs:86 (ws_handler); server/src/main.rs (--trusted-proxies, connect info)` · Fix: this commit
+> **DRA-0055** · Location: `server/src/address.rs:219 (AddressLimiter, TrustedProxies::client_ip); server/src/ws.rs:86 (ws_handler); server/src/main.rs (--trusted-proxies, connect info)` · Fix: [`9776154`](https://github.com/Journeycake/dratchet/commit/9776154748fe646a950f0bbfa54a52704e2e80be)
 
 Three earlier findings each recorded the same residual scope from a different angle:
 
