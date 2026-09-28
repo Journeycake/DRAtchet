@@ -94,7 +94,7 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0050 | Medium | `server/src/abuse.rs:325 (MailboxDeleteRateLimiter); server/src/ws.rs:494` | [`be8f0c1`](https://github.com/Journeycake/dratchet/commit/be8f0c16ee2d6c149a76bfcce6d2d9f3c28a3b84) | this doc |
 | DRA-0051 | Medium | `store/src/contacts.rs:136 (list_contacts)` | [`be8f0c1`](https://github.com/Journeycake/dratchet/commit/be8f0c16ee2d6c149a76bfcce6d2d9f3c28a3b84) | this doc |
 | DRA-0052 | Low | `client/src/net.rs:59 (Connection::recv)` | [`be8f0c1`](https://github.com/Journeycake/dratchet/commit/be8f0c16ee2d6c149a76bfcce6d2d9f3c28a3b84) | this doc |
-| DRA-0053 | Medium | `ui/src-tauri/src/lib.rs:832 (device_passphrase); restrict_to_owner` | this commit | this doc |
+| DRA-0053 | Medium | `ui/src-tauri/src/lib.rs:832 (device_passphrase); restrict_to_owner` | [`708c22b`](https://github.com/Journeycake/dratchet/commit/708c22b70f4380c7543d99af102838c0726fc765) | this doc |
 
 
 ## Summary
@@ -3956,7 +3956,7 @@ Rated **Low**: it discards diagnostic information and degrades error handling, b
 
 ## DRA-0053: the device keyfile was created readable by other local accounts, and a failed write was silently ignored (residual-scope follow-up to DRA-0033/DRA-0036; confirmed real, fixed) — **MEDIUM**
 
-> **DRA-0053** · Location: `ui/src-tauri/src/lib.rs:832 (device_passphrase); restrict_to_owner` · Fix: this commit
+> **DRA-0053** · Location: `ui/src-tauri/src/lib.rs:832 (device_passphrase); restrict_to_owner` · Fix: [`708c22b`](https://github.com/Journeycake/dratchet/commit/708c22b70f4380c7543d99af102838c0726fc765)
 
 Found while closing DRA-0036's residual scope (non-zeroized intermediate copies in `device_passphrase`). Reviewing that function turned up two further defects at the same write call:
 
