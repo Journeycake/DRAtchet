@@ -98,6 +98,7 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0054 | Low | `store/src/messages.rs:325 (list_messages_counting_unreadable); store/src/contacts.rs:143 (list_contacts_counting_unreadable); ui/src-tauri/src/lib.rs:250 (list_contacts/list_messages commands); ui/src/routes/+page.svelte (unreadable-notice)` | [`2d214d8`](https://github.com/Journeycake/dratchet/commit/2d214d8abef21405d687ddafdbf843337fb47952) | this doc |
 | DRA-0055 | Medium | `server/src/address.rs:219 (AddressLimiter, TrustedProxies::client_ip); server/src/ws.rs:86 (ws_handler); server/src/main.rs (--trusted-proxies, connect info)` | [`9776154`](https://github.com/Journeycake/dratchet/commit/9776154748fe646a950f0bbfa54a52704e2e80be) | this doc |
 | DRA-0056 | Low | `store/src/db.rs:326 (Db::rebind_legacy_records, called from Db::open)` | [`c642595`](https://github.com/Journeycake/dratchet/commit/c642595201639b049dbeb22961e80d1231db48ba) | this doc |
+| DRA-0057 | Low | `core/src/payload.rs:350 (ProfileAnnounce::decode)` | this commit | this doc |
 
 
 ## Summary
@@ -4100,4 +4101,28 @@ Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D w
 
 - **One-time cost at the first open after upgrading.** Every record is decrypted once, up to six times each in the worst case. That's fine for a desktop chat database; it would be slow for a very large one.
 - **Copies elsewhere aren't touched.** Backups or copies of the database made before the rebind still hold unbound records.
+
+## DRA-0057: `ProfileAnnounce::decode` accepted any peer-chosen username, leaving validation to one downstream caller (residual-scope follow-up to DRA-0043; confirmed real, fixed) — **LOW**
+
+> **DRA-0057** · Location: `core/src/payload.rs:350 (ProfileAnnounce::decode)` · Fix: this commit
+
+DRA-0025 and DRA-0043 made `store::profile::record_peer_profile` reject an announced username the directory would refuse: too long, or outside the allowed characters. DRA-0043's residual scope noted that `ProfileAnnounce::decode` itself still validated nothing. Today the only consumer is `apply_entry`, which goes straight to `record_peer_profile`. But any other code that decoded an announce (a notification, a log line, a future UI preview) would get an arbitrary peer-controlled string: a megabyte of text, or a Unicode lookalike of a real contact's handle.
+
+Rated **Low**: no shipped path consumes the unvalidated value today. This closes the gap at the parse boundary before one does.
+
+### Confirmation
+
+`core/src/payload.rs`, `profile_announce_decode_rejects_an_unacceptable_username`: encodes announces with an overlong name, a Cyrillic homograph and an empty name. With only the new check disabled, it fails with its `VULNERABILITY:` assertion on the first of them. The same test checks that a name exactly at `username::MAX_LEN` still round-trips.
+
+### Fixed
+
+`ProfileAnnounce::decode` applies `username::is_acceptable` (length and character set, the same rule the directory enforces at registration) after parsing the CBOR, and returns `MalformedPayload` otherwise. `record_peer_profile` keeps its own check as a second layer.
+
+**Behaviour change, called out:** an unacceptable announce now fails at decode, so `receive_pending` counts it as a skipped per-entry content error (logged and deleted, the rest of the batch unaffected). Before, `record_peer_profile` declined it as a no-op. The outcome is the same either way: the contact's handle doesn't change and the entry is consumed.
+
+Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (322 passed). `ui/src-tauri` `cargo test` (14 passed).
+
+### Known residual scope
+
+- **Other payload types.** `RoutingIdAnnounce`, `ConversationWipePolicyAnnounce` and the rest carry fixed-size or boolean fields, not free text, so they have no equivalent string to validate. They weren't changed.
 

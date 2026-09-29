@@ -341,9 +341,21 @@ impl ProfileAnnounce {
         bytes
     }
 
+    /// DRA-0057: the announced username is held to the same rule the
+    /// directory enforces at registration (`crate::username::is_acceptable`:
+    /// length and character set) right here, at the parse boundary. Before
+    /// this, only `store::profile::record_peer_profile` checked it (DRA-0025,
+    /// DRA-0043), so any other consumer of a decoded `ProfileAnnounce` got an
+    /// unvalidated, peer-chosen string.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        ciborium::from_reader(bytes)
-            .map_err(|_| Error::MalformedPayload("not a valid ProfileAnnounce"))
+        let announce: Self = ciborium::from_reader(bytes)
+            .map_err(|_| Error::MalformedPayload("not a valid ProfileAnnounce"))?;
+        if !crate::username::is_acceptable(&announce.username) {
+            return Err(Error::MalformedPayload(
+                "ProfileAnnounce username is too long or uses disallowed characters",
+            ));
+        }
+        Ok(announce)
     }
 }
 
@@ -510,6 +522,33 @@ mod tests {
     #[test]
     fn profile_announce_garbage_bytes_are_rejected_not_panicking() {
         assert!(ProfileAnnounce::decode(&[0xFF, 0x00, 0x01]).is_err());
+    }
+
+    /// DRA-0057: a peer-chosen username that the directory would never
+    /// have accepted must not survive decoding, whoever consumes it next.
+    #[test]
+    fn profile_announce_decode_rejects_an_unacceptable_username() {
+        for bad in [
+            "a".repeat(crate::username::MAX_LEN + 1),
+            "\u{0430}lice".to_string(), // Cyrillic 'а' homograph
+            String::new(),
+        ] {
+            let encoded = ProfileAnnounce {
+                username: bad.clone(),
+                discriminator: 1,
+            }
+            .encode();
+            assert!(
+                ProfileAnnounce::decode(&encoded).is_err(),
+                "VULNERABILITY: ProfileAnnounce::decode accepted {bad:?}, a username the \
+                 directory rejects -- any consumer other than record_peer_profile gets it unchecked"
+            );
+        }
+        let ok = ProfileAnnounce {
+            username: "a".repeat(crate::username::MAX_LEN),
+            discriminator: 1,
+        };
+        assert_eq!(ProfileAnnounce::decode(&ok.encode()).unwrap(), ok);
     }
 
     #[test]
