@@ -97,6 +97,7 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0053 | Medium | `ui/src-tauri/src/lib.rs:832 (device_passphrase); restrict_to_owner` | [`708c22b`](https://github.com/Journeycake/dratchet/commit/708c22b70f4380c7543d99af102838c0726fc765) | this doc |
 | DRA-0054 | Low | `store/src/messages.rs:325 (list_messages_counting_unreadable); store/src/contacts.rs:143 (list_contacts_counting_unreadable); ui/src-tauri/src/lib.rs:250 (list_contacts/list_messages commands); ui/src/routes/+page.svelte (unreadable-notice)` | [`2d214d8`](https://github.com/Journeycake/dratchet/commit/2d214d8abef21405d687ddafdbf843337fb47952) | this doc |
 | DRA-0055 | Medium | `server/src/address.rs:219 (AddressLimiter, TrustedProxies::client_ip); server/src/ws.rs:86 (ws_handler); server/src/main.rs (--trusted-proxies, connect info)` | [`9776154`](https://github.com/Journeycake/dratchet/commit/9776154748fe646a950f0bbfa54a52704e2e80be) | this doc |
+| DRA-0056 | Low | `store/src/db.rs:326 (Db::rebind_legacy_records, called from Db::open)` | this commit | this doc |
 
 
 ## Summary
@@ -4069,4 +4070,34 @@ Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D w
 - **Misconfigured `trustedProxies` breaks the limit.** Leaving it empty behind an Ingress counts every client as the controller's one address. Listing a range clients can reach directly lets them spoof their address. The chart and README both say this; nothing enforces it.
 - **In-process routers skip the check.** A router served without connect info (tests only today) runs without per-address limits, with a one-time warning.
 - **Chart template not rendered here.** `helm` isn't installed in this environment; the change is one quoted `ConfigMap` value.
+
+## DRA-0056: pre-DRA-0041 records stayed relocatable until something happened to read them (residual-scope follow-up to DRA-0041; confirmed real, fixed) — **LOW**
+
+> **DRA-0056** · Location: `store/src/db.rs:326 (Db::rebind_legacy_records, called from Db::open)` · Fix: this commit
+
+DRA-0041 bound each record's key into its AEAD associated data, so a ciphertext moved under another key no longer decrypts. Records written before that fix were upgraded only when read. Its residual scope said so: "a record that nothing ever reads keeps its unbound ciphertext." An old conversation or a contact nobody opens stayed in the unbound format indefinitely, and could still be moved under another record's key and decrypt there.
+
+Rated **Low**: it needs write access to the database file and applies only to databases created before DRA-0041. It closes a window, not a new attack.
+
+### Confirmation
+
+`store/src/db.rs`, `opening_the_database_rebinds_legacy_records_nothing_has_read`: writes a legacy contact record and a legacy ratchet record (neither is read by `open` for any other reason), reopens the database and inspects the raw bytes. With only the open-time pass removed, it fails with its `VULNERABILITY:` assertion: both records are still unbound.
+
+### Fixed
+
+`Db::open` now calls `rebind_legacy_records` once:
+- Every non-bootstrap record is tried under the three scope keys, bound first.
+- A record that only decrypts unbound is rewritten bound under the scope that opened it.
+- A record that decrypts under nothing is damaged. It's left alone, for the `list_*` functions to skip and report (DRA-0054).
+- A plaintext marker record (`__aad_bound_v1__`) is written last, so later opens skip the scan and an interrupted pass simply re-runs.
+- The bootstrap records are skipped: the salt is plaintext, and the master-key-encrypted ones are already upgraded by `open` reading them.
+
+Guard: `the_open_time_rebind_leaves_bound_and_damaged_records_alone_and_runs_once` checks that already-bound and damaged records are byte-for-byte untouched, that the marker is written, and that read-time upgrade still covers anything appearing after it. This guard also fails without the fix, since the marker doesn't exist there.
+
+Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (321 passed). `ui/src-tauri` `cargo test` (14 passed).
+
+### Known residual scope
+
+- **One-time cost at the first open after upgrading.** Every record is decrypted once, up to six times each in the worst case. That's fine for a desktop chat database; it would be slow for a very large one.
+- **Copies elsewhere aren't touched.** Backups or copies of the database made before the rebind still hold unbound records.
 

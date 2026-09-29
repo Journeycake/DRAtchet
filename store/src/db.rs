@@ -44,6 +44,10 @@ const IDENTITY_DEK_KEY: &str = "__identity_dek__";
 const CONTACTS_DEK_KEY: &str = "__contacts_dek__";
 const CONTENT_DEK_KEY: &str = "__content_dek__";
 const ACCOUNT_KEY: &str = "account";
+/// DRA-0056: present once every record has been checked for the pre-
+/// DRA-0041 unbound format and rewritten bound, so later opens skip the
+/// scan. Plaintext; its value carries no meaning.
+const AAD_MIGRATION_MARKER_KEY: &str = "__aad_bound_v1__";
 
 const NONCE_LEN: usize = 12;
 const DEK_LEN: usize = 32;
@@ -179,6 +183,7 @@ impl Db {
         // `(timestamp, sequence)` tie-break across a restart that lands
         // in the same wall-clock second as messages saved just before
         // it.
+        db.rebind_legacy_records()?;
         let recovered_sequence = crate::messages::recover_message_sequence(&db)?;
         db.message_sequence
             .store(recovered_sequence, Ordering::Relaxed);
@@ -302,6 +307,77 @@ impl Db {
     /// database (not expected to hold more than a modest number of
     /// contacts/messages) over the subtlety of getting prefix-range byte
     /// arithmetic exactly right.
+    /// DRA-0056: rewrite every record still in the pre-DRA-0041 format
+    /// (encrypted with no associated data) in the bound format, once, when
+    /// the database is opened. Before this, a record was only upgraded the
+    /// first time something read it, so a record nothing reads -- an old
+    /// conversation, a contact nobody opens -- stayed relocatable
+    /// indefinitely: its ciphertext could be moved under another record's
+    /// key and would still decrypt there.
+    ///
+    /// The scope a record belongs to isn't recorded alongside it, so each
+    /// record is tried under all three scope DEKs, bound first. A record
+    /// that decrypts under none of them, bound or not, is damaged and is
+    /// left alone for the `list_*` functions to skip and report (DRA-0054).
+    /// The `__`-prefixed bootstrap records are skipped: the salt is
+    /// plaintext, and the master-key-encrypted ones are already upgraded
+    /// by `open` itself reading them. The marker is written last, so an
+    /// interrupted pass simply runs again on the next open.
+    fn rebind_legacy_records(&self) -> Result<usize> {
+        if self.raw_get(AAD_MIGRATION_MARKER_KEY)?.is_some() {
+            return Ok(0);
+        }
+        let mut rebound = 0;
+        for key in self.keys_with_prefix("")? {
+            if key.starts_with("__") {
+                continue;
+            }
+            let Some(stored) = self.raw_get(&key)? else {
+                continue;
+            };
+            let legacy = {
+                let content_key = self.content_key.read().unwrap();
+                let deks = [
+                    (Scope::Identity, &*self.identity_key),
+                    (Scope::Contacts, &*self.contacts_key),
+                    (Scope::Content, &**content_key),
+                ];
+                if deks
+                    .iter()
+                    .any(|(_, dek)| decrypt(dek, key.as_bytes(), &stored).is_ok())
+                {
+                    None
+                } else {
+                    deks.iter().find_map(|(scope, dek)| {
+                        decrypt(dek, &[], &stored)
+                            .ok()
+                            .map(|plaintext| (*scope, plaintext))
+                    })
+                }
+            };
+            if let Some((scope, plaintext)) = legacy {
+                self.put_encrypted(scope, &key, &plaintext)?;
+                rebound += 1;
+            }
+        }
+        let write_txn = self.database.begin_write()?;
+        {
+            let mut table = write_txn.open_table(RECORDS)?;
+            table.insert(AAD_MIGRATION_MARKER_KEY, &b"1"[..])?;
+        }
+        write_txn.commit()?;
+        if rebound > 0 {
+            tracing::info!(rebound, "rebound pre-DRA-0041 records to their keys");
+        }
+        Ok(rebound)
+    }
+
+    fn raw_get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        let read_txn = self.database.begin_read()?;
+        let table = read_txn.open_table(RECORDS)?;
+        Ok(table.get(key)?.map(|raw| raw.value().to_vec()))
+    }
+
     pub(crate) fn keys_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
         let read_txn = self.database.begin_read()?;
         let table = read_txn.open_table(RECORDS)?;
@@ -759,6 +835,88 @@ mod tests {
         assert!(
             decrypt(&db.content_key.read().unwrap(), b"some-record", &upgraded).is_ok(),
             "the upgraded record must decrypt bound to its own key"
+        );
+    }
+
+    /// DRA-0056: a pre-DRA-0041 record that nothing ever reads must not
+    /// stay in the relocatable, unbound format forever -- opening the
+    /// database rebinds it. Uses a contact record and a ratchet record,
+    /// neither of which `open` reads for any other reason.
+    #[test]
+    fn opening_the_database_rebinds_legacy_records_nothing_has_read() {
+        let path = temp_db_path();
+        let (contact_legacy, ratchet_legacy, ratchet_key) = {
+            let db = Db::create(&path, "pw").unwrap();
+            let contact_legacy = encrypt(&db.contacts_key, &[], b"old contact");
+            write_raw_record(&db, "contact:aa", &contact_legacy);
+            let ratchet_key = Db::ratchet_key([3u8; 16]);
+            let ratchet_legacy = encrypt(&db.content_key.read().unwrap(), &[], b"old ratchet");
+            write_raw_record(&db, &ratchet_key, &ratchet_legacy);
+            (contact_legacy, ratchet_legacy, ratchet_key)
+        };
+
+        let db = Db::open(&path, "pw").unwrap();
+        let contact_now = raw_record(&db, "contact:aa");
+        let ratchet_now = raw_record(&db, &ratchet_key);
+        assert!(
+            contact_now != contact_legacy && ratchet_now != ratchet_legacy,
+            "VULNERABILITY: after reopening, records nothing has read are still in the unbound \
+             pre-DRA-0041 format, so their ciphertext can still be moved under another record's \
+             key and decrypt there"
+        );
+        assert!(decrypt(&db.contacts_key, b"contact:aa", &contact_now).is_ok());
+        assert!(decrypt(&db.contacts_key, &[], &contact_now).is_err());
+        assert!(decrypt(
+            &db.content_key.read().unwrap(),
+            ratchet_key.as_bytes(),
+            &ratchet_now
+        )
+        .is_ok());
+    }
+
+    /// DRA-0056 guard: the pass leaves already-bound and damaged records
+    /// exactly as they were, and runs only once.
+    #[test]
+    fn the_open_time_rebind_leaves_bound_and_damaged_records_alone_and_runs_once() {
+        let path = temp_db_path();
+        let (bound_before, damaged) = {
+            let db = Db::create(&path, "pw").unwrap();
+            db.put_encrypted(Scope::Contacts, "contact:bb", b"current")
+                .unwrap();
+            write_raw_record(&db, "contact:cc", b"garbage that decrypts under nothing");
+            (raw_record(&db, "contact:bb"), raw_record(&db, "contact:cc"))
+        };
+
+        let db = Db::open(&path, "pw").unwrap();
+        assert_eq!(
+            raw_record(&db, "contact:bb"),
+            bound_before,
+            "bound record untouched"
+        );
+        assert_eq!(
+            raw_record(&db, "contact:cc"),
+            damaged,
+            "damaged record left for list_* to report"
+        );
+        assert!(db.raw_get(AAD_MIGRATION_MARKER_KEY).unwrap().is_some());
+
+        // A legacy record appearing after the marker is written is no
+        // longer the open-time pass's job: read-time upgrade still covers it.
+        let legacy = encrypt(&db.contacts_key, &[], b"late");
+        write_raw_record(&db, "contact:dd", &legacy);
+        drop(db);
+        let db = Db::open(&path, "pw").unwrap();
+        assert_eq!(
+            raw_record(&db, "contact:dd"),
+            legacy,
+            "the scan ran only once"
+        );
+        assert_eq!(
+            db.get_encrypted(Scope::Contacts, "contact:dd")
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            b"late"
         );
     }
 
