@@ -217,6 +217,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     FrameTag::Error,
                     &ErrorFrame {
                         message: e.to_string(),
+                        code: e.code(),
                     },
                 ));
                 continue;
@@ -239,6 +240,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 FrameTag::Error,
                 &ErrorFrame {
                     message: e.to_string(),
+                    code: e.code(),
                 },
             ));
         }

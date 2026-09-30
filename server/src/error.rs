@@ -97,3 +97,32 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl Error {
+    /// DRA-0058: the wire code sent alongside this error's message, so a
+    /// client can tell refusals apart without parsing text.
+    pub fn code(&self) -> crate::protocol::ErrorCode {
+        use crate::protocol::ErrorCode;
+        match self {
+            Error::MalformedFrame(_) => ErrorCode::MalformedFrame,
+            Error::AuthRequired => ErrorCode::AuthRequired,
+            Error::AuthFailed => ErrorCode::AuthFailed,
+            Error::AlreadyAuthenticated => ErrorCode::AlreadyAuthenticated,
+            Error::InvalidBundle(_) => ErrorCode::InvalidBundle,
+            Error::UsernameTaken => ErrorCode::UsernameTaken,
+            Error::ProofOfWorkRequired => ErrorCode::ProofOfWorkRequired,
+            Error::RateLimited => ErrorCode::RateLimited,
+            Error::NotFound => ErrorCode::NotFound,
+            Error::NotMailboxOwner => ErrorCode::NotMailboxOwner,
+            Error::EnvelopeTooLarge => ErrorCode::EnvelopeTooLarge,
+            Error::MailboxFull => ErrorCode::MailboxFull,
+            Error::WriterQuotaExceeded => ErrorCode::WriterQuotaExceeded,
+            Error::NewMailboxRateLimited => ErrorCode::NewMailboxRateLimited,
+            Error::TooManyOneTimePrekeys => ErrorCode::TooManyOneTimePrekeys,
+            Error::UsernameTooLong => ErrorCode::UsernameTooLong,
+            Error::UsernameInvalidCharacters => ErrorCode::UsernameInvalidCharacters,
+            Error::SdpTooLarge => ErrorCode::SdpTooLarge,
+            Error::IceCandidatesInvalid => ErrorCode::IceCandidatesInvalid,
+        }
+    }
+}

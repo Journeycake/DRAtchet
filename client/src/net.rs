@@ -14,35 +14,74 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
 pub type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
+/// DRA-0058: why a [`Connection`] call failed, as a value callers can
+/// branch on. These used to be plain `String`s, and the app filed every
+/// one of them as a lost connection -- so a server refusal (rate limited,
+/// not the owner) tore down a healthy connection and reconnected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetError {
+    /// The transport itself failed: couldn't connect, a send failed, or
+    /// the socket errored or closed. Reconnecting is the right response.
+    Connection(String),
+    /// The server received the request and refused it. The connection is
+    /// fine; `code` says why (`ErrorCode::is_rate_limit` for "slow down").
+    Refused { code: ErrorCode, message: String },
+    /// A frame arrived that didn't match what the protocol allows here --
+    /// malformed, or an unexpected type. Not a transport failure.
+    Protocol(String),
+}
+
+impl std::fmt::Display for NetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NetError::Connection(msg) => write!(f, "{msg}"),
+            NetError::Refused { message, .. } => {
+                write!(f, "server refused the request: {message}")
+            }
+            NetError::Protocol(msg) => write!(f, "protocol error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for NetError {}
+
+/// Lets the CLI (`src/main.rs`), whose functions still return `String`,
+/// keep using `?` on these calls.
+impl From<NetError> for String {
+    fn from(e: NetError) -> Self {
+        e.to_string()
+    }
+}
+
 pub struct Connection {
     ws: WsStream,
 }
 
 impl Connection {
-    pub async fn connect(url: &str) -> Result<Self, String> {
+    pub async fn connect(url: &str) -> Result<Self, NetError> {
         let (ws, _resp) = connect_async(url)
             .await
-            .map_err(|e| format!("failed to connect to {url}: {e}"))?;
+            .map_err(|e| NetError::Connection(format!("failed to connect to {url}: {e}")))?;
         Ok(Connection { ws })
     }
 
-    pub async fn send<T: Serialize>(&mut self, tag: FrameTag, body: &T) -> Result<(), String> {
+    pub async fn send<T: Serialize>(&mut self, tag: FrameTag, body: &T) -> Result<(), NetError> {
         let frame = encode(tag, body);
         self.ws
             .send(WsMessage::Binary(frame))
             .await
-            .map_err(|e| format!("send failed: {e}"))
+            .map_err(|e| NetError::Connection(format!("send failed: {e}")))
     }
 
     /// Wait for the next binary frame, skipping any non-binary control
     /// frames the underlying transport surfaces.
-    pub async fn recv_raw(&mut self) -> Result<Vec<u8>, String> {
+    pub async fn recv_raw(&mut self) -> Result<Vec<u8>, NetError> {
         loop {
             match self.ws.next().await {
                 Some(Ok(WsMessage::Binary(b))) => return Ok(b),
                 Some(Ok(_)) => continue,
-                Some(Err(e)) => return Err(format!("connection error: {e}")),
-                None => return Err("connection closed".to_string()),
+                Some(Err(e)) => return Err(NetError::Connection(format!("connection error: {e}"))),
+                None => return Err(NetError::Connection("connection closed".to_string())),
             }
         }
     }
@@ -56,24 +95,34 @@ impl Connection {
     /// failure. A genuine, expected server refusal (rate limited, not
     /// the resource owner, anything else `Error` covers) must never look
     /// the same to a caller as the wire protocol being broken.
-    pub async fn recv<T: DeserializeOwned>(&mut self) -> Result<(FrameTag, T), String> {
+    ///
+    /// DRA-0058: a refusal comes back as [`NetError::Refused`] carrying the
+    /// server's [`ErrorCode`], and an undecodable frame as
+    /// [`NetError::Protocol`] -- neither is a lost connection.
+    pub async fn recv<T: DeserializeOwned>(&mut self) -> Result<(FrameTag, T), NetError> {
         let raw = self.recv_raw().await?;
-        let (tag, body) = split_tag(&raw).map_err(|e| e.to_string())?;
+        let (tag, body) = split_tag(&raw).map_err(|e| NetError::Protocol(e.to_string()))?;
         if tag == FrameTag::Error {
-            let err: ErrorFrame = decode_body(body).map_err(|e| e.to_string())?;
-            return Err(format!("server refused the request: {}", err.message));
+            let err: ErrorFrame =
+                decode_body(body).map_err(|e| NetError::Protocol(e.to_string()))?;
+            return Err(NetError::Refused {
+                code: err.code,
+                message: err.message,
+            });
         }
-        let parsed: T = decode_body(body).map_err(|e| e.to_string())?;
+        let parsed: T = decode_body(body).map_err(|e| NetError::Protocol(e.to_string()))?;
         Ok((tag, parsed))
     }
 
     /// Full self-certifying auth handshake: receive the challenge the
     /// server always sends first, sign it, send it back. Never requires a
     /// prior `PublishBundle` (`server/src/ws.rs`'s module doc).
-    pub async fn authenticate(&mut self, account: &Account) -> Result<(), String> {
+    pub async fn authenticate(&mut self, account: &Account) -> Result<(), NetError> {
         let (tag, challenge): (_, AuthChallenge) = self.recv().await?;
         if tag != FrameTag::AuthChallenge {
-            return Err(format!("expected AuthChallenge, got {tag:?}"));
+            return Err(NetError::Protocol(format!(
+                "expected AuthChallenge, got {tag:?}"
+            )));
         }
         // DRA-0039: domain-separated -- never sign a server-chosen value
         // verbatim, or the client becomes a signing oracle for the prekey
@@ -81,11 +130,11 @@ impl Connection {
         let signature = account
             .identity
             .sign_auth_challenge(&challenge.nonce)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| NetError::Protocol(e.to_string()))?;
         let identity_key = account
             .identity
             .export_public_key()
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| NetError::Protocol(e.to_string()))?;
         self.send(
             FrameTag::AuthResponse,
             &AuthResponse {
@@ -96,7 +145,9 @@ impl Connection {
         .await?;
         let (tag, ack): (_, Ack) = self.recv().await?;
         if tag != FrameTag::Ack || !ack.ok {
-            return Err("authentication was not acknowledged".to_string());
+            return Err(NetError::Protocol(
+                "authentication was not acknowledged".to_string(),
+            ));
         }
         Ok(())
     }

@@ -289,11 +289,108 @@ pub struct OwnPrekeyCount {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ErrorFrame {
     pub message: String,
+    /// DRA-0058: which refusal this is, as a value a client can branch on
+    /// instead of matching `message` text. Defaults to `Unspecified` when
+    /// absent, so a frame from a server predating this field still decodes
+    /// (and an older client simply ignores the extra field).
+    #[serde(default)]
+    pub code: ErrorCode,
+}
+
+/// DRA-0058: the machine-readable reason behind an [`ErrorFrame`], one per
+/// `crate::error::Error` variant. `Unspecified` covers a missing code and
+/// any code a newer server sends that this build doesn't know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ErrorCode {
+    MalformedFrame,
+    AuthRequired,
+    AuthFailed,
+    AlreadyAuthenticated,
+    InvalidBundle,
+    UsernameTaken,
+    ProofOfWorkRequired,
+    RateLimited,
+    NotFound,
+    NotMailboxOwner,
+    EnvelopeTooLarge,
+    MailboxFull,
+    WriterQuotaExceeded,
+    NewMailboxRateLimited,
+    TooManyOneTimePrekeys,
+    UsernameTooLong,
+    UsernameInvalidCharacters,
+    SdpTooLarge,
+    IceCandidatesInvalid,
+    #[default]
+    #[serde(other)]
+    Unspecified,
+}
+
+impl ErrorCode {
+    /// A refusal that means "slow down", not "you did something wrong":
+    /// the request can be retried later, on the same connection.
+    pub fn is_rate_limit(self) -> bool {
+        matches!(
+            self,
+            ErrorCode::RateLimited | ErrorCode::NewMailboxRateLimited
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// DRA-0058 guard: adding `code` must not break decoding across
+    /// versions -- a frame without it (an older server) and a code this
+    /// build doesn't know (a newer server) both decode as `Unspecified`.
+    #[test]
+    fn error_frames_decode_across_versions() {
+        #[derive(Serialize)]
+        struct OldErrorFrame {
+            message: String,
+        }
+        #[derive(Serialize)]
+        struct FutureErrorFrame {
+            message: String,
+            code: &'static str,
+        }
+        let mut old = Vec::new();
+        ciborium::into_writer(
+            &OldErrorFrame {
+                message: "x".into(),
+            },
+            &mut old,
+        )
+        .unwrap();
+        let decoded: ErrorFrame = decode_body(&old).unwrap();
+        assert_eq!(decoded.code, ErrorCode::Unspecified);
+
+        let mut future = Vec::new();
+        ciborium::into_writer(
+            &FutureErrorFrame {
+                message: "x".into(),
+                code: "SomethingAddedLater",
+            },
+            &mut future,
+        )
+        .unwrap();
+        let decoded: ErrorFrame = decode_body(&future).unwrap();
+        assert_eq!(decoded.code, ErrorCode::Unspecified);
+
+        let mut current = Vec::new();
+        ciborium::into_writer(
+            &ErrorFrame {
+                message: "x".into(),
+                code: ErrorCode::RateLimited,
+            },
+            &mut current,
+        )
+        .unwrap();
+        let decoded: ErrorFrame = decode_body(&current).unwrap();
+        assert_eq!(decoded.code, ErrorCode::RateLimited);
+        assert!(decoded.code.is_rate_limit());
+    }
 
     #[test]
     fn round_trips_a_typed_frame() {

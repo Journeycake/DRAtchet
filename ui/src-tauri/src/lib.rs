@@ -1009,6 +1009,15 @@ mod tests {
         assert!(!is_connection_error(&dratchet_app::Error::NotAcknowledged));
         assert!(!is_connection_error(&dratchet_app::Error::NoSession));
         assert!(!is_connection_error(&dratchet_app::Error::UsernameTaken));
+        // DRA-0058: a refusal or a protocol problem must not make
+        // poll_loop tear down and re-open a working connection.
+        assert!(!is_connection_error(&dratchet_app::Error::ServerRefused {
+            code: dratchet_server::protocol::ErrorCode::RateLimited,
+            message: "rate limit exceeded".into(),
+        }));
+        assert!(!is_connection_error(&dratchet_app::Error::Protocol(
+            "unexpected frame".into()
+        )));
     }
 
     /// The actual risk surface: does the helper `run()` and `poll_loop`

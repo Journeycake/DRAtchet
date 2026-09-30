@@ -109,9 +109,22 @@ async fn a_genuine_server_refusal_is_not_reported_as_a_decode_failure() {
     .await
     .unwrap();
 
-    let result: Result<(FrameTag, MailboxEntries), String> = conn.recv().await;
+    let result: Result<(FrameTag, MailboxEntries), dratchet_client::net::NetError> =
+        conn.recv().await;
     let err = result
         .expect_err("a stranger's fetch of another account's bootstrap mailbox must be refused");
+    // DRA-0058: the refusal also arrives typed, with the server's code.
+    assert!(
+        matches!(
+            err,
+            dratchet_client::net::NetError::Refused {
+                code: ErrorCode::NotMailboxOwner,
+                ..
+            }
+        ),
+        "expected a typed NotMailboxOwner refusal, got {err:?}"
+    );
+    let err = err.to_string();
 
     assert!(
         !err.contains("did not decode as expected CBOR shape") && !err.contains("MalformedFrame"),

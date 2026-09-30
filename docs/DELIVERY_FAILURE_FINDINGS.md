@@ -99,6 +99,7 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0055 | Medium | `server/src/address.rs:219 (AddressLimiter, TrustedProxies::client_ip); server/src/ws.rs:86 (ws_handler); server/src/main.rs (--trusted-proxies, connect info)` | [`9776154`](https://github.com/Journeycake/dratchet/commit/9776154748fe646a950f0bbfa54a52704e2e80be) | this doc |
 | DRA-0056 | Low | `store/src/db.rs:326 (Db::rebind_legacy_records, called from Db::open)` | [`c642595`](https://github.com/Journeycake/dratchet/commit/c642595201639b049dbeb22961e80d1231db48ba) | this doc |
 | DRA-0057 | Low | `core/src/payload.rs:350 (ProfileAnnounce::decode)` | [`814e959`](https://github.com/Journeycake/dratchet/commit/814e959fb42b777b391be10adf16f16089ebfdd6) | this doc |
+| DRA-0058 | Medium | `app/src/error.rs:69 (From<NetError>, From<String>); client/src/net.rs:22 (NetError); server/src/protocol.rs:304 (ErrorCode); ui/src-tauri/src/lib.rs (is_connection_error)` | this commit | this doc |
 
 
 ## Summary
@@ -4125,4 +4126,54 @@ Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D w
 ### Known residual scope
 
 - **Other payload types.** `RoutingIdAnnounce`, `ConversationWipePolicyAnnounce` and the rest carry fixed-size or boolean fields, not free text, so they have no equivalent string to validate. They weren't changed.
+
+## DRA-0058: every client-side failure was filed as a lost connection, so a server refusal made the app drop and reconnect a working connection (follow-up to DRA-0052's residual scope; confirmed real, fixed) — **MEDIUM**
+
+> **DRA-0058** · Location: `app/src/error.rs:69 (From<NetError>, From<String>); client/src/net.rs:22 (NetError); server/src/protocol.rs:304 (ErrorCode); ui/src-tauri/src/lib.rs (is_connection_error)` · Fix: this commit
+
+DRA-0052 stopped the client discarding the server's refusal reason, but noted the reason still arrived as plain text: `net::Connection` returned `Result<_, String>`. One level up, `dratchet_app::Error` had `impl From<String> for Error { Error::Connection(e) }`, so **every** `String` failure became `Error::Connection`:
+- server refusals (rate limited, not the mailbox owner, …);
+- malformed frames;
+- local handshake and pairing failures from `dratchet_client::handshake`, which never touch the network.
+
+`publish_bundle_wire` also hand-labelled malformed frames and fetched bundles as `Connection`, and detected a taken username by comparing message text.
+
+The desktop app's poll loop (`ui/src-tauri`, `is_connection_error`) reconnects on exactly `Error::Connection`. So a refusal:
+- tore down a working connection;
+- showed "Reconnecting…" while the network was fine;
+- spent one of DRA-0055's per-address new-connection allowances on a reconnect the refusal never called for. Refusals are often *caused* by rate limits, so the client answered "slow down" by opening more connections.
+
+The 2s-to-60s backoff kept this slow, not a flood. Message delivery stalled for the length of each backoff, but nothing was lost: mail waits on the server.
+
+Rated **Medium**: availability and correctness of the client's own connection handling. It also works against the server's abuse limits, but needs no attacker; any refusal triggers it.
+
+### Confirmation
+
+`app/tests/server_refusal_is_not_a_connection_error.rs`. With only the two conversions restored to their old behaviour (refusals and `String` both becoming `Connection`), both confirming tests fail with their `VULNERABILITY:` assertion:
+
+- `a_real_server_refusal_is_not_reported_as_a_lost_connection`: a real server refuses a stranger's fetch of another account's bootstrap mailbox. Pre-fix, this was classified as `Error::Connection`. The test also shows the same connection answers the next request normally.
+- `a_failed_pairing_step_is_not_reported_as_a_lost_connection`: a handshake/pairing `String` error was classified as `Error::Connection`.
+
+Guards: `a_real_transport_failure_is_still_a_connection_error` (connecting to a closed port still is one, so real outages still reconnect); `ui/src-tauri`'s `is_connection_error_matches_only_the_transport_variant`, extended with the new variants; and `server/src/protocol.rs`'s `error_frames_decode_across_versions`.
+
+### Fixed
+
+- **Wire:** `ErrorFrame` gained `code: ErrorCode`, with one variant per server `Error` (`Error::code()`), sent from both `ws.rs` error sites. It's `#[serde(default)]`, and unknown codes fall back to `Unspecified` via `#[serde(other)]`. So a frame from an older server, and a code from a newer one, both still decode, and older clients ignore the extra field. **This is not a lockstep upgrade.** `ErrorCode::is_rate_limit` groups the two "slow down" codes.
+- **Client:** `net::Connection` returns `NetError`, one of:
+  - `Connection`: the transport failed.
+  - `Refused { code, message }`: an `Error` frame.
+  - `Protocol`: a malformed or unexpected frame.
+
+  `impl From<NetError> for String` keeps the CLI's `?` working unchanged, and the `Display` text for a refusal is unchanged from DRA-0052.
+- **App:** `Error` gained `ServerRefused { code, message }` and `Protocol(String)`. `From<NetError>` maps each kind to its own variant, and `From<String>` (now only local handshake/pairing failures) maps to `Protocol`. The fetched-bundle and frame-decode sites in `lib.rs` use `Protocol`. `publish_bundle_wire` detects `UsernameTaken` by code, not message text; any other refusal is `ServerRefused`. `Error::Connection` now means a genuine transport failure only, which is what `is_connection_error` reconnects on. A refusal is logged and retried on the next poll tick, on the same connection.
+
+**Contract change, called out:** `net::Connection`'s methods return `Result<_, NetError>` instead of `Result<_, String>`. DRA-0052's `client/tests/error_frame_masking.rs` spelled out the old type. It now names `NetError`, keeps its original assertion unchanged (applied to the error's text), and adds a check that the refusal arrives as `Refused { code: NotMailboxOwner }`.
+
+Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (327 passed). `ui/src-tauri` fmt, clippy and `cargo test` (14 passed).
+
+### Known residual scope
+
+- **No backoff for rate limits yet.** The poll loop now keeps the connection on a refusal and simply retries at its next tick. It doesn't yet slow down specifically on `is_rate_limit()`. At the current poll interval that's harmless, but a smarter client would back off.
+- **Handshake and pairing errors are still text.** They're now filed as `Protocol`, which is correct for reconnect purposes, but they're still `String`s inside. Typing them is a separate, smaller clean-up.
+- **Not observed in a running app.** The reconnect-on-refusal behaviour was reasoned from the code and pinned down by tests at the error-classification level. It wasn't watched in a live Tauri window.
 

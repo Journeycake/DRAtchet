@@ -148,11 +148,11 @@ fn random_routing_id() -> Vec<u8> {
 fn to_core_bundle(wire: &FetchedBundleWire) -> Result<PrekeyBundle> {
     let identity_dh_public: [u8; 32] =
         wire.identity_dh_public.as_slice().try_into().map_err(|_| {
-            Error::Connection("fetched bundle: identity_dh_public must be 32 bytes".into())
+            Error::Protocol("fetched bundle: identity_dh_public must be 32 bytes".into())
         })?;
     let signed_prekey_public: [u8; 32] =
         wire.signed_prekey.as_slice().try_into().map_err(|_| {
-            Error::Connection("fetched bundle: signed_prekey must be 32 bytes".into())
+            Error::Protocol("fetched bundle: signed_prekey must be 32 bytes".into())
         })?;
     Ok(PrekeyBundle {
         identity_public_key: wire.identity_key.clone(),
@@ -168,7 +168,7 @@ fn to_core_bundle(wire: &FetchedBundleWire) -> Result<PrekeyBundle> {
             .as_ref()
             .map(|otp| -> Result<OneTimePrekeyPublic> {
                 let public: [u8; 32] = otp.key.as_slice().try_into().map_err(|_| {
-                    Error::Connection("fetched bundle: one_time_prekey.key must be 32 bytes".into())
+                    Error::Protocol("fetched bundle: one_time_prekey.key must be 32 bytes".into())
                 })?;
                 Ok(OneTimePrekeyPublic {
                     id: otp.id,
@@ -193,19 +193,23 @@ async fn publish_bundle_wire(conn: &mut Connection, wire: PrekeyBundleWire) -> R
         .await?;
     let raw = conn.recv_raw().await?;
     let (tag, body) =
-        dratchet_server::protocol::split_tag(&raw).map_err(|e| Error::Connection(e.to_string()))?;
+        dratchet_server::protocol::split_tag(&raw).map_err(|e| Error::Protocol(e.to_string()))?;
     match tag {
         FrameTag::Ack => Ok(()),
         FrameTag::Error => {
             let err: ErrorFrame = dratchet_server::protocol::decode_body(body)
-                .map_err(|e| Error::Connection(e.to_string()))?;
-            if err.message == dratchet_server::error::Error::UsernameTaken.to_string() {
+                .map_err(|e| Error::Protocol(e.to_string()))?;
+            // DRA-0058: by code, not by comparing the message text.
+            if err.code == dratchet_server::protocol::ErrorCode::UsernameTaken {
                 Err(Error::UsernameTaken)
             } else {
-                Err(Error::Connection(err.message))
+                Err(Error::ServerRefused {
+                    code: err.code,
+                    message: err.message,
+                })
             }
         }
-        other => Err(Error::Connection(format!(
+        other => Err(Error::Protocol(format!(
             "unexpected frame tag {other:?} from PublishBundle"
         ))),
     }
