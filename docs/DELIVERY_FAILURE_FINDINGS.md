@@ -99,7 +99,7 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0055 | Medium | `server/src/address.rs:219 (AddressLimiter, TrustedProxies::client_ip); server/src/ws.rs:86 (ws_handler); server/src/main.rs (--trusted-proxies, connect info)` | [`9776154`](https://github.com/Journeycake/dratchet/commit/9776154748fe646a950f0bbfa54a52704e2e80be) | this doc |
 | DRA-0056 | Low | `store/src/db.rs:326 (Db::rebind_legacy_records, called from Db::open)` | [`c642595`](https://github.com/Journeycake/dratchet/commit/c642595201639b049dbeb22961e80d1231db48ba) | this doc |
 | DRA-0057 | Low | `core/src/payload.rs:350 (ProfileAnnounce::decode)` | [`814e959`](https://github.com/Journeycake/dratchet/commit/814e959fb42b777b391be10adf16f16089ebfdd6) | this doc |
-| DRA-0058 | Medium | `app/src/error.rs:69 (From<NetError>, From<String>); client/src/net.rs:22 (NetError); server/src/protocol.rs:304 (ErrorCode); ui/src-tauri/src/lib.rs (is_connection_error)` | this commit | this doc |
+| DRA-0058 | Medium | `app/src/error.rs:69 (From<NetError>, From<String>); client/src/net.rs:22 (NetError); server/src/protocol.rs:304 (ErrorCode); ui/src-tauri/src/lib.rs (is_connection_error)` | [`73dfc1c`](https://github.com/Journeycake/dratchet/commit/73dfc1cbc9eb71fb0b9a640c216313e7fd4e968b) | this doc |
 
 
 ## Summary
@@ -4129,7 +4129,7 @@ Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D w
 
 ## DRA-0058: every client-side failure was filed as a lost connection, so a server refusal made the app drop and reconnect a working connection (follow-up to DRA-0052's residual scope; confirmed real, fixed) — **MEDIUM**
 
-> **DRA-0058** · Location: `app/src/error.rs:69 (From<NetError>, From<String>); client/src/net.rs:22 (NetError); server/src/protocol.rs:304 (ErrorCode); ui/src-tauri/src/lib.rs (is_connection_error)` · Fix: this commit
+> **DRA-0058** · Location: `app/src/error.rs:69 (From<NetError>, From<String>); client/src/net.rs:22 (NetError); server/src/protocol.rs:304 (ErrorCode); ui/src-tauri/src/lib.rs (is_connection_error)` · Fix: [`73dfc1c`](https://github.com/Journeycake/dratchet/commit/73dfc1cbc9eb71fb0b9a640c216313e7fd4e968b)
 
 DRA-0052 stopped the client discarding the server's refusal reason, but noted the reason still arrived as plain text: `net::Connection` returned `Result<_, String>`. One level up, `dratchet_app::Error` had `impl From<String> for Error { Error::Connection(e) }`, so **every** `String` failure became `Error::Connection`:
 - server refusals (rate limited, not the mailbox owner, …);
