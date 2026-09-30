@@ -90,10 +90,30 @@ impl TestClient {
         }
     }
 
+    /// If the server answered with an `Error` frame where the test
+    /// expected some other type, the panic names the server's actual
+    /// reason instead of a generic decode failure -- the same masking
+    /// DRA-0052 fixed in `client::net::Connection::recv`, which this
+    /// harness copied. A test that asks for `ErrorFrame` itself still
+    /// decodes it normally.
     pub async fn recv<T: DeserializeOwned>(&mut self) -> (FrameTag, T) {
         let raw = self.recv_raw().await;
         let (tag, body) = split_tag(&raw).expect("valid frame from the server");
-        let parsed: T = decode_body(body).expect("server frame decodes as expected type");
+        let parsed: T = match decode_body(body) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                if tag == FrameTag::Error {
+                    if let Ok(err) = decode_body::<ErrorFrame>(body) {
+                        panic!(
+                            "expected a {} frame, but the server refused the request: {}",
+                            std::any::type_name::<T>(),
+                            err.message
+                        );
+                    }
+                }
+                panic!("server frame decodes as expected type: {e}");
+            }
+        };
         (tag, parsed)
     }
 

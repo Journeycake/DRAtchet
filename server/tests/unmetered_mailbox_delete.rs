@@ -158,3 +158,44 @@ async fn ordinary_deletes_and_ownership_checks_still_work() {
     assert_eq!(tag, FrameTag::MailboxEntries);
     assert_eq!(entries.entries.len(), 0, "writer never sees its own entry");
 }
+
+/// DRA-0052 residual: the test harness's own `recv` must surface the
+/// server's refusal message, not a generic decode failure, when a test
+/// expects success and the server says no.
+#[tokio::test]
+#[should_panic(expected = "the server refused the request")]
+async fn the_test_harness_reports_an_unexpected_refusal_by_its_reason() {
+    let (url, _state) = spawn_server_with_state().await;
+    let (writer, writer_bundle) = fresh_account_and_bundle("owner52", 9052, 0);
+    let (stranger, _b) = fresh_account_and_bundle("stranger52", 9053, 0);
+
+    let mut owner = TestClient::connect(&url).await;
+    owner.authenticate(&writer).await;
+    owner
+        .send(
+            FrameTag::PublishBundle,
+            &PublishBundle {
+                bundle: writer_bundle,
+            },
+        )
+        .await;
+    let _: (_, Ack) = owner.recv().await;
+
+    let mut client = TestClient::connect(&url).await;
+    client.authenticate(&stranger).await;
+    client
+        .send(
+            FrameTag::MailboxDelete,
+            &MailboxDelete {
+                mailbox_id: dratchet_core::x3dh::bootstrap_mailbox_id(
+                    writer.identity.fingerprint().as_bytes(),
+                )
+                .to_vec(),
+                entry_id: vec![1u8; 16],
+            },
+        )
+        .await;
+    // A non-owner's delete is refused; asking for an Ack here must panic
+    // with the server's reason.
+    let _: (_, Ack) = client.recv().await;
+}
