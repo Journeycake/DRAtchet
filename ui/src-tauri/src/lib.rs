@@ -27,7 +27,7 @@ use dratchet_client::net::Connection;
 use dratchet_core::account::Account;
 use dratchet_store::{Contact, Db, VerificationState};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use tokio::sync::Mutex;
 
 const SERVER_URL: &str = "ws://127.0.0.1:8787/v1/ws";
@@ -53,6 +53,9 @@ const EXPIRY_CHECK_EVERY_N_TICKS: u32 = 30;
 struct AppState {
     db: Db,
     db_path: PathBuf,
+    /// Where `poll_loop` (re)connects -- `SERVER_URL` in the app; tests
+    /// point it at a real ephemeral server.
+    server_url: String,
     // Behind a `Mutex` (not just `db`/`db_path`) because
     // `register_own_profile`/`rename_own_profile`/the poll loop's
     // first-contact scan all need `&mut Account` — self-registration and
@@ -723,8 +726,8 @@ async fn connect_authenticate_and_reconcile(
 /// on every backoff-gated retry attempt would be a harmless but noisy
 /// no-op for the frontend, so this stays quiet unless there's something
 /// new to say.
-fn set_connection_status(
-    app_handle: &AppHandle,
+fn set_connection_status<R: Runtime>(
+    app_handle: &AppHandle<R>,
     state: &AppState,
     new_status: ConnectionStatusDto,
 ) {
@@ -768,7 +771,7 @@ fn is_connection_error(e: &dratchet_app::Error) -> bool {
 /// backoff-gated retry rather than silently and permanently going dark —
 /// see `docs/DELIVERY_FAILURE_FINDINGS.md` scenario 23 for the failure
 /// mode this closes.
-async fn poll_loop(app_handle: AppHandle) {
+async fn poll_loop<R: Runtime>(app_handle: AppHandle<R>) {
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
     let mut tick_count: u32 = 0;
     // Set the moment a tick's work hits a transport-layer error
@@ -816,9 +819,11 @@ async fn poll_loop(app_handle: AppHandle) {
                 continue;
             }
             let mut account = state.account.lock().await;
-            match connect_authenticate_and_reconcile(SERVER_URL, &state.db, &mut account).await {
+            match connect_authenticate_and_reconcile(&state.server_url, &state.db, &mut account)
+                .await
+            {
                 Ok((new_conn, notice)) => {
-                    eprintln!("poll: reconnected to {SERVER_URL}");
+                    eprintln!("poll: reconnected to {}", state.server_url);
                     *state.conn.lock().await = Some(new_conn);
                     // Anything sent during the outage has genuine reason
                     // to be in doubt — see `mark_pending_sends_uncertain`'s
@@ -1071,6 +1076,7 @@ pub fn run() {
         .manage(AppState {
             db,
             db_path,
+            server_url: SERVER_URL.to_string(),
             account,
             conn,
             own_discriminator_change_notice: StdMutex::new(own_discriminator_change_notice),
@@ -1115,11 +1121,8 @@ pub fn run() {
 /// `connect_authenticate_and_reconcile` actually producing a live,
 /// usable connection against a real spawned `dratchet_server::app()` (the
 /// same helper both `run()`'s startup and `poll_loop`'s reconnect path
-/// call). `poll_loop`'s own backoff *timing* state machine isn't covered
-/// here — it needs a real `tauri::AppHandle`, which isn't practical to
-/// construct in a plain unit test — but the two pieces that actually
-/// determine correctness (does a dead connection get correctly
-/// recognized, does a fresh one actually work) are.
+/// call). `poll_loop` itself runs end to end, on `tauri::test`'s mock
+/// runtime, in `retry_flow_tests`.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1509,3 +1512,6 @@ mod tests {
         assert!(messages["messages"].is_array());
     }
 }
+
+#[cfg(test)]
+mod retry_flow_tests;

@@ -47,6 +47,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 # able to call `dratchet_server::app()` themselves.
 dratchet-server = { path = "../../server" }
 tempfile = "3"
+# `tauri::test`'s mock runtime: the commands and `poll_loop` run for real,
+# without a window system.
+tauri = { version = "2", features = ["test"] }
 axum = { version = "0.7", features = ["ws"] }
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
