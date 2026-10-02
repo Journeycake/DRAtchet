@@ -4348,6 +4348,8 @@ Rated **Medium**, like DRA-0063: silent message loss, here for everyone at once,
 
 Guard: `reconnecting_to_the_same_server_flags_nothing`.
 
+Added later (closing a test gap): `a_crashed_and_restarted_server_is_detected_and_the_retry_is_delivered` crashes and restarts the *same* server, with its directory persisted as `dratchetd` keeps it, on the same address. It checks that the sender's connection dies, the directory survives while the mailbox doesn't, the restart is detected on reconnect, and the retry is delivered and acknowledged. `a_message_collected_just_before_the_crash_is_not_shown_twice_after_a_retry` covers a message collected before the crash whose receipt was lost with it: the retry isn't shown twice, and the sender's flag clears.
+
 Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (336 passed). `ui/src-tauri` fmt, clippy and `cargo test` (16 passed). `npm run check` (0 errors, 0 warnings).
 
 ### Known residual scope
