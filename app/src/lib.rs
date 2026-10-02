@@ -457,6 +457,10 @@ pub async fn announce_profile(
         }
         .encode(),
     )?;
+    // DRA-0059: commit the ratchet advance *before* the envelope leaves,
+    // so a retry after a lost Ack encrypts at a fresh chain position
+    // (fresh key and nonce) instead of reusing this one.
+    db.save_ratchet(conv_id, &ratchet)?;
     conn.send(
         FrameTag::MailboxWrite,
         &MailboxWrite {
@@ -471,7 +475,6 @@ pub async fn announce_profile(
         return Err(Error::NotAcknowledged);
     }
 
-    db.save_ratchet(conv_id, &ratchet)?;
     Ok(())
 }
 
@@ -839,6 +842,10 @@ pub async fn send_message(
     let send_n = envelope.n;
     let send_dh_pub = envelope.dh_pub.to_vec();
 
+    // DRA-0059: commit the ratchet advance *before* the envelope leaves,
+    // so a retry after a lost Ack encrypts at a fresh chain position
+    // (fresh key and nonce) instead of reusing this one.
+    db.save_ratchet(conv_id, &ratchet)?;
     conn.send(
         FrameTag::MailboxWrite,
         &MailboxWrite {
@@ -853,7 +860,6 @@ pub async fn send_message(
         return Err(Error::NotAcknowledged);
     }
 
-    db.save_ratchet(conv_id, &ratchet)?;
     Ok(db.save_message_now(
         conv_id,
         content.to_vec(),
@@ -1052,6 +1058,13 @@ pub async fn receive_pending(
             }
             .encode();
             let ack_envelope = ratchet.encrypt_payload(PAYLOAD_DELIVERY_ACK, &ack_content)?;
+            // DRA-0059: commit before sending, as every other send does. Safe
+            // mid-batch: this entry is already processed, saved and deleted
+            // from the mailbox, so committing its receive progress is
+            // correct too. A session this batch wiped stays unsaved.
+            if !session_wiped {
+                db.save_ratchet(conv_id, &ratchet)?;
+            }
             conn.send(
                 FrameTag::MailboxWrite,
                 &MailboxWrite {
@@ -1378,6 +1391,10 @@ pub async fn announce_routing_id(
         &RoutingIdAnnounce { routing_id }.encode(),
     )?;
 
+    // DRA-0059: commit the ratchet advance *before* the envelope leaves,
+    // so a retry after a lost Ack encrypts at a fresh chain position
+    // (fresh key and nonce) instead of reusing this one.
+    db.save_ratchet(conv_id, &ratchet)?;
     conn.send(
         FrameTag::MailboxWrite,
         &MailboxWrite {
@@ -1392,7 +1409,6 @@ pub async fn announce_routing_id(
         return Err(Error::NotAcknowledged);
     }
 
-    db.save_ratchet(conv_id, &ratchet)?;
     Ok(())
 }
 
@@ -1427,6 +1443,10 @@ pub async fn announce_wipe_policy(
         }
         .encode(),
     )?;
+    // DRA-0059: commit the ratchet advance *before* the envelope leaves,
+    // so a retry after a lost Ack encrypts at a fresh chain position
+    // (fresh key and nonce) instead of reusing this one.
+    db.save_ratchet(conv_id, &ratchet)?;
     conn.send(
         FrameTag::MailboxWrite,
         &MailboxWrite {
@@ -1440,8 +1460,6 @@ pub async fn announce_wipe_policy(
     if !ack.ok {
         return Err(Error::NotAcknowledged);
     }
-
-    db.save_ratchet(conv_id, &ratchet)?;
 
     // Stamp this side's own wipe boundary now that the announce is
     // actually acked — "how far this side had gotten the moment the peer
@@ -1538,6 +1556,10 @@ pub async fn request_conversation_wipe(
     let include_session = contact.effective_wipe_include_session();
     let content = ConversationWipeRequestContent { include_session }.encode();
     let envelope = ratchet.encrypt_payload(PAYLOAD_CONVERSATION_WIPE_REQUEST, &content)?;
+    // DRA-0059: commit the ratchet advance *before* the envelope leaves,
+    // so a retry after a lost Ack encrypts at a fresh chain position
+    // (fresh key and nonce) instead of reusing this one.
+    db.save_ratchet(conv_id, &ratchet)?;
     conn.send(
         FrameTag::MailboxWrite,
         &MailboxWrite {
@@ -1552,7 +1574,6 @@ pub async fn request_conversation_wipe(
         return Err(Error::NotAcknowledged);
     }
 
-    db.save_ratchet(conv_id, &ratchet)?;
     Ok(db.wipe_conversation(conv_id, include_session)?)
 }
 

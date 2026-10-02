@@ -100,6 +100,7 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0056 | Low | `store/src/db.rs:326 (Db::rebind_legacy_records, called from Db::open)` | [`c642595`](https://github.com/Journeycake/dratchet/commit/c642595201639b049dbeb22961e80d1231db48ba) | this doc |
 | DRA-0057 | Low | `core/src/payload.rs:350 (ProfileAnnounce::decode)` | [`814e959`](https://github.com/Journeycake/dratchet/commit/814e959fb42b777b391be10adf16f16089ebfdd6) | this doc |
 | DRA-0058 | Medium | `app/src/error.rs:69 (From<NetError>, From<String>); client/src/net.rs:22 (NetError); server/src/protocol.rs:304 (ErrorCode); ui/src-tauri/src/lib.rs (is_connection_error)` | [`73dfc1c`](https://github.com/Journeycake/dratchet/commit/73dfc1cbc9eb71fb0b9a640c216313e7fd4e968b) | this doc |
+| DRA-0059 | High | `app/src/lib.rs:817 (send_message) and the five other ratchet senders (announce_profile, receive_pending's DeliveryAck, announce_routing_id, announce_wipe_policy, request_conversation_wipe)` | this commit | this doc |
 
 
 ## Summary
@@ -4176,4 +4177,35 @@ Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D w
 - **No backoff for rate limits yet.** The poll loop now keeps the connection on a refusal and simply retries at its next tick. It doesn't yet slow down specifically on `is_rate_limit()`. At the current poll interval that's harmless, but a smarter client would back off.
 - **Handshake and pairing errors are still text.** They're now filed as `Protocol`, which is correct for reconnect purposes, but they're still `String`s inside. Typing them is a separate, smaller clean-up.
 - **Not observed in a running app.** The reconnect-on-refusal behaviour was reasoned from the code and pinned down by tests at the error-classification level. It wasn't watched in a live Tauri window.
+
+## DRA-0059: a send retried after a lost acknowledgement reused the same message key and nonce (reopens audit scenario 22; confirmed real, fixed) — **HIGH**
+
+> **DRA-0059** · Location: `app/src/lib.rs:817 (send_message) and the five other ratchet senders (announce_profile, receive_pending's DeliveryAck, announce_routing_id, announce_wipe_policy, request_conversation_wipe)` · Fix: this commit
+
+Every function that sends a ratchet-encrypted envelope saved the advanced ratchet only **after** the server's `Ack`. Suppose the server stores the envelope but the `Ack` never arrives, because the connection drops in between. The caller sees an error, the ratchet on disk is unchanged, and the next attempt encrypts again from the same chain position.
+
+The AEAD nonce is derived from the message key (`core::ratchet::derive_message_cipher`), so both envelopes use the **same (key, nonce)**. If the two plaintexts differ, anyone holding both ciphertexts learns information about both, and the relay holds both by construction. They differ if the user edits before retrying, or if a `receive_pending` pass between the two attempts changes the piggyback ack built into the chat payload. Poly1305's one-time key is reused too.
+
+Audit scenario 22 found the reuse but called it "practically masked", because the recipient's single-use keys reject the second envelope. That protects the recipient's view, not what the relay can see.
+
+Rated **High**: it breaks message confidentiality against the relay, the party end-to-end encryption exists to exclude. It needs a lost `Ack` followed by a retry with different content, so it isn't every user every time (not Critical).
+
+### Confirmation
+
+`app/tests/retried_send_reuses_no_key.rs`, `a_send_retried_after_a_lost_ack_uses_a_fresh_message_key`. Alice and Bob are paired for real. Alice's next two sends go through a stand-in relay that stores each `MailboxWrite`, then drops the connection without acknowledging it. On the unfixed code it fails with its `VULNERABILITY:` assertion: both stored envelopes sit at the same chain position (n = 2).
+
+### Fixed
+
+All six ratchet senders now save the ratchet **before** the envelope is sent:
+- `send_message`, `announce_profile`, `announce_routing_id`, `announce_wipe_policy` and `request_conversation_wipe` move their save before `conn.send`.
+- `receive_pending` saves before sending each `DeliveryAck`. That's safe mid-batch, because the entry is already processed, saved and deleted. A batch that wiped the session still never re-saves it.
+
+A failed send now burns its chain position, and any retry encrypts at the next one, with a fresh key and nonce. The recipient's skipped-key cache already absorbs the gap a burned position leaves. `add_contact_by_username` was already safe: a retry there runs a fresh X3DH with a new ephemeral key.
+
+Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (328 passed). `ui/src-tauri` `cargo test` (14 passed).
+
+### Known residual scope
+
+- **A failed send still vanishes from the sender's history, and a retry may duplicate.** If the first attempt did reach the server, the recipient gets both it and the retry, under different keys. That's addressed by DRA-0060 (failed sends kept, retry, recipient-side dedup).
+- **Each burned position costs one skipped-key slot.** Many consecutive failed sends without a successful one could exceed `max_skip` on the recipient. A long outage that fails every send fails fast, so this would need deliberate repeated retries.
 

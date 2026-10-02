@@ -506,10 +506,12 @@ dependencies = [
  "dratchet-core",
  "dratchet-server",
  "dratchet-store",
+ "futures-util",
  "rand_core 0.6.4",
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-tungstenite 0.21.0",
  "x25519-dalek",
 ]
 
