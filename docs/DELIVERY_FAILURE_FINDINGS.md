@@ -101,7 +101,7 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0057 | Low | `core/src/payload.rs:350 (ProfileAnnounce::decode)` | [`814e959`](https://github.com/Journeycake/dratchet/commit/814e959fb42b777b391be10adf16f16089ebfdd6) | this doc |
 | DRA-0058 | Medium | `app/src/error.rs:69 (From<NetError>, From<String>); client/src/net.rs:22 (NetError); server/src/protocol.rs:304 (ErrorCode); ui/src-tauri/src/lib.rs (is_connection_error)` | [`73dfc1c`](https://github.com/Journeycake/dratchet/commit/73dfc1cbc9eb71fb0b9a640c216313e7fd4e968b) | this doc |
 | DRA-0059 | High | `app/src/lib.rs:817 (send_message) and the five other ratchet senders (announce_profile, receive_pending's DeliveryAck, announce_routing_id, announce_wipe_policy, request_conversation_wipe)` | [`041d25d`](https://github.com/Journeycake/dratchet/commit/041d25dff0257988035ec8dd6f82e136ddcf4612) | this doc |
-| DRA-0060 | Medium | `app/src/lib.rs:830 (send_message, retry_message, transmit_chat); store/src/messages.rs:373 (save_received_chat); core/src/payload.rs (ChatContent::message_id); ui (Retry button)` | this commit | this doc |
+| DRA-0060 | Medium | `app/src/lib.rs:830 (send_message, retry_message, transmit_chat); store/src/messages.rs:373 (save_received_chat); core/src/payload.rs (ChatContent::message_id); ui (Retry button)` | [`07ee985`](https://github.com/Journeycake/dratchet/commit/07ee985cee52a1822f602469d29f10d1a2e4f512) | this doc |
 
 
 ## Summary
@@ -4212,7 +4212,7 @@ Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D w
 
 ## DRA-0060: a failed send vanished from the sender's history, and the only retry delivered a second copy (residual scope of DRA-0059; confirmed real, fixed) — **MEDIUM**
 
-> **DRA-0060** · Location: `app/src/lib.rs:830 (send_message, retry_message, transmit_chat); store/src/messages.rs:373 (save_received_chat); core/src/payload.rs (ChatContent::message_id); ui (Retry button)` · Fix: this commit
+> **DRA-0060** · Location: `app/src/lib.rs:830 (send_message, retry_message, transmit_chat); store/src/messages.rs:373 (save_received_chat); core/src/payload.rs (ChatContent::message_id); ui (Retry button)` · Fix: [`07ee985`](https://github.com/Journeycake/dratchet/commit/07ee985cee52a1822f602469d29f10d1a2e4f512)
 
 `send_message` saved the message to local history only after the server's `Ack`. On any failure the message was simply gone from the sender's side, and the UI kept the text in the composer for the user to send again as a brand-new message. In the lost-`Ack` case (the server stored it, the `Ack` didn't arrive), the recipient had the message while the sender's history didn't, and resending delivered a second, separate copy. The two sides' records of the conversation disagreed either way.
 
