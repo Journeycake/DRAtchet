@@ -838,6 +838,27 @@ pub async fn send_message(
     transmit_chat(db, conn, account, contact, message).await
 }
 
+/// DRA-0062: keep a message written while there is no connection to the
+/// server, flagged `RetryReason::SendFailed` so it is offered for
+/// [`retry_message`] once the app reconnects. Nothing is encrypted yet --
+/// that happens on the retry, at whatever ratchet position is current
+/// then. Refused for a contact that isn't `Verified`, exactly as
+/// [`send_message`] refuses.
+pub fn save_unsent_message(
+    db: &Db,
+    account: &Account,
+    contact: &Contact,
+    content: &[u8],
+) -> Result<Message> {
+    if contact.verification_state != VerificationState::Verified {
+        return Err(dratchet_store::Error::NotVerified.into());
+    }
+    let conv_id = conversation_id_for(account, contact);
+    let message = db.new_outgoing_message(content.to_vec());
+    db.save_message(conv_id, &message)?;
+    Ok(message)
+}
+
 /// DRA-0060/0063/0064: resend one of this side's own messages that is
 /// flagged for retry (`Message::retry_reason`). The same content is
 /// encrypted again at the ratchet's next position -- a fresh key and nonce

@@ -103,6 +103,7 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0059 | High | `app/src/lib.rs:817 (send_message) and the five other ratchet senders (announce_profile, receive_pending's DeliveryAck, announce_routing_id, announce_wipe_policy, request_conversation_wipe)` | [`041d25d`](https://github.com/Journeycake/dratchet/commit/041d25dff0257988035ec8dd6f82e136ddcf4612) | this doc |
 | DRA-0060 | Medium | `app/src/lib.rs:830 (send_message, retry_message, transmit_chat); store/src/messages.rs:373 (save_received_chat); core/src/payload.rs (ChatContent::message_id); ui (Retry button)` | [`07ee985`](https://github.com/Journeycake/dratchet/commit/07ee985cee52a1822f602469d29f10d1a2e4f512) | this doc |
 | DRA-0061 | Medium | `client/src/net.rs:62 (REQUEST_TIMEOUT; Connection::send, Connection::recv_raw)` | [`4cf0f3a`](https://github.com/Journeycake/dratchet/commit/4cf0f3add2925232227c71f4a4e5ec5f92417f41) | this doc |
+| DRA-0062 | Low | `ui/src-tauri/src/lib.rs:652 (connect_at_startup; AppState::conn as Option; connected; poll_loop); app/src/lib.rs:847 (save_unsent_message)` | this commit | this doc |
 
 
 ## Summary
@@ -4266,4 +4267,32 @@ Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D w
 
 - **Not configurable at runtime.** 20 seconds is a constant. A very slow link could time out a send that would have succeeded; the message is then flagged for retry rather than lost.
 - **Push frames could still be misread.** If the server ever sends an unsolicited frame (a presence update) while a request is waiting, `recv` would read it as the reply. That's a separate, pre-existing issue that the timeout doesn't change.
+
+## DRA-0062: the desktop app could not be opened while the server was unreachable (confirmed real, fixed) — **LOW**
+
+> **DRA-0062** · Location: `ui/src-tauri/src/lib.rs:652 (connect_at_startup; AppState::conn as Option; connected; poll_loop); app/src/lib.rs:847 (save_unsent_message)` · Fix: this commit
+
+`run()` connected to the server once, before the window opened, and on failure called `panic!("connect to … (is dratchetd running?)")`. With the server down or the network unavailable at launch, the app exited at once. The user couldn't read their own locally stored history, and couldn't write anything to send later.
+
+Rated **Low**: availability of the local client. Nothing is exposed or lost, but the app is unusable offline, and anyone who can block the server can stop it from opening.
+
+### Confirmation
+
+`ui/src-tauri/src/lib.rs`, `the_app_can_start_while_the_server_is_unreachable`, runs the launch-time connection attempt against an unreachable address. With `connect_at_startup` restored to the old `panic!`, it fails with its `VULNERABILITY:` assertion.
+
+### Fixed
+
+- **Startup.** The launch-time attempt is now `connect_at_startup`, which returns no connection instead of panicking. `AppState::conn` is `Option<Connection>`, and the app starts with the status "Reconnecting…".
+- **Background loop.** `poll_loop` attempts the connection at its first tick, through the same backoff-gated path it already used for reconnects, and does its usual work only once connected. The connection only ever goes from absent to present.
+- **Commands.** Every command that needs the server gets the connection through `connected()`, which answers "not connected to the server yet" while there's none.
+- **Writing offline.** Sending a message offline saves it with `dratchet_app::save_unsent_message`, flagged `RetryReason::SendFailed` (DRA-0060), rather than refusing. Nothing is encrypted until it's retried, so it's sent at whatever ratchet position is current then. An unverified contact is still refused.
+
+Tests: `commands_report_not_connected_until_the_first_connection` (UI) and `a_message_written_offline_is_kept_and_sent_on_retry` (app).
+
+Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (332 passed). `ui/src-tauri` fmt, clippy and `cargo test` (16 passed). `npm run check` (0 errors, 0 warnings).
+
+### Known residual scope
+
+- **Offline messages need a manual retry.** They're kept and flagged, but not sent automatically on reconnect. An automatic resend of `SendFailed` messages after reconnecting would be a small follow-up; it's left manual here so nothing is sent without the user seeing it.
+- **Not run as a real desktop app.** The startup path was tested through `connect_at_startup`, not by launching the Tauri app against a stopped server.
 

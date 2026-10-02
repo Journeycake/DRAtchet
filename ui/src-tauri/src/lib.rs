@@ -59,7 +59,11 @@ struct AppState {
     // since these calls hold it across real network `.await`s — same
     // reason `conn` already uses one.
     account: Arc<Mutex<Account>>,
-    conn: Arc<Mutex<Connection>>,
+    // DRA-0062: `None` until the first successful connection -- the app
+    // opens (history readable, messages queueable) even when the server
+    // is unreachable at launch, and `poll_loop` connects once it can.
+    // Only ever goes from `None` to `Some`, never back.
+    conn: Arc<Mutex<Option<Connection>>>,
     // Set once at startup if `reconcile_own_profile` finds this device's
     // stored discriminator was reassigned out from under it (only
     // realistically possible after the directory server lost its
@@ -207,6 +211,15 @@ fn to_contact_dto(contact: &Contact) -> ContactDto {
     }
 }
 
+/// DRA-0062: what every command reports while the app has not yet reached
+/// the server.
+const NOT_CONNECTED: &str = "not connected to the server yet -- retrying in the background";
+
+/// DRA-0062: the live connection, or [`NOT_CONNECTED`].
+fn connected(conn: &mut Option<Connection>) -> Result<&mut Connection, String> {
+    conn.as_mut().ok_or_else(|| NOT_CONNECTED.to_string())
+}
+
 fn to_message_dto(message: &dratchet_store::Message) -> MessageDto {
     MessageDto {
         id: hex::encode(&message.id),
@@ -298,14 +311,25 @@ async fn send_message(
         .load_contact(&fp)
         .map_err(|e| e.to_string())?
         .ok_or("no such contact")?;
-    let mut conn = state.conn.lock().await;
+    let mut conn_guard = state.conn.lock().await;
     let account = state.account.lock().await;
+    // DRA-0062: offline, the message is kept (flagged for retry) rather
+    // than refused, so nothing typed is lost while the server is away.
+    let Some(conn) = conn_guard.as_mut() else {
+        return dratchet_app::save_unsent_message(
+            &state.db,
+            &account,
+            &contact,
+            content.as_bytes(),
+        )
+        .map(|m| to_message_dto(&m))
+        .map_err(|e| e.to_string());
+    };
     // DRA-0060: a send that failed after the message was saved comes back
     // as that saved message, flagged for retry, not as an error -- the
     // composer clears and the message shows in the conversation with a
     // Retry button.
-    match dratchet_app::send_message(&state.db, &mut conn, &account, &contact, content.as_bytes())
-        .await
+    match dratchet_app::send_message(&state.db, conn, &account, &contact, content.as_bytes()).await
     {
         Ok(message) => Ok(to_message_dto(&message)),
         Err(dratchet_app::Error::NotSent { message, cause }) => {
@@ -332,9 +356,10 @@ async fn retry_message(
         .load_contact(&fp)
         .map_err(|e| e.to_string())?
         .ok_or("no such contact")?;
-    let mut conn = state.conn.lock().await;
+    let mut conn_guard = state.conn.lock().await;
+    let conn = connected(&mut conn_guard)?;
     let account = state.account.lock().await;
-    match dratchet_app::retry_message(&state.db, &mut conn, &account, &contact, &id).await {
+    match dratchet_app::retry_message(&state.db, conn, &account, &contact, &id).await {
         Ok(message) => Ok(to_message_dto(&message)),
         Err(dratchet_app::Error::NotSent { message, cause }) => {
             eprintln!("retry_message: still not sent: {cause}");
@@ -359,11 +384,12 @@ async fn set_wipe_policy(
         .load_contact(&fp)
         .map_err(|e| e.to_string())?
         .ok_or("no such contact")?;
-    let mut conn = state.conn.lock().await;
+    let mut conn_guard = state.conn.lock().await;
+    let conn = connected(&mut conn_guard)?;
     let account = state.account.lock().await;
     dratchet_app::announce_wipe_policy(
         &state.db,
-        &mut conn,
+        conn,
         &account,
         &contact,
         ask_before_delete,
@@ -411,9 +437,10 @@ async fn request_conversation_wipe(
         .load_contact(&fp)
         .map_err(|e| e.to_string())?
         .ok_or("no such contact")?;
-    let mut conn = state.conn.lock().await;
+    let mut conn_guard = state.conn.lock().await;
+    let conn = connected(&mut conn_guard)?;
     let account = state.account.lock().await;
-    dratchet_app::request_conversation_wipe(&state.db, &mut conn, &account, &contact)
+    dratchet_app::request_conversation_wipe(&state.db, conn, &account, &contact)
         .await
         .map_err(|e| e.to_string())
 }
@@ -478,9 +505,10 @@ async fn register_own_profile(
     state: State<'_, AppState>,
     username: String,
 ) -> Result<OwnProfileDto, String> {
-    let mut conn = state.conn.lock().await;
+    let mut conn_guard = state.conn.lock().await;
+    let conn = connected(&mut conn_guard)?;
     let mut account = state.account.lock().await;
-    let profile = dratchet_app::publish_own_bundle(&state.db, &mut conn, &mut account, &username)
+    let profile = dratchet_app::publish_own_bundle(&state.db, conn, &mut account, &username)
         .await
         .map_err(|e| e.to_string())?;
     Ok(to_own_profile_dto(&profile))
@@ -492,12 +520,12 @@ async fn rename_own_profile(
     state: State<'_, AppState>,
     new_username: String,
 ) -> Result<OwnProfileDto, String> {
-    let mut conn = state.conn.lock().await;
+    let mut conn_guard = state.conn.lock().await;
+    let conn = connected(&mut conn_guard)?;
     let mut account = state.account.lock().await;
-    let profile =
-        dratchet_app::rename_own_profile(&state.db, &mut conn, &mut account, &new_username)
-            .await
-            .map_err(|e| e.to_string())?;
+    let profile = dratchet_app::rename_own_profile(&state.db, conn, &mut account, &new_username)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(to_own_profile_dto(&profile))
 }
 
@@ -527,11 +555,12 @@ async fn add_contact(
         .load_own_profile()
         .map_err(|e| e.to_string())?
         .ok_or("choose a username for yourself first")?;
-    let mut conn = state.conn.lock().await;
+    let mut conn_guard = state.conn.lock().await;
+    let conn = connected(&mut conn_guard)?;
     let account = state.account.lock().await;
     let contact = dratchet_app::add_contact_by_username(
         &state.db,
-        &mut conn,
+        conn,
         &account,
         &own_profile,
         &username,
@@ -616,6 +645,24 @@ fn full_wipe(state: State<AppState>, app: AppHandle) -> Result<(), String> {
 ///
 /// Takes `url` rather than reading `SERVER_URL` itself so tests can point
 /// it at a real ephemeral test server instead of the hardcoded default.
+/// DRA-0062: the launch-time connection attempt. An unreachable server
+/// is not fatal: the app opens without a connection (history readable,
+/// messages saved for retry) and `poll_loop` connects when it can. This
+/// used to `panic!`, so the app could not even be opened offline.
+async fn connect_at_startup(
+    url: &str,
+    db: &Db,
+    account: &mut Account,
+) -> (Option<Connection>, Option<OwnDiscriminatorChangeNoticeDto>) {
+    match connect_authenticate_and_reconcile(url, db, account).await {
+        Ok((conn, notice)) => (Some(conn), notice),
+        Err(e) => {
+            eprintln!("startup: {url} unreachable, opening offline: {e}");
+            (None, None)
+        }
+    }
+}
+
 async fn connect_authenticate_and_reconcile(
     url: &str,
     db: &Db,
@@ -726,6 +773,12 @@ async fn poll_loop(app_handle: AppHandle) {
         let state = app_handle.state::<AppState>();
 
         let mut changed = false;
+        // DRA-0062: not connected yet (the server was unreachable at
+        // launch) -- attempt it now, through the same backoff-gated path a
+        // reconnect uses.
+        if next_reconnect_attempt.is_none() && state.conn.lock().await.is_none() {
+            next_reconnect_attempt = Some(std::time::Instant::now());
+        }
         if let Some(due) = next_reconnect_attempt {
             if std::time::Instant::now() < due {
                 continue;
@@ -734,7 +787,7 @@ async fn poll_loop(app_handle: AppHandle) {
             match connect_authenticate_and_reconcile(SERVER_URL, &state.db, &mut account).await {
                 Ok((new_conn, notice)) => {
                     eprintln!("poll: reconnected to {SERVER_URL}");
-                    *state.conn.lock().await = new_conn;
+                    *state.conn.lock().await = Some(new_conn);
                     // Anything sent during the outage has genuine reason
                     // to be in doubt — see `mark_pending_sends_uncertain`'s
                     // doc. Best-effort: a failure here shouldn't block
@@ -767,10 +820,12 @@ async fn poll_loop(app_handle: AppHandle) {
 
         let mut connection_died = false;
         {
-            let mut conn = state.conn.lock().await;
+            let mut conn_guard = state.conn.lock().await;
+            let conn = conn_guard
+                .as_mut()
+                .expect("connected: checked at the top of this tick (DRA-0062)");
             let mut account = state.account.lock().await;
-            match dratchet_app::receive_first_contact_attempts(&state.db, &mut conn, &mut account)
-                .await
+            match dratchet_app::receive_first_contact_attempts(&state.db, conn, &mut account).await
             {
                 Ok(new_contacts) if !new_contacts.is_empty() => changed = true,
                 Ok(_) => {}
@@ -781,7 +836,7 @@ async fn poll_loop(app_handle: AppHandle) {
             }
 
             if !connection_died && tick_count.is_multiple_of(PREKEY_REPLENISH_CHECK_EVERY_N_TICKS) {
-                if let Err(e) = replenish_prekeys_if_low(&state.db, &mut conn, &mut account).await {
+                if let Err(e) = replenish_prekeys_if_low(&state.db, conn, &mut account).await {
                     connection_died = is_connection_error(&e);
                     eprintln!("poll: replenish_prekeys_if_low failed: {e}");
                 }
@@ -803,9 +858,12 @@ async fn poll_loop(app_handle: AppHandle) {
                 }
                 let mailbox_before = contact.mailbox_id.clone();
                 let received = {
-                    let mut conn = state.conn.lock().await;
+                    let mut conn_guard = state.conn.lock().await;
+                    let conn = conn_guard
+                        .as_mut()
+                        .expect("connected: checked at the top of this tick (DRA-0062)");
                     let account = state.account.lock().await;
-                    dratchet_app::receive_pending(&state.db, &mut conn, &account, &contact).await
+                    dratchet_app::receive_pending(&state.db, conn, &account, &contact).await
                 };
                 match received {
                     Ok(outcome) => {
@@ -966,10 +1024,13 @@ pub fn run() {
     // `connect_authenticate_and_reconcile`'s doc, also reused by
     // `poll_loop`'s reconnect-after-failure path so a re-established
     // connection is never any less complete than this first one.
-    let (conn, own_discriminator_change_notice) = tauri::async_runtime::block_on(
-        connect_authenticate_and_reconcile(SERVER_URL, &db, &mut account),
-    )
-    .unwrap_or_else(|e| panic!("connect to {SERVER_URL} (is dratchetd running?): {e}"));
+    let (conn, own_discriminator_change_notice) =
+        tauri::async_runtime::block_on(connect_at_startup(SERVER_URL, &db, &mut account));
+    let starting_status = if conn.is_some() {
+        ConnectionStatusDto::Connected
+    } else {
+        ConnectionStatusDto::Reconnecting
+    };
     let conn = Arc::new(Mutex::new(conn));
     let account = Arc::new(Mutex::new(account));
 
@@ -982,10 +1043,9 @@ pub fn run() {
             conn,
             own_discriminator_change_notice: StdMutex::new(own_discriminator_change_notice),
             peer_profile_change_notices: StdMutex::new(Vec::new()),
-            // `run()` only reaches here after a successful connect+authenticate
-            // above (a failure panics), so `Connected` is the honest starting
-            // value — never `Reconnecting` before `poll_loop` has even run once.
-            connection_status: StdMutex::new(ConnectionStatusDto::Connected),
+            // DRA-0062: `Reconnecting` if the server was unreachable at
+            // launch; `poll_loop` keeps trying and flips it once connected.
+            connection_status: StdMutex::new(starting_status),
         })
         .invoke_handler(tauri::generate_handler![
             list_contacts,
@@ -1102,6 +1162,37 @@ mod tests {
 
     /// The failure path `poll_loop`'s backoff depends on: connecting to
     /// nothing reachable must return a real `Err`, not hang or panic.
+    /// DRA-0062: the launch-time connection attempt against an unreachable
+    /// server must leave the app openable (no connection yet), not abort.
+    #[tokio::test]
+    async fn the_app_can_start_while_the_server_is_unreachable() {
+        let db = temp_db();
+        let mut account = open_account(&db).unwrap();
+        let attempt = tokio::spawn(async move {
+            connect_at_startup("ws://127.0.0.1:1/v1/ws", &db, &mut account).await
+        })
+        .await;
+        let (conn, notice) = attempt.unwrap_or_else(|_| {
+            panic!(
+                "VULNERABILITY: starting with the server unreachable aborts the app, so a user \
+                 can't even open it to read their own history while offline"
+            )
+        });
+        assert!(
+            conn.is_none(),
+            "no connection yet; poll_loop connects later"
+        );
+        assert!(notice.is_none());
+    }
+
+    /// DRA-0062: while there's no connection, commands say so instead of
+    /// panicking or hanging.
+    #[test]
+    fn commands_report_not_connected_until_the_first_connection() {
+        let mut none: Option<dratchet_client::net::Connection> = None;
+        assert_eq!(connected(&mut none).err().as_deref(), Some(NOT_CONNECTED));
+    }
+
     #[tokio::test]
     async fn connect_authenticate_and_reconcile_fails_cleanly_against_an_unreachable_server() {
         let db = temp_db();

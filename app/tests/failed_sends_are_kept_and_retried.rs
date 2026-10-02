@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 use dratchet_app::{
     add_contact_by_username, generate_pairing_code, open_account, publish_own_bundle,
-    receive_first_contact_attempts, receive_pending, retry_message, send_message, Error,
+    receive_first_contact_attempts, receive_pending, retry_message, save_unsent_message,
+    send_message, Error,
 };
 use dratchet_client::net::Connection;
 use dratchet_core::account::Account;
@@ -250,4 +251,35 @@ async fn a_resend_the_recipient_already_has_is_not_shown_twice() {
         "the resend's acknowledgement confirms delivery"
     );
     assert_eq!(alice_copy.retry_reason, None);
+}
+
+/// DRA-0062: a message written while the app has no connection at all is
+/// kept, flagged for retry, and delivered normally once retried.
+#[tokio::test]
+async fn a_message_written_offline_is_kept_and_sent_on_retry() {
+    let url = spawn_server().await;
+    let mut p = paired(&url, "62").await;
+
+    let offline =
+        save_unsent_message(&p.db_alice, &p.alice, &p.alice_contact, b"written offline").unwrap();
+    assert_eq!(offline.retry_reason, Some(RetryReason::SendFailed));
+    assert_eq!(
+        offline.send_n, None,
+        "nothing is encrypted until it's actually sent"
+    );
+
+    retry_message(
+        &p.db_alice,
+        &mut p.alice_conn,
+        &p.alice,
+        &p.alice_contact,
+        &offline.id,
+    )
+    .await
+    .unwrap();
+    let got = receive_pending(&p.db_bob, &mut p.bob_conn, &p.bob, &p.bob_contact)
+        .await
+        .unwrap();
+    assert_eq!(got.messages.len(), 1);
+    assert_eq!(got.messages[0].content, b"written offline");
 }
