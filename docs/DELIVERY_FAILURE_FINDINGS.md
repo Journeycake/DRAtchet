@@ -105,6 +105,7 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0061 | Medium | `client/src/net.rs:62 (REQUEST_TIMEOUT; Connection::send, Connection::recv_raw)` | [`4cf0f3a`](https://github.com/Journeycake/dratchet/commit/4cf0f3add2925232227c71f4a4e5ec5f92417f41) | this doc |
 | DRA-0062 | Low | `ui/src-tauri/src/lib.rs:652 (connect_at_startup; AppState::conn as Option; connected; poll_loop); app/src/lib.rs:847 (save_unsent_message)` | [`c9fe0a3`](https://github.com/Journeycake/dratchet/commit/c9fe0a32e3fba2cc6268f949ad6a91cc8c3a49d4) | this doc |
 | DRA-0063 | Medium | `app/src/lib.rs:73 (mark_expired_sends); store/src/messages.rs:570 (Db::mark_expired_sends, Message::last_sent_at); ui/src-tauri poll_loop` | [`38c3c6f`](https://github.com/Journeycake/dratchet/commit/38c3c6f1e5137b9543779b231d866b12d2516e71) | this doc |
+| DRA-0064 | Medium | `app/src/lib.rs:76 (note_server_boot); server/src/protocol.rs (AuthChallenge::server_boot_id); server/src/state.rs (AppState::boot_id); store/src/messages.rs (mark_unconfirmed_lost_in_restart)` | this commit | this doc |
 
 
 ## Summary
@@ -4324,4 +4325,33 @@ Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D w
 - **In-app notice only.** It appears in the conversation; there's no operating-system notification. The app's existing notification setting (with its three privacy levels) could carry one.
 - **Messages sent before this change** have no `last_sent_at`, so their creation time is used instead. That's slightly early for anything that was retried, never late.
 - **The check runs on the sender's clock.** A badly wrong device clock flags too early or too late. The one-hour grace only absorbs ordinary drift.
+
+## DRA-0064: a server restart silently lost every queued message (audit scenario 9; confirmed real, fixed) — **MEDIUM**
+
+> **DRA-0064** · Location: `app/src/lib.rs:76 (note_server_boot); server/src/protocol.rs (AuthChallenge::server_boot_id); server/src/state.rs (AppState::boot_id); store/src/messages.rs (mark_unconfirmed_lost_in_restart)` · Fix: this commit
+
+Mailboxes live only in the server's memory; `server/src/persistence.rs` persists the directory alone. A restart, redeploy, crash or pod reschedule dropped every message waiting to be collected, for every user at once. Audit scenario 9 recorded it as "the same 'no signal to anyone' property as #1". Senders kept seeing "sent", recipients never received anything, and nothing on either side showed it had happened.
+
+Rated **Medium**, like DRA-0063: silent message loss, here for everyone at once, triggered by anything that restarts the server.
+
+### Confirmation
+
+`app/tests/server_restart_is_detected.rs`, `messages_waiting_on_a_server_that_restarted_are_flagged_for_retry`. Alice and Bob pair on one server instance and Alice sends a message Bob never collects. Alice then connects to a fresh instance standing in for the restarted server, with a new boot id and empty mailboxes. With only the new flagging step disabled, it fails with its `VULNERABILITY:` assertion: the lost message is still shown as merely sent.
+
+### Fixed
+
+- **Server.** The server picks a random `boot_id` per process (`AppState::boot_id`) and sends it in every `AuthChallenge` (`server_boot_id`, `#[serde(default)]`; older clients ignore it, and an empty one from an older server is ignored).
+- **Client.** `net::Connection` keeps it after `authenticate`.
+- **Detection.** `dratchet_app::note_server_boot`, called by the desktop app right after authenticating (at startup and on every reconnect, before anything is sent on the new connection), compares it with the boot id this device last saw (stored in the local database). On a change, every own message the server accepted but nobody confirmed is flagged `RetryReason::ServerRestarted`. The message then reads "Possibly lost when the server restarted" with a **Retry** button.
+- **Retry.** A retry uses a fresh key (DRA-0059) and the same message id. Messages collected just before the restart but not yet confirmed are flagged too; retrying those is safe, because the recipient drops a copy it already has (DRA-0060) and still acknowledges it, which clears the flag.
+
+Guard: `reconnecting_to_the_same_server_flags_nothing`.
+
+Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (336 passed). `ui/src-tauri` fmt, clippy and `cargo test` (16 passed). `npm run check` (0 errors, 0 warnings).
+
+### Known residual scope
+
+- **This detects loss; it doesn't prevent it.** Persisting mailboxes to disk (audit scenario 9 option (a)) would avoid the loss entirely, at the cost of keeping encrypted mail at rest on the server. That's a design decision, not attempted here.
+- **The recipient isn't told.** Only senders learn of the restart.
+- **Older clients** never learn about restarts, and retry flags are still manual (see DRA-0062's residual).
 

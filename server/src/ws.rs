@@ -181,6 +181,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         FrameTag::AuthChallenge,
         &AuthChallenge {
             nonce: nonce.to_vec(),
+            server_boot_id: state.boot_id.to_vec(),
         },
     ));
 

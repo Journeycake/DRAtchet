@@ -64,6 +64,34 @@ pub const MAILBOX_TTL_SECS: u32 = 14 * 24 * 60 * 60;
 /// between this device and the server.
 pub const EXPIRY_GRACE_SECS: u64 = 60 * 60;
 
+/// DRA-0064: call right after authenticating, before sending anything on
+/// the new connection. If the server's boot id differs from the one this
+/// device saw last, the server restarted and its in-memory mailboxes --
+/// every message waiting for collection -- are gone, so every message this
+/// side sent that nobody has confirmed is flagged
+/// `RetryReason::ServerRestarted` and offered for a retry. Some may in
+/// fact have been collected before the restart; retrying those is safe,
+/// since the recipient drops a copy it already has (DRA-0060). Returns how
+/// many were flagged. A server that sends no boot id is ignored.
+pub fn note_server_boot(db: &Db, account: &Account, conn: &Connection) -> Result<usize> {
+    let boot_id = conn.server_boot_id();
+    if boot_id.is_empty() {
+        return Ok(0);
+    }
+    let previous = db.load_server_boot_id()?;
+    let mut flagged = 0;
+    if previous.as_deref().is_some_and(|prev| prev != boot_id) {
+        for contact in db.list_contacts()? {
+            let conv_id = conversation_id_for(account, &contact);
+            flagged += db.mark_unconfirmed_lost_in_restart(conv_id)?;
+        }
+    }
+    if previous.as_deref() != Some(boot_id) {
+        db.save_server_boot_id(boot_id)?;
+    }
+    Ok(flagged)
+}
+
 /// DRA-0063: flag every message this side sent that has gone unconfirmed
 /// for longer than the server keeps it ([`MAILBOX_TTL_SECS`] +
 /// [`EXPIRY_GRACE_SECS`]) as `RetryReason::Expired`, across every

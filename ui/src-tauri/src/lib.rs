@@ -673,6 +673,17 @@ async fn connect_authenticate_and_reconcile(
 ) -> Result<(Connection, Option<OwnDiscriminatorChangeNoticeDto>), String> {
     let mut conn = Connection::connect(url).await?;
     conn.authenticate(account).await?;
+    // DRA-0064: before anything is sent on this connection -- a changed
+    // server boot id means the server restarted and lost every queued
+    // message, so unconfirmed sends are flagged for retry. Best-effort:
+    // never blocks the connection itself.
+    match dratchet_app::note_server_boot(db, account, &conn) {
+        Ok(0) => {}
+        Ok(n) => {
+            eprintln!("connect: server restarted; {n} unconfirmed message(s) flagged for retry")
+        }
+        Err(e) => eprintln!("connect: note_server_boot failed: {e}"),
+    }
 
     let mut notice = None;
     match dratchet_app::reconcile_own_profile(db, &mut conn, account).await {

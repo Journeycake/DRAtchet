@@ -306,6 +306,10 @@ pub struct AppState {
     /// DRA-0055 — reverse proxies whose `X-Forwarded-For` is believed.
     /// Empty by default; set once at startup by `src/main.rs`.
     pub trusted_proxies: std::sync::RwLock<crate::address::TrustedProxies>,
+    /// DRA-0064: random per process, sent in every `AuthChallenge`, so a
+    /// client can tell the server restarted (and its in-memory mailboxes
+    /// with it).
+    pub boot_id: [u8; 16],
 }
 
 impl AppState {
@@ -317,6 +321,7 @@ impl AppState {
             connection_cap: MAX_CONCURRENT_CONNECTIONS,
             address_limiter: Default::default(),
             trusted_proxies: Default::default(),
+            boot_id: random_16(),
         })
     }
 
@@ -333,6 +338,7 @@ impl AppState {
             connection_cap: cap,
             address_limiter: Default::default(),
             trusted_proxies: Default::default(),
+            boot_id: random_16(),
         })
     }
 
@@ -361,6 +367,7 @@ impl AppState {
             connection_cap: MAX_CONCURRENT_CONNECTIONS,
             address_limiter: Default::default(),
             trusted_proxies: Default::default(),
+            boot_id: random_16(),
         })
     }
 }

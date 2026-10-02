@@ -591,6 +591,33 @@ impl Db {
         Ok(count)
     }
 
+    /// DRA-0064: flag as `RetryReason::ServerRestarted` every own message
+    /// the server accepted that nobody has confirmed receiving -- after a
+    /// server restart it may have been lost with the server's in-memory
+    /// mailboxes. Returns how many were newly flagged.
+    pub fn mark_unconfirmed_lost_in_restart(&self, conversation_id: [u8; 16]) -> Result<usize> {
+        let mut count = 0;
+        for mut m in self.list_messages(conversation_id)? {
+            if m.sender_is_local && !m.delivered && m.retry_reason.is_none() && m.send_n.is_some() {
+                m.retry_reason = Some(RetryReason::ServerRestarted);
+                self.save_message(conversation_id, &m)?;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// DRA-0064: the server boot id this device last connected to.
+    pub fn load_server_boot_id(&self) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .get_encrypted(Scope::Content, SERVER_BOOT_ID_KEY)?
+            .map(|bytes| bytes.to_vec()))
+    }
+
+    pub fn save_server_boot_id(&self, boot_id: &[u8]) -> Result<()> {
+        self.put_encrypted(Scope::Content, SERVER_BOOT_ID_KEY, boot_id)
+    }
+
     pub fn mark_undelivered_uncertain(&self, conversation_id: [u8; 16]) -> Result<usize> {
         let messages = self.list_messages(conversation_id)?;
         let mut count = 0;
@@ -604,6 +631,9 @@ impl Db {
         Ok(count)
     }
 }
+
+/// DRA-0064: storage key for the last server boot id seen.
+const SERVER_BOOT_ID_KEY: &str = "server:boot_id";
 
 fn random_message_id() -> Vec<u8> {
     use rand_core::{OsRng, RngCore};

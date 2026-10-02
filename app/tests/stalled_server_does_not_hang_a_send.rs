@@ -30,6 +30,7 @@ async fn spawn_server_that_stops_answering() -> String {
                     FrameTag::AuthChallenge,
                     &AuthChallenge {
                         nonce: vec![7u8; 32],
+                        server_boot_id: Vec::new(),
                     },
                 );
                 ws.send(WsMessage::Binary(challenge)).await.unwrap();

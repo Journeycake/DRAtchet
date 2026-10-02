@@ -64,6 +64,7 @@ pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 pub struct Connection {
     ws: WsStream,
     request_timeout: std::time::Duration,
+    server_boot_id: Vec<u8>,
 }
 
 impl Connection {
@@ -74,6 +75,7 @@ impl Connection {
         Ok(Connection {
             ws,
             request_timeout: REQUEST_TIMEOUT,
+            server_boot_id: Vec::new(),
         })
     }
 
@@ -81,6 +83,14 @@ impl Connection {
     /// one).
     pub fn set_request_timeout(&mut self, timeout: std::time::Duration) {
         self.request_timeout = timeout;
+    }
+
+    /// DRA-0064: the server process's boot id from its `AuthChallenge`
+    /// (empty before [`authenticate`](Self::authenticate), or from a server
+    /// that predates it). A change since the last connection means the
+    /// server restarted and lost every queued message.
+    pub fn server_boot_id(&self) -> &[u8] {
+        &self.server_boot_id
     }
 
     fn timed_out(&self) -> NetError {
@@ -149,6 +159,7 @@ impl Connection {
     /// prior `PublishBundle` (`server/src/ws.rs`'s module doc).
     pub async fn authenticate(&mut self, account: &Account) -> Result<(), NetError> {
         let (tag, challenge): (_, AuthChallenge) = self.recv().await?;
+        self.server_boot_id = challenge.server_boot_id.clone();
         if tag != FrameTag::AuthChallenge {
             return Err(NetError::Protocol(format!(
                 "expected AuthChallenge, got {tag:?}"
