@@ -102,7 +102,7 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0058 | Medium | `app/src/error.rs:69 (From<NetError>, From<String>); client/src/net.rs:22 (NetError); server/src/protocol.rs:304 (ErrorCode); ui/src-tauri/src/lib.rs (is_connection_error)` | [`73dfc1c`](https://github.com/Journeycake/dratchet/commit/73dfc1cbc9eb71fb0b9a640c216313e7fd4e968b) | this doc |
 | DRA-0059 | High | `app/src/lib.rs:817 (send_message) and the five other ratchet senders (announce_profile, receive_pending's DeliveryAck, announce_routing_id, announce_wipe_policy, request_conversation_wipe)` | [`041d25d`](https://github.com/Journeycake/dratchet/commit/041d25dff0257988035ec8dd6f82e136ddcf4612) | this doc |
 | DRA-0060 | Medium | `app/src/lib.rs:830 (send_message, retry_message, transmit_chat); store/src/messages.rs:373 (save_received_chat); core/src/payload.rs (ChatContent::message_id); ui (Retry button)` | [`07ee985`](https://github.com/Journeycake/dratchet/commit/07ee985cee52a1822f602469d29f10d1a2e4f512) | this doc |
-| DRA-0061 | Medium | `client/src/net.rs:62 (REQUEST_TIMEOUT; Connection::send, Connection::recv_raw)` | this commit | this doc |
+| DRA-0061 | Medium | `client/src/net.rs:62 (REQUEST_TIMEOUT; Connection::send, Connection::recv_raw)` | [`4cf0f3a`](https://github.com/Journeycake/dratchet/commit/4cf0f3add2925232227c71f4a4e5ec5f92417f41) | this doc |
 
 
 ## Summary
@@ -4244,7 +4244,7 @@ Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D w
 
 ## DRA-0061: a send to a server that stopped answering waited indefinitely, stalling the desktop app (confirmed real, fixed) — **MEDIUM**
 
-> **DRA-0061** · Location: `client/src/net.rs:62 (REQUEST_TIMEOUT; Connection::send, Connection::recv_raw)` · Fix: this commit
+> **DRA-0061** · Location: `client/src/net.rs:62 (REQUEST_TIMEOUT; Connection::send, Connection::recv_raw)` · Fix: [`4cf0f3a`](https://github.com/Journeycake/dratchet/commit/4cf0f3add2925232227c71f4a4e5ec5f92417f41)
 
 Nothing bounded how long `net::Connection` waited, either to send a frame or for the server's reply. If the network stalled without the connection closing (packets silently dropped, a NAT mapping expiring, a server process frozen), a send waited until the operating system gave up on the TCP connection, which can take many minutes. The desktop app holds its connection lock across every exchange, so incoming mail and every other command were blocked for the same time.
 
