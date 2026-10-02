@@ -104,7 +104,7 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0060 | Medium | `app/src/lib.rs:830 (send_message, retry_message, transmit_chat); store/src/messages.rs:373 (save_received_chat); core/src/payload.rs (ChatContent::message_id); ui (Retry button)` | [`07ee985`](https://github.com/Journeycake/dratchet/commit/07ee985cee52a1822f602469d29f10d1a2e4f512) | this doc |
 | DRA-0061 | Medium | `client/src/net.rs:62 (REQUEST_TIMEOUT; Connection::send, Connection::recv_raw)` | [`4cf0f3a`](https://github.com/Journeycake/dratchet/commit/4cf0f3add2925232227c71f4a4e5ec5f92417f41) | this doc |
 | DRA-0062 | Low | `ui/src-tauri/src/lib.rs:652 (connect_at_startup; AppState::conn as Option; connected; poll_loop); app/src/lib.rs:847 (save_unsent_message)` | [`c9fe0a3`](https://github.com/Journeycake/dratchet/commit/c9fe0a32e3fba2cc6268f949ad6a91cc8c3a49d4) | this doc |
-| DRA-0063 | Medium | `app/src/lib.rs:73 (mark_expired_sends); store/src/messages.rs:570 (Db::mark_expired_sends, Message::last_sent_at); ui/src-tauri poll_loop` | this commit | this doc |
+| DRA-0063 | Medium | `app/src/lib.rs:73 (mark_expired_sends); store/src/messages.rs:570 (Db::mark_expired_sends, Message::last_sent_at); ui/src-tauri poll_loop` | [`38c3c6f`](https://github.com/Journeycake/dratchet/commit/38c3c6f1e5137b9543779b231d866b12d2516e71) | this doc |
 
 
 ## Summary
@@ -4299,7 +4299,7 @@ Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D w
 
 ## DRA-0063: a message nobody collected within 14 days expired silently, with no notice or retry for the sender (audit scenario 1; confirmed real, fixed) — **MEDIUM**
 
-> **DRA-0063** · Location: `app/src/lib.rs:73 (mark_expired_sends); store/src/messages.rs:570 (Db::mark_expired_sends, Message::last_sent_at); ui/src-tauri poll_loop` · Fix: this commit
+> **DRA-0063** · Location: `app/src/lib.rs:73 (mark_expired_sends); store/src/messages.rs:570 (Db::mark_expired_sends, Message::last_sent_at); ui/src-tauri poll_loop` · Fix: [`38c3c6f`](https://github.com/Journeycake/dratchet/commit/38c3c6f1e5137b9543779b231d866b12d2516e71)
 
 The relay keeps an uncollected message for 14 days (`MAILBOX_TTL_SECS`, `ARCHITECTURE.md` §4.5) and then discards it, telling nobody. Audit scenario 1 recorded this as "silent loss, no signal". `DeliveryAck` shows when a message *was* delivered, but nothing marked one that never would be. The sender's copy stayed "sent, not yet delivered" forever, indistinguishable from one still waiting, and the only way to send it again was to retype it.
 
