@@ -818,17 +818,24 @@ async fn poll_loop<R: Runtime>(app_handle: AppHandle<R>) {
             if std::time::Instant::now() < due {
                 continue;
             }
-            let mut account = state.account.lock().await;
-            match connect_authenticate_and_reconcile(&state.server_url, &state.db, &mut account)
-                .await
-            {
+            let reconnected = {
+                let mut account = state.account.lock().await;
+                connect_authenticate_and_reconcile(&state.server_url, &state.db, &mut account).await
+            };
+            match reconnected {
                 Ok((new_conn, notice)) => {
                     eprintln!("poll: reconnected to {}", state.server_url);
+                    // DRA-0067: the account lock is released before the
+                    // connection lock is taken. Every command takes the
+                    // connection first, then the account; holding the
+                    // account here while waiting for the connection
+                    // deadlocked against any command sent mid-reconnect.
                     *state.conn.lock().await = Some(new_conn);
                     // Anything sent during the outage has genuine reason
                     // to be in doubt — see `mark_pending_sends_uncertain`'s
                     // doc. Best-effort: a failure here shouldn't block
                     // the reconnect itself from completing.
+                    let account = state.account.lock().await;
                     if let Err(e) = dratchet_app::mark_pending_sends_uncertain(&state.db, &account)
                     {
                         eprintln!("poll: mark_pending_sends_uncertain failed: {e}");

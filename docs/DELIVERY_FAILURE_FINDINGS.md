@@ -108,6 +108,7 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0064 | Medium | `app/src/lib.rs:76 (note_server_boot); server/src/protocol.rs (AuthChallenge::server_boot_id); server/src/state.rs (AppState::boot_id); store/src/messages.rs (mark_unconfirmed_lost_in_restart)` | [`e7c69fd`](https://github.com/Journeycake/dratchet/commit/e7c69fd0fcd27d6a7e7e7909c53e65f494af24bd) | this doc |
 | DRA-0065 | Medium | `client/src/net.rs:105 (Connection::is_lost); app/src/lib.rs:977 (transmit_chat), app/src/lib.rs:496 (ensure_connection_usable)` | [`9cd43d8`](https://github.com/Journeycake/dratchet/commit/9cd43d812e3862b1ad2e6db0026ae84d2b8b3c4d) | this doc |
 | DRA-0066 | Medium | `app/src/lib.rs:939 (reannounce_routing_id_if_unconfirmed), app/src/lib.rs:1161 (receive_pending confirms the switch), app/src/lib.rs:1648 (announce_routing_id keeps the envelope); store/src/contacts.rs:106 (Contact::routing_confirmed, routing_announce)` | [`d739e0f`](https://github.com/Journeycake/dratchet/commit/d739e0f7d688b6c4cc0fa0c1037400b205318f32) | this doc |
+| DRA-0067 | Medium | `ui/src-tauri/src/lib.rs:821 (poll_loop reconnect)` | pending | this doc |
 
 
 ## Summary
@@ -4426,4 +4427,31 @@ Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D w
 - **Contacts paired before this change** have no stored announce, so they aren't healed.
 - **Extra writes to the peer's bootstrap inbox** until the switch is confirmed, normally the peer's next poll. A peer that has already switched never reads them; they expire with the mailbox lifetime.
 - **The 14-day path is covered by the same mechanism but not by its own test.** Only the restart case is tested.
+
+## DRA-0067: pressing Send while the desktop app was reconnecting deadlocked it until restarted (found closing the retry test gaps; confirmed real, fixed) — **MEDIUM**
+
+> **DRA-0067** · Location: `ui/src-tauri/src/lib.rs:821 (poll_loop reconnect)` · Fix: pending
+
+The desktop app guards its server connection and the account with two locks. Every command that uses the server (`send_message`, `retry_message`, `add_contact`, the wipe and profile commands) takes the connection lock and then the account lock. The background loop's reconnect took them the other way round. It held the account lock for the whole connection attempt, then took the connection lock to install the new connection.
+
+A command arriving during a reconnect took the connection lock and waited for the account lock. The reconnect then finished and waited for the connection lock. Neither ever released. From then on, every command and the background loop hung until the app was quit. A reconnect happens after every network interruption and at startup while the server is unreachable. Pressing Send or Retry during one, the natural thing to do while the app shows "Reconnecting…", was enough.
+
+Rated **Medium**: the desktop app hangs until restarted, triggered by ordinary use during any reconnect. The same availability class as DRA-0061. No data is lost: a message typed offline is saved before it's sent.
+
+### Confirmation
+
+`ui/src-tauri/src/retry_flow_tests.rs`, `sending_while_the_app_is_reconnecting_does_not_deadlock_it`. It runs the real `poll_loop` and commands on `tauri::test`'s mock runtime. The app starts offline, and the loop reconnects through a link that takes 1.5 seconds to connect. Send is pressed 300 ms in. Before the fix, the command never answered within 10 seconds and the test failed with its `VULNERABILITY:` assertion.
+
+### Fixed
+
+The reconnect releases the account lock before it takes the connection lock, then takes the account lock again on its own to mark outstanding sends uncertain. No code path now holds the account lock while waiting for the connection lock.
+
+The test also checks that the reconnect still completes after the send. The existing restart test, `the_poll_loop_detects_a_server_restart_and_retry_delivers_the_lost_message`, also exercises the reconnect path.
+
+Validation: `ui/src-tauri` `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` (21 passed).
+
+### Known residual scope
+
+- **Commands still wait while a reconnect holds the account lock.** That includes connecting itself, with no time limit on the attempt (DRA-0068).
+- **The order is a convention, not enforced.** A future code path that holds the account lock while waiting for the connection lock would bring it back. One lock around both would rule that out, at the cost of serializing reads behind the network.
 

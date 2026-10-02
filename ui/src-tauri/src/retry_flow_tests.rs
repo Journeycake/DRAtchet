@@ -614,3 +614,87 @@ fn the_poll_loop_detects_a_server_restart_and_retry_delivers_the_lost_message() 
     });
     assert_eq!(got, vec![b"queued when it crashed".to_vec()]);
 }
+
+/// Invoke a command, giving up after `limit` (a hung command never
+/// answers; its thread is left behind).
+fn invoke_within(
+    webview: &WebviewWindow<MockRuntime>,
+    cmd: &str,
+    args: Value,
+    limit: Duration,
+) -> Option<Result<Value, Value>> {
+    let webview = webview.clone();
+    let cmd = cmd.to_string();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(invoke(&webview, &cmd, args));
+    });
+    rx.recv_timeout(limit).ok()
+}
+
+/// A link to a real server that waits `delay` before forwarding anything:
+/// a slow network, so a reconnect through it takes a while.
+async fn spawn_slow_link(server_url: &str, delay: Duration) -> String {
+    let upstream = server_url
+        .trim_start_matches("ws://")
+        .split('/')
+        .next()
+        .unwrap()
+        .to_string();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut down, _) = listener.accept().await.unwrap();
+            let upstream = upstream.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let mut up = TcpStream::connect(&upstream).await.unwrap();
+                let _ = tokio::io::copy_bidirectional(&mut down, &mut up).await;
+            });
+        }
+    });
+    format!("ws://{addr}/v1/ws")
+}
+
+/// DRA-0067: every command locks the connection, then the account; the
+/// loop's reconnect locked the account, then the connection. Sending while
+/// a reconnect was under way deadlocked the two for good.
+#[test]
+fn sending_while_the_app_is_reconnecting_does_not_deadlock_it() {
+    let (url, p) = on_runtime(async {
+        let url = spawn_server().await;
+        let p = paired(&url, "u5").await;
+        (url, p)
+    });
+    let slow = on_runtime(spawn_slow_link(&url, Duration::from_millis(1500)));
+    let fingerprint = hex::encode(&p.alice_contact.fingerprint);
+    let (app, webview) = desktop_app(app_state(p.alice_db, p.alice, None, &slow));
+    tauri::async_runtime::spawn(poll_loop(app.handle().clone()));
+    // The loop's first tick starts connecting through the slow link.
+    std::thread::sleep(Duration::from_millis(300));
+
+    let sent = invoke_within(
+        &webview,
+        "send_message",
+        json!({ "fingerprint": fingerprint, "content": "typed during a reconnect" }),
+        Duration::from_secs(10),
+    );
+    assert!(
+        sent.is_some(),
+        "VULNERABILITY: pressing Send while the app was reconnecting deadlocked it -- the \
+         command holds the connection lock waiting for the account, the reconnect holds the \
+         account waiting for the connection, and neither ever lets go"
+    );
+    assert_eq!(
+        sent.unwrap().unwrap()["content"],
+        "typed during a reconnect"
+    );
+    let state = app.state::<AppState>();
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            *state.connection_status.lock().unwrap() == ConnectionStatusDto::Connected
+        }),
+        "and the reconnect still completes"
+    );
+}
