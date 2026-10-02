@@ -105,7 +105,7 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0061 | Medium | `client/src/net.rs:62 (REQUEST_TIMEOUT; Connection::send, Connection::recv_raw)` | [`4cf0f3a`](https://github.com/Journeycake/dratchet/commit/4cf0f3add2925232227c71f4a4e5ec5f92417f41) | this doc |
 | DRA-0062 | Low | `ui/src-tauri/src/lib.rs:652 (connect_at_startup; AppState::conn as Option; connected; poll_loop); app/src/lib.rs:847 (save_unsent_message)` | [`c9fe0a3`](https://github.com/Journeycake/dratchet/commit/c9fe0a32e3fba2cc6268f949ad6a91cc8c3a49d4) | this doc |
 | DRA-0063 | Medium | `app/src/lib.rs:73 (mark_expired_sends); store/src/messages.rs:570 (Db::mark_expired_sends, Message::last_sent_at); ui/src-tauri poll_loop` | [`38c3c6f`](https://github.com/Journeycake/dratchet/commit/38c3c6f1e5137b9543779b231d866b12d2516e71) | this doc |
-| DRA-0064 | Medium | `app/src/lib.rs:76 (note_server_boot); server/src/protocol.rs (AuthChallenge::server_boot_id); server/src/state.rs (AppState::boot_id); store/src/messages.rs (mark_unconfirmed_lost_in_restart)` | this commit | this doc |
+| DRA-0064 | Medium | `app/src/lib.rs:76 (note_server_boot); server/src/protocol.rs (AuthChallenge::server_boot_id); server/src/state.rs (AppState::boot_id); store/src/messages.rs (mark_unconfirmed_lost_in_restart)` | [`e7c69fd`](https://github.com/Journeycake/dratchet/commit/e7c69fd0fcd27d6a7e7e7909c53e65f494af24bd) | this doc |
 
 
 ## Summary
@@ -4328,7 +4328,7 @@ Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D w
 
 ## DRA-0064: a server restart silently lost every queued message (audit scenario 9; confirmed real, fixed) — **MEDIUM**
 
-> **DRA-0064** · Location: `app/src/lib.rs:76 (note_server_boot); server/src/protocol.rs (AuthChallenge::server_boot_id); server/src/state.rs (AppState::boot_id); store/src/messages.rs (mark_unconfirmed_lost_in_restart)` · Fix: this commit
+> **DRA-0064** · Location: `app/src/lib.rs:76 (note_server_boot); server/src/protocol.rs (AuthChallenge::server_boot_id); server/src/state.rs (AppState::boot_id); store/src/messages.rs (mark_unconfirmed_lost_in_restart)` · Fix: [`e7c69fd`](https://github.com/Journeycake/dratchet/commit/e7c69fd0fcd27d6a7e7e7909c53e65f494af24bd)
 
 Mailboxes live only in the server's memory; `server/src/persistence.rs` persists the directory alone. A restart, redeploy, crash or pod reschedule dropped every message waiting to be collected, for every user at once. Audit scenario 9 recorded it as "the same 'no signal to anyone' property as #1". Senders kept seeing "sent", recipients never received anything, and nothing on either side showed it had happened.
 
