@@ -108,7 +108,7 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0064 | Medium | `app/src/lib.rs:76 (note_server_boot); server/src/protocol.rs (AuthChallenge::server_boot_id); server/src/state.rs (AppState::boot_id); store/src/messages.rs (mark_unconfirmed_lost_in_restart)` | [`e7c69fd`](https://github.com/Journeycake/dratchet/commit/e7c69fd0fcd27d6a7e7e7909c53e65f494af24bd) | this doc |
 | DRA-0065 | Medium | `client/src/net.rs:105 (Connection::is_lost); app/src/lib.rs:977 (transmit_chat), app/src/lib.rs:496 (ensure_connection_usable)` | [`9cd43d8`](https://github.com/Journeycake/dratchet/commit/9cd43d812e3862b1ad2e6db0026ae84d2b8b3c4d) | this doc |
 | DRA-0066 | Medium | `app/src/lib.rs:939 (reannounce_routing_id_if_unconfirmed), app/src/lib.rs:1161 (receive_pending confirms the switch), app/src/lib.rs:1648 (announce_routing_id keeps the envelope); store/src/contacts.rs:106 (Contact::routing_confirmed, routing_announce)` | [`d739e0f`](https://github.com/Journeycake/dratchet/commit/d739e0f7d688b6c4cc0fa0c1037400b205318f32) | this doc |
-| DRA-0067 | Medium | `ui/src-tauri/src/lib.rs:821 (poll_loop reconnect)` | pending | this doc |
+| DRA-0067 | Medium | `ui/src-tauri/src/lib.rs:821 (poll_loop reconnect)` | [`bc8e05b`](https://github.com/Journeycake/dratchet/commit/bc8e05b4e85ca4fa6e09929be07c26fd46c58009) | this doc |
 
 
 ## Summary
@@ -4430,7 +4430,7 @@ Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D w
 
 ## DRA-0067: pressing Send while the desktop app was reconnecting deadlocked it until restarted (found closing the retry test gaps; confirmed real, fixed) — **MEDIUM**
 
-> **DRA-0067** · Location: `ui/src-tauri/src/lib.rs:821 (poll_loop reconnect)` · Fix: pending
+> **DRA-0067** · Location: `ui/src-tauri/src/lib.rs:821 (poll_loop reconnect)` · Fix: [`bc8e05b`](https://github.com/Journeycake/dratchet/commit/bc8e05b4e85ca4fa6e09929be07c26fd46c58009)
 
 The desktop app guards its server connection and the account with two locks. Every command that uses the server (`send_message`, `retry_message`, `add_contact`, the wipe and profile commands) takes the connection lock and then the account lock. The background loop's reconnect took them the other way round. It held the account lock for the whole connection attempt, then took the connection lock to install the new connection.
 
