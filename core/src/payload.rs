@@ -259,6 +259,13 @@ pub struct ChatContent {
     #[serde(with = "serde_bytes")]
     pub text: Vec<u8>,
     pub piggyback_ack: Option<PiggybackAck>,
+    /// DRA-0060: the sender's own id for this message, the same on every
+    /// resend of it, so the recipient can drop a copy it already has.
+    /// Encrypted with the rest of the payload; the relay never sees it.
+    /// Empty from a sender that predates it (and omitted on the wire when
+    /// empty, so an older recipient sees exactly the old shape).
+    #[serde(default, skip_serializing_if = "Vec::is_empty", with = "serde_bytes")]
+    pub message_id: Vec<u8>,
 }
 
 impl ChatContent {
@@ -583,6 +590,7 @@ mod tests {
             }),
         ] {
             let chat = ChatContent {
+                message_id: Vec::new(),
                 text: b"hi bob".to_vec(),
                 piggyback_ack,
             };

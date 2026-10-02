@@ -63,6 +63,20 @@ pub enum Error {
 
     #[error("filesystem error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// DRA-0060: the message was saved to this side's history (flagged for
+    /// retry) but not confirmed sent, because of `cause`. It may still
+    /// have reached the server if only the acknowledgement was lost.
+    #[error("message saved but not sent: {cause}")]
+    NotSent {
+        message: Box<dratchet_store::Message>,
+        cause: Box<Error>,
+    },
+
+    /// `retry_message`: no such message, or it isn't one of this side's
+    /// own messages flagged for retry.
+    #[error("that message is not waiting to be resent")]
+    NothingToRetry,
 }
 
 /// DRA-0058: keeps the client's three kinds of failure apart.

@@ -50,8 +50,14 @@ use dratchet_server::protocol::{
     PrekeyBundleWire, PublishBundle,
 };
 use dratchet_store::{
-    decrypt_gated, encrypt_gated, Contact, Db, Message, OwnProfile, PairingCode, VerificationState,
+    decrypt_gated, encrypt_gated, Contact, Db, Message, OwnProfile, PairingCode, RetryReason,
+    VerificationState,
 };
+
+/// How long the relay keeps a message nobody has collected
+/// (`ARCHITECTURE.md` §4.5's default). Also what DRA-0063 measures an
+/// unconfirmed send against.
+pub const MAILBOX_TTL_SECS: u32 = 14 * 24 * 60 * 60;
 use rand_core::{OsRng, RngCore};
 use x25519_dalek::PublicKey;
 
@@ -466,7 +472,7 @@ pub async fn announce_profile(
         &MailboxWrite {
             mailbox_id: contact.mailbox_id.clone(),
             envelope: envelope.encode(),
-            ttl: 14 * 24 * 60 * 60,
+            ttl: MAILBOX_TTL_SECS,
         },
     )
     .await?;
@@ -579,7 +585,7 @@ pub async fn add_contact_by_username(
         &MailboxWrite {
             mailbox_id: bootstrap_mailbox_id(&peer_fp).to_vec(),
             envelope: wire.encode(),
-            ttl: 14 * 24 * 60 * 60,
+            ttl: MAILBOX_TTL_SECS,
         },
     )
     .await?;
@@ -810,16 +816,58 @@ fn try_accept_first_contact(
 }
 
 /// Encrypt and send `content` to `contact`, refusing (via
-/// `store::gate::encrypt_gated`) if `contact` isn't `Verified` yet —
+/// `store::gate::encrypt_gated`) if `contact` isn't `Verified` yet --
 /// `docs/ARCHITECTURE.md` §6.5's mandatory gate, enforced here, not left
-/// to the UI to remember. On success, persists both the advanced ratchet
-/// state and the sent message.
+/// to the UI to remember.
+///
+/// DRA-0060: once encrypted, the message is saved to this side's history
+/// *before* it is sent, marked `RetryReason::SendFailed`, and the mark is
+/// cleared when the server acknowledges it. A send that fails, or whose
+/// acknowledgement is lost, therefore stays visible and can be resent
+/// with [`retry_message`], instead of vanishing from the sender's history
+/// while possibly having reached the recipient. Such a failure returns
+/// [`Error::NotSent`], carrying the saved message.
 pub async fn send_message(
     db: &Db,
     conn: &mut Connection,
     account: &Account,
     contact: &Contact,
     content: &[u8],
+) -> Result<Message> {
+    let message = db.new_outgoing_message(content.to_vec());
+    transmit_chat(db, conn, account, contact, message).await
+}
+
+/// DRA-0060/0063/0064: resend one of this side's own messages that is
+/// flagged for retry (`Message::retry_reason`). The same content is
+/// encrypted again at the ratchet's next position -- a fresh key and nonce
+/// (DRA-0059), never the original ones -- and carries the same message id,
+/// so a recipient that already has the original drops the copy. Updates
+/// the stored message in place (same place in the conversation).
+pub async fn retry_message(
+    db: &Db,
+    conn: &mut Connection,
+    account: &Account,
+    contact: &Contact,
+    message_id: &[u8],
+) -> Result<Message> {
+    let conv_id = conversation_id_for(account, contact);
+    let message = db
+        .load_message(conv_id, message_id)?
+        .ok_or(Error::NothingToRetry)?;
+    if !message.sender_is_local || message.retry_reason.is_none() {
+        return Err(Error::NothingToRetry);
+    }
+    transmit_chat(db, conn, account, contact, message).await
+}
+
+/// The shared send path for [`send_message`] and [`retry_message`].
+async fn transmit_chat(
+    db: &Db,
+    conn: &mut Connection,
+    account: &Account,
+    contact: &Contact,
+    mut message: Message,
 ) -> Result<Message> {
     let conv_id = conversation_id_for(account, contact);
     let mut ratchet = db.load_ratchet(conv_id)?.ok_or(Error::NoSession)?;
@@ -834,39 +882,58 @@ pub async fn send_message(
         .receiving_progress()
         .map(|(dh_pub, highest_n)| PiggybackAck { dh_pub, highest_n });
     let chat = ChatContent {
-        text: content.to_vec(),
+        text: message.content.clone(),
         piggyback_ack,
+        message_id: message.id.clone(),
     };
 
+    // Nothing is saved if this refuses (an unverified contact): same as
+    // before DRA-0060, a gated send leaves no trace.
     let envelope = encrypt_gated(&mut ratchet, contact, PAYLOAD_CHAT, &chat.encode())?;
-    let send_n = envelope.n;
-    let send_dh_pub = envelope.dh_pub.to_vec();
 
     // DRA-0059: commit the ratchet advance *before* the envelope leaves,
     // so a retry after a lost Ack encrypts at a fresh chain position
     // (fresh key and nonce) instead of reusing this one.
     db.save_ratchet(conv_id, &ratchet)?;
-    conn.send(
-        FrameTag::MailboxWrite,
-        &MailboxWrite {
-            mailbox_id: contact.mailbox_id.clone(),
-            envelope: envelope.encode(),
-            ttl: 14 * 24 * 60 * 60, // 14 days, `ARCHITECTURE.md` §4.5's default
-        },
-    )
-    .await?;
-    let (_, ack): (_, Ack) = conn.recv().await?;
-    if !ack.ok {
-        return Err(Error::NotAcknowledged);
-    }
+    // DRA-0060: saved, still flagged, before sending -- so the message
+    // survives a failed send (or a crash mid-send), and a DeliveryAck for
+    // this envelope always finds it by (dh_pub, n).
+    message.send_n = Some(envelope.n);
+    message.send_dh_pub = Some(envelope.dh_pub.to_vec());
+    message.delivered = false;
+    message.uncertain = false;
+    message.retry_reason = Some(RetryReason::SendFailed);
+    db.save_message(conv_id, &message)?;
 
-    Ok(db.save_message_now(
-        conv_id,
-        content.to_vec(),
-        true,
-        Some(send_n),
-        Some(send_dh_pub),
-    )?)
+    let sent: Result<()> = async {
+        conn.send(
+            FrameTag::MailboxWrite,
+            &MailboxWrite {
+                mailbox_id: contact.mailbox_id.clone(),
+                envelope: envelope.encode(),
+                ttl: MAILBOX_TTL_SECS,
+            },
+        )
+        .await?;
+        let (_, ack): (_, Ack) = conn.recv().await?;
+        if !ack.ok {
+            return Err(Error::NotAcknowledged);
+        }
+        Ok(())
+    }
+    .await;
+
+    match sent {
+        Ok(()) => {
+            message.retry_reason = None;
+            db.save_message(conv_id, &message)?;
+            Ok(message)
+        }
+        Err(cause) => Err(Error::NotSent {
+            message: Box::new(message),
+            cause: Box::new(cause),
+        }),
+    }
 }
 
 /// Fetch and process everything currently sitting in the mailbox `contact`
@@ -1000,6 +1067,10 @@ pub async fn receive_pending(
                 received.push(message);
                 delivered.extend(piggyback_delivered);
             }
+            Ok(EntryEffect::Resent(dh_pub, acked_n, piggyback_delivered)) => {
+                ack_after_delete = Some((dh_pub, acked_n));
+                delivered.extend(piggyback_delivered);
+            }
             Ok(EntryEffect::Delivered(message)) => delivered.push(message),
             Ok(EntryEffect::WipeActivity { session_wiped: sw }) => {
                 wipe_activity = true;
@@ -1070,7 +1141,7 @@ pub async fn receive_pending(
                 &MailboxWrite {
                     mailbox_id: contact.mailbox_id.clone(),
                     envelope: ack_envelope.encode(),
-                    ttl: 14 * 24 * 60 * 60,
+                    ttl: MAILBOX_TTL_SECS,
                 },
             )
             .await?;
@@ -1106,6 +1177,10 @@ enum EntryEffect {
     /// usually empty, non-empty whenever the sender's chat message
     /// carried a cumulative ack.
     Message(Message, Vec<u8>, u32, Vec<Message>),
+    /// DRA-0060: a resend of a chat message already received. Not shown
+    /// again; carries what `Message` does minus the message itself, so the
+    /// new envelope is still acked.
+    Resent(Vec<u8>, u32, Vec<Message>),
     /// An incoming `DeliveryAck` matched one of our own previously-sent
     /// messages (`Db::mark_message_delivered`) — the now-delivered
     /// message, for a caller to react to (e.g. a UI checkmark).
@@ -1169,12 +1244,24 @@ fn apply_entry(
             // message instead of inserting a second one.
             let recv_dh_pub = envelope.dh_pub.to_vec();
             let recv_n = envelope.n;
-            let message = db.save_received_message_idempotent(
+            // DRA-0060: a resend of a message already received (same sender
+            // id) is not shown again, but its envelope is still acked so the
+            // sender's copy is confirmed.
+            let peer_message_id = (!chat.message_id.is_empty()).then_some(chat.message_id);
+            let (message, resent) = db.save_received_chat(
                 conv_id,
                 chat.text,
                 recv_dh_pub.clone(),
                 recv_n,
+                peer_message_id,
             )?;
+            if resent {
+                return Ok(EntryEffect::Resent(
+                    recv_dh_pub,
+                    recv_n,
+                    piggyback_delivered,
+                ));
+            }
             Ok(EntryEffect::Message(
                 message,
                 recv_dh_pub,
@@ -1400,7 +1487,7 @@ pub async fn announce_routing_id(
         &MailboxWrite {
             mailbox_id: bootstrap_mailbox_id(&contact.fingerprint).to_vec(),
             envelope: envelope.encode(),
-            ttl: 14 * 24 * 60 * 60,
+            ttl: MAILBOX_TTL_SECS,
         },
     )
     .await?;
@@ -1452,7 +1539,7 @@ pub async fn announce_wipe_policy(
         &MailboxWrite {
             mailbox_id: updated.mailbox_id.clone(),
             envelope: envelope.encode(),
-            ttl: 14 * 24 * 60 * 60,
+            ttl: MAILBOX_TTL_SECS,
         },
     )
     .await?;
@@ -1565,7 +1652,7 @@ pub async fn request_conversation_wipe(
         &MailboxWrite {
             mailbox_id: contact.mailbox_id.clone(),
             envelope: envelope.encode(),
-            ttl: 14 * 24 * 60 * 60,
+            ttl: MAILBOX_TTL_SECS,
         },
     )
     .await?;

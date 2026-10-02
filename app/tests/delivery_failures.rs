@@ -217,6 +217,7 @@ async fn scenario_22_retrying_from_unsaved_ratchet_state_reuses_the_same_chain_p
     // Ack arrived — deliberately *not* saving it back.
     let mut attempt_1 = db.load_ratchet(conv_id).unwrap().unwrap();
     let content_1 = ChatContent {
+        message_id: Vec::new(),
         text: b"are you free tonight?".to_vec(),
         piggyback_ack: None,
     }
@@ -230,6 +231,7 @@ async fn scenario_22_retrying_from_unsaved_ratchet_state_reuses_the_same_chain_p
     // time) — a different plaintext, to make the point sharply.
     let mut attempt_2 = db.load_ratchet(conv_id).unwrap().unwrap();
     let content_2 = ChatContent {
+        message_id: Vec::new(),
         text: b"never mind, it can wait".to_vec(),
         piggyback_ack: None,
     }
@@ -393,6 +395,7 @@ async fn scenario_14_a_crash_before_save_ratchet_does_not_lose_already_processed
     let plaintexts = ["message one", "message two", "message three"];
     for text in &plaintexts {
         let content = ChatContent {
+            message_id: Vec::new(),
             text: text.as_bytes().to_vec(),
             piggyback_ack: None,
         }
@@ -491,6 +494,7 @@ async fn scenario_14_a_crash_before_save_ratchet_does_not_lose_already_processed
 
     // Bob sends a 4th, real message.
     let content_4 = ChatContent {
+        message_id: Vec::new(),
         text: b"message four".to_vec(),
         piggyback_ack: None,
     }

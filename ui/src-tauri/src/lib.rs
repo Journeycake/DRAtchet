@@ -128,6 +128,10 @@ struct MessageDto {
     /// distinct indicator for this rather than the ordinary "sent,
     /// awaiting ack" state.
     uncertain: bool,
+    /// DRA-0060/0063/0064: set on one of this side's own messages that
+    /// should be offered a resend, and why: `"send_failed"`, `"expired"`
+    /// or `"server_restarted"`. `None` otherwise.
+    retry_reason: Option<&'static str>,
 }
 
 /// This device's own directory-facing profile (`dratchet_store::OwnProfile`),
@@ -211,6 +215,11 @@ fn to_message_dto(message: &dratchet_store::Message) -> MessageDto {
         timestamp: message.timestamp,
         delivered: message.delivered,
         uncertain: message.uncertain,
+        retry_reason: message.retry_reason.map(|r| match r {
+            dratchet_store::RetryReason::SendFailed => "send_failed",
+            dratchet_store::RetryReason::Expired => "expired",
+            dratchet_store::RetryReason::ServerRestarted => "server_restarted",
+        }),
     }
 }
 
@@ -291,11 +300,48 @@ async fn send_message(
         .ok_or("no such contact")?;
     let mut conn = state.conn.lock().await;
     let account = state.account.lock().await;
-    let message =
-        dratchet_app::send_message(&state.db, &mut conn, &account, &contact, content.as_bytes())
-            .await
-            .map_err(|e| e.to_string())?;
-    Ok(to_message_dto(&message))
+    // DRA-0060: a send that failed after the message was saved comes back
+    // as that saved message, flagged for retry, not as an error -- the
+    // composer clears and the message shows in the conversation with a
+    // Retry button.
+    match dratchet_app::send_message(&state.db, &mut conn, &account, &contact, content.as_bytes())
+        .await
+    {
+        Ok(message) => Ok(to_message_dto(&message)),
+        Err(dratchet_app::Error::NotSent { message, cause }) => {
+            eprintln!("send_message: saved but not sent: {cause}");
+            Ok(to_message_dto(&message))
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// DRA-0060/0063/0064: resend one of this side's own messages flagged for
+/// retry, encrypted afresh (`dratchet_app::retry_message`). Returns the
+/// updated message -- still flagged if this attempt failed too.
+#[tauri::command]
+async fn retry_message(
+    state: State<'_, AppState>,
+    fingerprint: String,
+    message_id: String,
+) -> Result<MessageDto, String> {
+    let fp = hex::decode(&fingerprint)?;
+    let id = hex::decode(&message_id)?;
+    let contact = state
+        .db
+        .load_contact(&fp)
+        .map_err(|e| e.to_string())?
+        .ok_or("no such contact")?;
+    let mut conn = state.conn.lock().await;
+    let account = state.account.lock().await;
+    match dratchet_app::retry_message(&state.db, &mut conn, &account, &contact, &id).await {
+        Ok(message) => Ok(to_message_dto(&message)),
+        Err(dratchet_app::Error::NotSent { message, cause }) => {
+            eprintln!("retry_message: still not sent: {cause}");
+            Ok(to_message_dto(&message))
+        }
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// `docs/ARCHITECTURE.md` §11.9a's per-conversation wipe policy: saves
@@ -945,6 +991,7 @@ pub fn run() {
             list_contacts,
             list_messages,
             send_message,
+            retry_message,
             set_wipe_policy,
             preview_conversation_wipe,
             request_conversation_wipe,

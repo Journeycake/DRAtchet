@@ -75,6 +75,8 @@ fn sample_message(id: u32, timestamp: u64, sequence: u64) -> Message {
         recv_dh_pub: None,
         delivered: false,
         uncertain: false,
+        retry_reason: None,
+        peer_message_id: None,
     }
 }
 

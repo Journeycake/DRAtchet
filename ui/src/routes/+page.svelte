@@ -21,6 +21,8 @@
     timestamp: number;
     delivered: boolean;
     uncertain: boolean;
+    // DRA-0060/0063/0064: why this message is offered for a resend, if it is.
+    retry_reason: "send_failed" | "expired" | "server_restarted" | null;
   };
 
   type OwnProfileDto = {
@@ -221,6 +223,32 @@
       sendError = String(e);
     } finally {
       sending = false;
+    }
+  }
+
+  // DRA-0060/0063/0064: resend a flagged message. The backend encrypts it
+  // afresh (never the original key) and the recipient drops a copy it
+  // already has, so retrying is always safe.
+  let retrying = $state<string | null>(null);
+  const RETRY_LABEL: Record<string, string> = {
+    send_failed: "Not sent",
+    expired: "Not delivered within 14 days — the server discarded it",
+    server_restarted: "Possibly lost when the server restarted",
+  };
+
+  async function retryMessage(message: MessageDto) {
+    if (!selected || retrying) return;
+    retrying = message.id;
+    try {
+      const updated = await invoke<MessageDto>("retry_message", {
+        fingerprint: selected.fingerprint,
+        messageId: message.id,
+      });
+      messages = messages.map((m) => (m.id === updated.id ? updated : m));
+    } catch (e) {
+      sendError = String(e);
+    } finally {
+      retrying = null;
     }
   }
 
@@ -724,6 +752,18 @@
               >
                 {message.uncertain ? "?" : message.delivered ? "✓✓" : "✓"}
               </span>
+              {#if message.retry_reason}
+                <span class="retry-notice" role="status">
+                  {RETRY_LABEL[message.retry_reason]}
+                  <button
+                    class="retry-button"
+                    disabled={retrying === message.id}
+                    onclick={() => retryMessage(message)}
+                  >
+                    {retrying === message.id ? "Retrying…" : "Retry"}
+                  </button>
+                </span>
+              {/if}
             {/if}
           </div>
         {/each}
@@ -1367,6 +1407,18 @@
     background: var(--teal-dim);
     color: var(--ink);
     align-self: flex-end;
+  }
+
+  .retry-notice {
+    display: block;
+    margin-top: 4px;
+    font-size: 11px;
+    color: var(--red);
+  }
+
+  .retry-button {
+    margin-left: 6px;
+    font-size: 11px;
   }
 
   .delivery-status {

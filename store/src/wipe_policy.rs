@@ -285,6 +285,8 @@ mod tests {
             recv_dh_pub: None,
             delivered: false,
             uncertain: false,
+            retry_reason: None,
+            peer_message_id: None,
         }
     }
 
@@ -341,6 +343,8 @@ mod tests {
             recv_dh_pub: None,
             delivered: false,
             uncertain: false,
+            retry_reason: None,
+            peer_message_id: None,
         }
     }
 

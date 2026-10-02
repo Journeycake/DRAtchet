@@ -102,6 +102,34 @@ pub struct Message {
     /// to decode at all.
     #[serde(default)]
     pub uncertain: bool,
+    /// DRA-0060/0063/0064: set on one of this side's own messages that the
+    /// user should be offered a resend for, and why. `None` for every
+    /// received message and every confirmed send. A resend re-encrypts the
+    /// same content at a fresh ratchet position (DRA-0059), never the old
+    /// key.
+    #[serde(default)]
+    pub retry_reason: Option<RetryReason>,
+    /// DRA-0060: on a *received* message, the sender's own id for it,
+    /// carried inside the encrypted `ChatContent`. A resend carries the
+    /// same id, so a copy the recipient already has is recognised and not
+    /// shown twice. `None` for messages from a sender that predates it.
+    #[serde(default, with = "serde_bytes")]
+    pub peer_message_id: Option<Vec<u8>>,
+}
+
+/// Why one of this side's own messages is offered for a resend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RetryReason {
+    /// DRA-0060: the send didn't get the server's acknowledgement (no
+    /// connection, refused, or the Ack was lost). It may or may not have
+    /// reached the server.
+    SendFailed,
+    /// DRA-0063: accepted by the server but never confirmed delivered
+    /// within the mailbox lifetime, so the server has discarded it.
+    Expired,
+    /// DRA-0064: unconfirmed when the server restarted, which discards
+    /// every queued message.
+    ServerRestarted,
 }
 
 /// Hand-written, not `#[derive(Debug)]`: `content` is plaintext message
@@ -124,6 +152,8 @@ impl fmt::Debug for Message {
             .field("recv_dh_pub", &self.recv_dh_pub.as_deref().map(hex))
             .field("delivered", &self.delivered)
             .field("uncertain", &self.uncertain)
+            .field("retry_reason", &self.retry_reason)
+            .field("peer_message_id", &self.peer_message_id.as_deref().map(hex))
             .finish()
     }
 }
@@ -232,6 +262,8 @@ impl Db {
             recv_dh_pub: None,
             delivered: false,
             uncertain: false,
+            retry_reason: None,
+            peer_message_id: None,
         };
         self.save_message(conversation_id, &message)?;
         Ok(message)
@@ -287,9 +319,85 @@ impl Db {
             recv_dh_pub: Some(recv_dh_pub),
             delivered: false,
             uncertain: false,
+            retry_reason: None,
+            peer_message_id: None,
         };
         self.save_message(conversation_id, &message)?;
         Ok(message)
+    }
+
+    /// DRA-0060: a new outgoing message, numbered and timestamped but not
+    /// yet saved -- its id has to exist before encryption, because the id
+    /// travels inside the encrypted payload so the recipient can spot a
+    /// resend it already has. The caller saves it (marked
+    /// `RetryReason::SendFailed`) before sending and clears the mark once
+    /// the server confirms.
+    pub fn new_outgoing_message(&self, content: Vec<u8>) -> Message {
+        Message {
+            id: random_message_id(),
+            sender_is_local: true,
+            content,
+            timestamp: now_unix(),
+            sequence: self.message_sequence.fetch_add(1, Ordering::Relaxed),
+            send_n: None,
+            send_dh_pub: None,
+            recv_n: None,
+            recv_dh_pub: None,
+            delivered: false,
+            uncertain: false,
+            retry_reason: Some(RetryReason::SendFailed),
+            peer_message_id: None,
+        }
+    }
+
+    /// One message by id, if it exists and is readable.
+    pub fn load_message(
+        &self,
+        conversation_id: [u8; 16],
+        message_id: &[u8],
+    ) -> Result<Option<Message>> {
+        match self.get_encrypted(Scope::Content, &message_key(conversation_id, message_id))? {
+            Some(bytes) => Ok(Some(decode_message(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// DRA-0060: like [`save_received_message_idempotent`], plus resend
+    /// detection. A message carrying a sender id this conversation has
+    /// already received is a resend of something already shown: the
+    /// existing record is returned with `true` and nothing new is saved.
+    /// (The new envelope still gets its own `DeliveryAck`, so the sender's
+    /// copy is confirmed.)
+    ///
+    /// [`save_received_message_idempotent`]: Self::save_received_message_idempotent
+    pub fn save_received_chat(
+        &self,
+        conversation_id: [u8; 16],
+        content: Vec<u8>,
+        recv_dh_pub: Vec<u8>,
+        recv_n: u32,
+        peer_message_id: Option<Vec<u8>>,
+    ) -> Result<(Message, bool)> {
+        if let Some(peer_id) = peer_message_id.as_deref() {
+            for existing in self.list_messages(conversation_id)? {
+                if !existing.sender_is_local && existing.peer_message_id.as_deref() == Some(peer_id)
+                {
+                    tracing::debug!(
+                        conversation = %hex(&conversation_id),
+                        message_id = %hex(&existing.id),
+                        "resent message already received; not shown again (DRA-0060)",
+                    );
+                    return Ok((existing, true));
+                }
+            }
+        }
+        let mut message =
+            self.save_received_message_idempotent(conversation_id, content, recv_dh_pub, recv_n)?;
+        if peer_message_id.is_some() && message.peer_message_id != peer_message_id {
+            message.peer_message_id = peer_message_id;
+            self.save_message(conversation_id, &message)?;
+        }
+        Ok((message, false))
     }
 
     pub fn delete_message(&self, conversation_id: [u8; 16], message_id: &[u8]) -> Result<()> {
@@ -442,10 +550,9 @@ impl Db {
     pub fn mark_undelivered_uncertain(&self, conversation_id: [u8; 16]) -> Result<usize> {
         let messages = self.list_messages(conversation_id)?;
         let mut count = 0;
-        for mut m in messages
-            .into_iter()
-            .filter(|m| m.sender_is_local && !m.delivered && !m.uncertain)
-        {
+        for mut m in messages.into_iter().filter(|m| {
+            m.sender_is_local && !m.delivered && !m.uncertain && m.retry_reason.is_none()
+        }) {
             m.uncertain = true;
             self.save_message(conversation_id, &m)?;
             count += 1;
@@ -558,6 +665,8 @@ mod tests {
             recv_dh_pub: None,
             delivered: false,
             uncertain: false,
+            retry_reason: None,
+            peer_message_id: None,
         }
     }
 

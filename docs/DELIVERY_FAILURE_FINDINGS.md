@@ -101,6 +101,7 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0057 | Low | `core/src/payload.rs:350 (ProfileAnnounce::decode)` | [`814e959`](https://github.com/Journeycake/dratchet/commit/814e959fb42b777b391be10adf16f16089ebfdd6) | this doc |
 | DRA-0058 | Medium | `app/src/error.rs:69 (From<NetError>, From<String>); client/src/net.rs:22 (NetError); server/src/protocol.rs:304 (ErrorCode); ui/src-tauri/src/lib.rs (is_connection_error)` | [`73dfc1c`](https://github.com/Journeycake/dratchet/commit/73dfc1cbc9eb71fb0b9a640c216313e7fd4e968b) | this doc |
 | DRA-0059 | High | `app/src/lib.rs:817 (send_message) and the five other ratchet senders (announce_profile, receive_pending's DeliveryAck, announce_routing_id, announce_wipe_policy, request_conversation_wipe)` | [`041d25d`](https://github.com/Journeycake/dratchet/commit/041d25dff0257988035ec8dd6f82e136ddcf4612) | this doc |
+| DRA-0060 | Medium | `app/src/lib.rs:830 (send_message, retry_message, transmit_chat); store/src/messages.rs:373 (save_received_chat); core/src/payload.rs (ChatContent::message_id); ui (Retry button)` | this commit | this doc |
 
 
 ## Summary
@@ -4208,4 +4209,35 @@ Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D w
 
 - **A failed send still vanishes from the sender's history, and a retry may duplicate.** If the first attempt did reach the server, the recipient gets both it and the retry, under different keys. That's addressed by DRA-0060 (failed sends kept, retry, recipient-side dedup).
 - **Each burned position costs one skipped-key slot.** Many consecutive failed sends without a successful one could exceed `max_skip` on the recipient. A long outage that fails every send fails fast, so this would need deliberate repeated retries.
+
+## DRA-0060: a failed send vanished from the sender's history, and the only retry delivered a second copy (residual scope of DRA-0059; confirmed real, fixed) — **MEDIUM**
+
+> **DRA-0060** · Location: `app/src/lib.rs:830 (send_message, retry_message, transmit_chat); store/src/messages.rs:373 (save_received_chat); core/src/payload.rs (ChatContent::message_id); ui (Retry button)` · Fix: this commit
+
+`send_message` saved the message to local history only after the server's `Ack`. On any failure the message was simply gone from the sender's side, and the UI kept the text in the composer for the user to send again as a brand-new message. In the lost-`Ack` case (the server stored it, the `Ack` didn't arrive), the recipient had the message while the sender's history didn't, and resending delivered a second, separate copy. The two sides' records of the conversation disagreed either way.
+
+Rated **Medium**: integrity of the conversation record. The sender loses track of what they sent, and the recipient can see duplicates. No confidentiality impact once DRA-0059 is in place.
+
+### Confirmation
+
+`app/tests/failed_sends_are_kept_and_retried.rs`, `a_failed_send_stays_in_the_senders_history_and_can_be_retried`. A send goes through a stand-in relay that drops the `Ack`. Its core assertion uses only the pre-existing API, and was run against the previous commit (`041d25d`) in a separate worktree, where it failed with its `VULNERABILITY:` message: the failed message was missing from the sender's history.
+
+### Fixed
+
+- **Saved before sending.** `send_message` now builds the outgoing message first (`Db::new_outgoing_message`, so its id exists before encryption), encrypts it, commits the ratchet (DRA-0059), and saves the message flagged `RetryReason::SendFailed` *before* sending. The flag is cleared when the server acknowledges. A failed send (or a crash mid-send) therefore leaves the message in history, flagged, and the call returns `Error::NotSent` carrying it. An unverified contact is still refused before anything is saved, as before.
+- **Retry with a fresh key.** `retry_message` re-encrypts the same content at the ratchet's next position (a fresh key and nonce, never the original) and updates the stored message in place.
+- **No duplicate for the recipient.** `ChatContent` gained `message_id`, the sender's id for the message, the same on every resend. It travels *inside* the encrypted payload, so the relay can't see it or link the two envelopes. It's omitted when empty and ignored by older recipients. The receiver (`Db::save_received_chat`) recognises an id it already has and doesn't show the resend, but still acknowledges the new envelope, so the sender's copy is marked delivered.
+- **UI.** A flagged message shows a reason and a **Retry** button. A failed send no longer leaves its text in the composer; it appears in the conversation instead.
+
+The second test, `a_resend_the_recipient_already_has_is_not_shown_twice`, covers the lost-`Ack` case where the first copy did arrive. The recipient shows one message, and the sender's copy ends up delivered and unflagged.
+
+`RetryReason` also has `Expired` and `ServerRestarted` variants, used by DRA-0063 and DRA-0064.
+
+Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (330 passed). `ui/src-tauri` fmt, clippy and `cargo test` (14 passed). `npm run check` (0 errors, 0 warnings).
+
+### Known residual scope
+
+- **Older senders get no deduplication.** A message from a sender that predates this change carries no id, so a manual resend from an old client still shows twice.
+- **Deduplication scans the conversation.** `save_received_chat` checks every stored message in the conversation for the id: linear in conversation length, the same cost shape as the existing DRA-0012 check.
+- **Not seen in a live window.** The Retry button was type-checked, not viewed in a running Tauri window.
 

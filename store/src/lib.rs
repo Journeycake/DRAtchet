@@ -21,7 +21,7 @@ pub use contacts::{Contact, VerificationState};
 pub use db::Db;
 pub use error::{Error, Result};
 pub use gate::{decrypt_gated, encrypt_gated};
-pub use messages::Message;
+pub use messages::{Message, RetryReason};
 pub use profile::OwnProfile;
 pub use routing::compute_mailbox_id;
 pub use verification::{

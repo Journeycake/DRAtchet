@@ -744,6 +744,8 @@ mod tests {
             recv_dh_pub: None,
             delivered: false,
             uncertain: false,
+            retry_reason: None,
+            peer_message_id: None,
         };
         db.save_message(alice, &message).unwrap();
 
@@ -1141,6 +1143,8 @@ mod tests {
                 recv_dh_pub: None,
                 delivered: false,
                 uncertain: false,
+                retry_reason: None,
+                peer_message_id: None,
             },
         )
         .unwrap();
@@ -1201,6 +1205,8 @@ mod tests {
                 recv_dh_pub: None,
                 delivered: false,
                 uncertain: false,
+                retry_reason: None,
+                peer_message_id: None,
             },
         )
         .unwrap();
