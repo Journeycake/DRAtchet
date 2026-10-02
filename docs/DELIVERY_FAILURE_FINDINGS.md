@@ -100,7 +100,7 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0056 | Low | `store/src/db.rs:326 (Db::rebind_legacy_records, called from Db::open)` | [`c642595`](https://github.com/Journeycake/dratchet/commit/c642595201639b049dbeb22961e80d1231db48ba) | this doc |
 | DRA-0057 | Low | `core/src/payload.rs:350 (ProfileAnnounce::decode)` | [`814e959`](https://github.com/Journeycake/dratchet/commit/814e959fb42b777b391be10adf16f16089ebfdd6) | this doc |
 | DRA-0058 | Medium | `app/src/error.rs:69 (From<NetError>, From<String>); client/src/net.rs:22 (NetError); server/src/protocol.rs:304 (ErrorCode); ui/src-tauri/src/lib.rs (is_connection_error)` | [`73dfc1c`](https://github.com/Journeycake/dratchet/commit/73dfc1cbc9eb71fb0b9a640c216313e7fd4e968b) | this doc |
-| DRA-0059 | High | `app/src/lib.rs:817 (send_message) and the five other ratchet senders (announce_profile, receive_pending's DeliveryAck, announce_routing_id, announce_wipe_policy, request_conversation_wipe)` | this commit | this doc |
+| DRA-0059 | High | `app/src/lib.rs:817 (send_message) and the five other ratchet senders (announce_profile, receive_pending's DeliveryAck, announce_routing_id, announce_wipe_policy, request_conversation_wipe)` | [`041d25d`](https://github.com/Journeycake/dratchet/commit/041d25dff0257988035ec8dd6f82e136ddcf4612) | this doc |
 
 
 ## Summary
@@ -4180,7 +4180,7 @@ Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D w
 
 ## DRA-0059: a send retried after a lost acknowledgement reused the same message key and nonce (reopens audit scenario 22; confirmed real, fixed) — **HIGH**
 
-> **DRA-0059** · Location: `app/src/lib.rs:817 (send_message) and the five other ratchet senders (announce_profile, receive_pending's DeliveryAck, announce_routing_id, announce_wipe_policy, request_conversation_wipe)` · Fix: this commit
+> **DRA-0059** · Location: `app/src/lib.rs:817 (send_message) and the five other ratchet senders (announce_profile, receive_pending's DeliveryAck, announce_routing_id, announce_wipe_policy, request_conversation_wipe)` · Fix: [`041d25d`](https://github.com/Journeycake/dratchet/commit/041d25dff0257988035ec8dd6f82e136ddcf4612)
 
 Every function that sends a ratchet-encrypted envelope saved the advanced ratchet only **after** the server's `Ack`. Suppose the server stores the envelope but the `Ack` never arrives, because the connection drops in between. The caller sees an error, the ratchet on disk is unchanged, and the next attempt encrypts again from the same chain position.
 
