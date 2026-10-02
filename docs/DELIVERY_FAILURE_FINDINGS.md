@@ -109,7 +109,7 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0065 | Medium | `client/src/net.rs:105 (Connection::is_lost); app/src/lib.rs:977 (transmit_chat), app/src/lib.rs:496 (ensure_connection_usable)` | [`9cd43d8`](https://github.com/Journeycake/dratchet/commit/9cd43d812e3862b1ad2e6db0026ae84d2b8b3c4d) | this doc |
 | DRA-0066 | Medium | `app/src/lib.rs:939 (reannounce_routing_id_if_unconfirmed), app/src/lib.rs:1161 (receive_pending confirms the switch), app/src/lib.rs:1648 (announce_routing_id keeps the envelope); store/src/contacts.rs:106 (Contact::routing_confirmed, routing_announce)` | [`d739e0f`](https://github.com/Journeycake/dratchet/commit/d739e0f7d688b6c4cc0fa0c1037400b205318f32) | this doc |
 | DRA-0067 | Medium | `ui/src-tauri/src/lib.rs:821 (poll_loop reconnect)` | [`bc8e05b`](https://github.com/Journeycake/dratchet/commit/bc8e05b4e85ca4fa6e09929be07c26fd46c58009) | this doc |
-| DRA-0068 | Medium | `client/src/net.rs:81 (Connection::connect_with_timeout); ui/src-tauri/src/lib.rs:833 (poll_loop reconnect)` | pending | this doc |
+| DRA-0068 | Medium | `client/src/net.rs:81 (Connection::connect_with_timeout); ui/src-tauri/src/lib.rs:833 (poll_loop reconnect)` | [`970ffcc`](https://github.com/Journeycake/dratchet/commit/970ffcc9436f63178c35bafdaf5fc6ba1c64f0d9) | this doc |
 
 
 ## Summary
@@ -4458,7 +4458,7 @@ Validation: `ui/src-tauri` `cargo fmt --check`, `cargo clippy --all-targets -- -
 
 ## DRA-0068: a server that accepted connections but never answered froze the desktop app (DRA-0061's residual, extended to connecting; confirmed real, fixed) — **MEDIUM**
 
-> **DRA-0068** · Location: `client/src/net.rs:81 (Connection::connect_with_timeout); ui/src-tauri/src/lib.rs:833 (poll_loop reconnect)` · Fix: pending
+> **DRA-0068** · Location: `client/src/net.rs:81 (Connection::connect_with_timeout); ui/src-tauri/src/lib.rs:833 (poll_loop reconnect)` · Fix: [`970ffcc`](https://github.com/Journeycake/dratchet/commit/970ffcc9436f63178c35bafdaf5fc6ba1c64f0d9)
 
 DRA-0061 put a time limit on every send and every wait for a reply, but not on connecting. `Connection::connect` waited for the WebSocket handshake indefinitely. The desktop app's reconnect also connected while holding the account lock, which every command that touches the account needs, including reading a conversation.
 
