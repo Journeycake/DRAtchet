@@ -1,0 +1,3 @@
+# The ratchet is committed before an envelope is sent
+
+Every send saves the advanced ratchet before the envelope leaves, so a failed or unacknowledged send never leaves its key and nonce available for reuse; reuse would let the relay combine two ciphertexts (DRA-0059). The alternative, saving only after the relay's acknowledgement, is simpler but reuses (key, nonce) whenever an acknowledgement is lost. The cost is a used-up chain position per failed attempt, which the recipient skips over; sends refuse before encrypting on a connection already known to be lost, so an outage can't use up more than the recipient will skip (DRA-0065).

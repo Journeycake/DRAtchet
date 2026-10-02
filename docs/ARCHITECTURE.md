@@ -1355,6 +1355,14 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
    exists. Bug fixes and hardening within what's already shipped
    (correctness fixes, test coverage, documentation) are not blocked by
    this freeze — only new v2-roadmap work is.
+   **v1.5 — relay operator features** (decided Oct 2026; the v1 freeze
+   above still holds for everything else): optional relay mail
+   persistence — encrypted, fragmented, off by default except on hosts
+   under 2 GB of usable RAM, configured in `dratchet.cfg`, with Server
+   Epochs telling senders when queued mail may have been lost (see
+   `docs/adr/0001-relay-mail-persistence-is-optional.md`); then changing
+   the operator key on a live server, limits on mail held for
+   long-absent recipients, and Fragment storage off the relay host.
 3. **v2**: multi-device support (full roadmap, including the per-device
    identity model and how recovery profiles stay consistent across a
    user's own devices, in §14), group chat (MLS/RFC 9420 — full roadmap,
