@@ -106,6 +106,7 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0062 | Low | `ui/src-tauri/src/lib.rs:652 (connect_at_startup; AppState::conn as Option; connected; poll_loop); app/src/lib.rs:847 (save_unsent_message)` | [`c9fe0a3`](https://github.com/Journeycake/dratchet/commit/c9fe0a32e3fba2cc6268f949ad6a91cc8c3a49d4) | this doc |
 | DRA-0063 | Medium | `app/src/lib.rs:73 (mark_expired_sends); store/src/messages.rs:570 (Db::mark_expired_sends, Message::last_sent_at); ui/src-tauri poll_loop` | [`38c3c6f`](https://github.com/Journeycake/dratchet/commit/38c3c6f1e5137b9543779b231d866b12d2516e71) | this doc |
 | DRA-0064 | Medium | `app/src/lib.rs:76 (note_server_boot); server/src/protocol.rs (AuthChallenge::server_boot_id); server/src/state.rs (AppState::boot_id); store/src/messages.rs (mark_unconfirmed_lost_in_restart)` | [`e7c69fd`](https://github.com/Journeycake/dratchet/commit/e7c69fd0fcd27d6a7e7e7909c53e65f494af24bd) | this doc |
+| DRA-0065 | Medium | `client/src/net.rs:105 (Connection::is_lost); app/src/lib.rs:977 (transmit_chat), app/src/lib.rs:496 (ensure_connection_usable)` | pending | this doc |
 
 
 ## Summary
@@ -4354,4 +4355,37 @@ Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D w
 - **This detects loss; it doesn't prevent it.** Persisting mailboxes to disk (audit scenario 9 option (a)) would avoid the loss entirely, at the cost of keeping encrypted mail at rest on the server. That's a design decision, not attempted here.
 - **The recipient isn't told.** Only senders learn of the restart.
 - **Older clients** never learn about restarts, and retry flags are still manual (see DRA-0062's residual).
+
+## DRA-0065: repeated send attempts on a dead connection permanently broke the conversation for the recipient (found closing the retry test gaps; confirmed real, fixed) — **MEDIUM**
+
+> **DRA-0065** · Location: `client/src/net.rs:105 (Connection::is_lost); app/src/lib.rs:977 (transmit_chat), app/src/lib.rs:496 (ensure_connection_usable)` · Fix: pending
+
+DRA-0059 made every ratchet send commit its chain position before the envelope goes out, so a failed attempt is never retried under the same key. The cost is one used-up position per failed attempt, which the recipient skips over when the next message arrives. The recipient skips at most `max_skip` positions (`DEFAULT_MAX_SKIP`, 100) in one go.
+
+Nothing stopped attempts on a connection that had already failed. In the desktop app, a connection that dies stays in place until the background loop manages to reconnect, which during a long outage means up to a minute between attempts, indefinitely. Every message typed and every Retry pressed in that time went to the dead connection, used a position, and failed. After more than 100 of them, the recipient couldn't decrypt the message that finally arrived. The entry was dropped as undecryptable, with a log line only.
+
+It's permanent: the confirming scenario, extended, shows the next message from the same sender failing the same way, and still failing after the recipient replies and the ratchet takes a new DH step (the new header asks the recipient to skip the old chain's remaining positions, which is over the limit too). Messages in the other direction still arrive, so the sender sees nothing wrong.
+
+Rated **Medium**: permanent, silent loss of one direction of one conversation. It needs more than 100 send attempts during an outage, which an active user can reach over a long one, but no outside party can force.
+
+### Confirmation
+
+`app/tests/repeated_failed_retries.rs`, `many_failed_attempts_during_an_outage_do_not_break_the_conversation`. Alice's connection to a real server goes through a TCP link that the test cuts mid-session. She sends, then retries 120 times on the dead connection, then retries once on a working one. With only the two new checks in `app/src/lib.rs` disabled, the test fails with its `VULNERABILITY:` assertion: Bob receives nothing, and logs "skipped-message key cache would exceed MAX_SKIP (100)".
+
+### Fixed
+
+- **The connection remembers that it failed.** `net::Connection` marks itself lost on any transport failure or timeout. Every later `send` or `recv` on it fails at once, and `is_lost()` reports it. A server refusal (DRA-0058) doesn't mark it lost.
+- **Senders check before encrypting.** `transmit_chat` (sends and retries) keeps the message flagged `SendFailed` without encrypting it when the connection is lost, the same as an offline send (DRA-0062). The four other ratchet senders (`announce_profile`, `announce_routing_id`, `announce_wipe_policy`, `request_conversation_wipe`) return `Error::Connection` before encrypting.
+
+Only the attempt that discovers the failure uses a position now: one per connection that dies, not one per attempt.
+
+Tests in the same file: `a_retry_that_keeps_failing_still_delivers_once_the_server_is_back` (several failed retries, then one copy delivered and the conversation carries on) and the guard `other_ratchet_sends_on_a_lost_connection_use_no_chain_position`. The confirming test also checks that the delivered retry is exactly one position after the first attempt and that both directions work afterwards.
+
+Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (339 passed). `ui/src-tauri` fmt, clippy and `cargo test` (16 passed).
+
+### Known residual scope
+
+- **One position per failed connection is still used.** A link that drops and reconnects more than 100 times, each time failing a send, with no message delivered in between, would still exceed the limit. Each cycle needs a reconnect (with backoff), so this is far harder to reach.
+- **A conversation already broken this way isn't repaired.** The fix stops new breakage; it doesn't recover a conversation past the limit. That would need a session reset.
+- **The recipient isn't told.** An undecryptable entry is still dropped with only a log line, which predates this finding.
 

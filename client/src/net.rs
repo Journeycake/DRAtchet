@@ -65,6 +65,8 @@ pub struct Connection {
     ws: WsStream,
     request_timeout: std::time::Duration,
     server_boot_id: Vec<u8>,
+    /// DRA-0065: set once a send or receive fails at the transport level.
+    lost: bool,
 }
 
 impl Connection {
@@ -76,6 +78,7 @@ impl Connection {
             ws,
             request_timeout: REQUEST_TIMEOUT,
             server_boot_id: Vec::new(),
+            lost: false,
         })
     }
 
@@ -93,6 +96,20 @@ impl Connection {
         &self.server_boot_id
     }
 
+    /// DRA-0065: whether this connection has already failed. A lost
+    /// connection is never usable again (after a timeout, a late reply
+    /// could be mistaken for the next request's), so every further
+    /// [`send`](Self::send) and [`recv_raw`](Self::recv_raw) fails at once.
+    /// Callers check this before spending anything on a send that can't
+    /// succeed -- a ratchet chain position in particular.
+    pub fn is_lost(&self) -> bool {
+        self.lost
+    }
+
+    fn already_lost() -> NetError {
+        NetError::Connection("connection already lost".to_string())
+    }
+
     fn timed_out(&self) -> NetError {
         NetError::Connection(format!(
             "no response from the server within {}s",
@@ -101,29 +118,42 @@ impl Connection {
     }
 
     pub async fn send<T: Serialize>(&mut self, tag: FrameTag, body: &T) -> Result<(), NetError> {
+        if self.lost {
+            return Err(Self::already_lost());
+        }
         let frame = encode(tag, body);
-        match tokio::time::timeout(self.request_timeout, self.ws.send(WsMessage::Binary(frame)))
-            .await
+        let result = match tokio::time::timeout(
+            self.request_timeout,
+            self.ws.send(WsMessage::Binary(frame)),
+        )
+        .await
         {
             Ok(sent) => sent.map_err(|e| NetError::Connection(format!("send failed: {e}"))),
             Err(_) => Err(self.timed_out()),
-        }
+        };
+        self.lost = result.is_err();
+        result
     }
 
     /// Wait for the next binary frame, skipping any non-binary control
     /// frames the underlying transport surfaces.
     pub async fn recv_raw(&mut self) -> Result<Vec<u8>, NetError> {
-        loop {
+        if self.lost {
+            return Err(Self::already_lost());
+        }
+        let failure = loop {
             let Ok(next) = tokio::time::timeout(self.request_timeout, self.ws.next()).await else {
-                return Err(self.timed_out());
+                break self.timed_out();
             };
             match next {
                 Some(Ok(WsMessage::Binary(b))) => return Ok(b),
                 Some(Ok(_)) => continue,
-                Some(Err(e)) => return Err(NetError::Connection(format!("connection error: {e}"))),
-                None => return Err(NetError::Connection("connection closed".to_string())),
+                Some(Err(e)) => break NetError::Connection(format!("connection error: {e}")),
+                None => break NetError::Connection("connection closed".to_string()),
             }
-        }
+        };
+        self.lost = true;
+        Err(failure)
     }
 
     /// DRA-0052 (`docs/DELIVERY_FAILURE_FINDINGS.md`): if the server

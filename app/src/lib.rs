@@ -488,6 +488,18 @@ pub async fn replenish_prekeys_if_low(
     Ok(true)
 }
 
+/// DRA-0065: refuse before encrypting on a connection that has already
+/// failed. Every ratchet send commits its chain position before sending
+/// (DRA-0059), so each attempt on a dead connection used one up for
+/// nothing; past the recipient's `max_skip` the recipient could no longer
+/// decrypt anything from this side in the conversation.
+fn ensure_connection_usable(conn: &Connection) -> Result<()> {
+    if conn.is_lost() {
+        return Err(Error::Connection("connection already lost".to_string()));
+    }
+    Ok(())
+}
+
 /// Send this side's current `username#NNNN` (§6.1's `ProfileAnnounce`,
 /// `MESSAGE_SCHEMA.md`) to one already-Verified contact. Purely a
 /// display-label update — see `ProfileAnnounce`'s doc for why this never
@@ -504,6 +516,7 @@ pub async fn announce_profile(
     let conv_id = conversation_id_for(account, contact);
     let mut ratchet = db.load_ratchet(conv_id)?.ok_or(Error::NoSession)?;
 
+    ensure_connection_usable(conn)?;
     let envelope = ratchet.encrypt_payload(
         PAYLOAD_PROFILE_ANNOUNCE,
         &ProfileAnnounce {
@@ -956,6 +969,22 @@ async fn transmit_chat(
         piggyback_ack,
         message_id: message.id.clone(),
     };
+
+    // DRA-0065: the connection already failed, so this attempt can't
+    // reach the server. Keep the message flagged for retry, exactly as an
+    // offline send is kept (DRA-0062), without encrypting it -- encrypting
+    // would use up a chain position for nothing.
+    if conn.is_lost() {
+        if contact.verification_state != VerificationState::Verified {
+            return Err(dratchet_store::Error::NotVerified.into());
+        }
+        message.retry_reason = Some(RetryReason::SendFailed);
+        db.save_message(conv_id, &message)?;
+        return Err(Error::NotSent {
+            message: Box::new(message),
+            cause: Box::new(Error::Connection("connection already lost".to_string())),
+        });
+    }
 
     // Nothing is saved if this refuses (an unverified contact): same as
     // before DRA-0060, a gated send leaves no trace.
@@ -1545,6 +1574,7 @@ pub async fn announce_routing_id(
     let conv_id = conversation_id_for(account, contact);
     let mut ratchet = db.load_ratchet(conv_id)?.ok_or(Error::NoSession)?;
 
+    ensure_connection_usable(conn)?;
     let envelope = ratchet.encrypt_payload(
         PAYLOAD_ROUTING_ID_ANNOUNCE,
         &RoutingIdAnnounce { routing_id }.encode(),
@@ -1594,6 +1624,7 @@ pub async fn announce_wipe_policy(
     updated.wipe_include_session = include_session;
     db.save_contact(&updated)?;
 
+    ensure_connection_usable(conn)?;
     let envelope = ratchet.encrypt_payload(
         PAYLOAD_CONVERSATION_WIPE_POLICY_ANNOUNCE,
         &ConversationWipePolicyAnnounce {
@@ -1714,6 +1745,7 @@ pub async fn request_conversation_wipe(
 
     let include_session = contact.effective_wipe_include_session();
     let content = ConversationWipeRequestContent { include_session }.encode();
+    ensure_connection_usable(conn)?;
     let envelope = ratchet.encrypt_payload(PAYLOAD_CONVERSATION_WIPE_REQUEST, &content)?;
     // DRA-0059: commit the ratchet advance *before* the envelope leaves,
     // so a retry after a lost Ack encrypts at a fresh chain position
