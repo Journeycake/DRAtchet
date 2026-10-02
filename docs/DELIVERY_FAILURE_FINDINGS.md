@@ -103,7 +103,7 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0059 | High | `app/src/lib.rs:817 (send_message) and the five other ratchet senders (announce_profile, receive_pending's DeliveryAck, announce_routing_id, announce_wipe_policy, request_conversation_wipe)` | [`041d25d`](https://github.com/Journeycake/dratchet/commit/041d25dff0257988035ec8dd6f82e136ddcf4612) | this doc |
 | DRA-0060 | Medium | `app/src/lib.rs:830 (send_message, retry_message, transmit_chat); store/src/messages.rs:373 (save_received_chat); core/src/payload.rs (ChatContent::message_id); ui (Retry button)` | [`07ee985`](https://github.com/Journeycake/dratchet/commit/07ee985cee52a1822f602469d29f10d1a2e4f512) | this doc |
 | DRA-0061 | Medium | `client/src/net.rs:62 (REQUEST_TIMEOUT; Connection::send, Connection::recv_raw)` | [`4cf0f3a`](https://github.com/Journeycake/dratchet/commit/4cf0f3add2925232227c71f4a4e5ec5f92417f41) | this doc |
-| DRA-0062 | Low | `ui/src-tauri/src/lib.rs:652 (connect_at_startup; AppState::conn as Option; connected; poll_loop); app/src/lib.rs:847 (save_unsent_message)` | this commit | this doc |
+| DRA-0062 | Low | `ui/src-tauri/src/lib.rs:652 (connect_at_startup; AppState::conn as Option; connected; poll_loop); app/src/lib.rs:847 (save_unsent_message)` | [`c9fe0a3`](https://github.com/Journeycake/dratchet/commit/c9fe0a32e3fba2cc6268f949ad6a91cc8c3a49d4) | this doc |
 
 
 ## Summary
@@ -4270,7 +4270,7 @@ Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D w
 
 ## DRA-0062: the desktop app could not be opened while the server was unreachable (confirmed real, fixed) — **LOW**
 
-> **DRA-0062** · Location: `ui/src-tauri/src/lib.rs:652 (connect_at_startup; AppState::conn as Option; connected; poll_loop); app/src/lib.rs:847 (save_unsent_message)` · Fix: this commit
+> **DRA-0062** · Location: `ui/src-tauri/src/lib.rs:652 (connect_at_startup; AppState::conn as Option; connected; poll_loop); app/src/lib.rs:847 (save_unsent_message)` · Fix: [`c9fe0a3`](https://github.com/Journeycake/dratchet/commit/c9fe0a32e3fba2cc6268f949ad6a91cc8c3a49d4)
 
 `run()` connected to the server once, before the window opened, and on failure called `panic!("connect to … (is dratchetd running?)")`. With the server down or the network unavailable at launch, the app exited at once. The user couldn't read their own locally stored history, and couldn't write anything to send later.
 
