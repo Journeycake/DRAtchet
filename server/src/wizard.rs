@@ -30,7 +30,22 @@ pub struct WizardAnswers {
     pub resource_tier: ResourceTier,
     pub ingress: Option<IngressAnswers>,
     pub pod_disruption_budget: bool,
+    /// `docs/adr/0001`: the chart's `mailPersistence.enabled`. Defaults to
+    /// on, as the chart does, so answer files written before this existed
+    /// still render.
+    #[serde(default = "default_true")]
+    pub mail_persistence: bool,
 }
+
+fn default_true() -> bool {
+    true
+}
+
+/// Shown, in bold red, when mail persistence is ticked: the same warning
+/// the chart renders when `replicaCount` is above 1 with persistence on.
+pub const MAIL_PERSISTENCE_WARNING: &str = "WARNING: with mail persistence on, the mail store's \
+volumes are ReadWriteOnce and its index admits one process, so only one replica can start. \
+Keep replicaCount at 1, or turn mail persistence off.";
 
 impl Default for WizardAnswers {
     fn default() -> Self {
@@ -43,6 +58,7 @@ impl Default for WizardAnswers {
             resource_tier: ResourceTier::Dev,
             ingress: None,
             pod_disruption_budget: false,
+            mail_persistence: true,
         }
     }
 }
@@ -172,6 +188,9 @@ pub fn render_values_override(answers: &WizardAnswers) -> String {
         out.push_str("podDisruptionBudget:\n");
         out.push_str("  enabled: true\n\n");
     }
+
+    out.push_str("mailPersistence:\n");
+    out.push_str(&format!("  enabled: {}\n\n", answers.mail_persistence));
 
     out
 }
@@ -320,6 +339,24 @@ pub fn collect_answers_interactive() -> WizardAnswers {
         None
     };
 
+    let mail_persistence = Confirm::with_theme(&theme)
+        .with_prompt(
+            "Save queued mail to disk (mail persistence; an encrypted, fragmented store on \
+             PersistentVolumeClaims)?",
+        )
+        .default(true)
+        .interact()
+        .expect("terminal input");
+    if mail_persistence {
+        eprintln!(
+            "{}",
+            console::style(MAIL_PERSISTENCE_WARNING)
+                .red()
+                .bold()
+                .force_styling(true)
+        );
+    }
+
     let pod_disruption_budget = replica_count > 1
         && Confirm::with_theme(&theme)
             .with_prompt("Enable a PodDisruptionBudget (minAvailable: 1)?")
@@ -336,6 +373,7 @@ pub fn collect_answers_interactive() -> WizardAnswers {
         resource_tier,
         ingress,
         pod_disruption_budget,
+        mail_persistence,
     }
 }
 
@@ -438,6 +476,37 @@ mod tests {
         assert!(rendered.contains("memory: 8Gi\n"));
     }
 
+    #[test]
+    fn mail_persistence_is_written_explicitly_and_defaults_on() {
+        assert!(render_values_override(&WizardAnswers::default())
+            .contains("mailPersistence:\n  enabled: true"));
+        let off = WizardAnswers {
+            mail_persistence: false,
+            ..WizardAnswers::default()
+        };
+        assert!(render_values_override(&off).contains("mailPersistence:\n  enabled: false"));
+        // An answer file from before the question existed still parses.
+        let old: WizardAnswers = serde_json::from_str(
+            r#"{"service_port":8787,"log_level":"info","image_repository":"r",
+                "image_tag":"t","replica_count":1,"resource_tier":"Dev",
+                "ingress":null,"pod_disruption_budget":false}"#,
+        )
+        .unwrap();
+        assert!(old.mail_persistence);
+    }
+
+    #[test]
+    fn the_persistence_warning_renders_bold_red() {
+        let styled = console::style(MAIL_PERSISTENCE_WARNING)
+            .red()
+            .bold()
+            .force_styling(true)
+            .to_string();
+        assert!(styled.contains("\u{1b}[31m"), "red: {styled:?}");
+        assert!(styled.contains("\u{1b}[1m"), "bold: {styled:?}");
+        assert!(styled.contains("only one replica can start"));
+    }
+
     /// Schema-drift guard: every dotted key path this module ever writes is
     /// confirmed present as a real key somewhere in the chart's own
     /// `values.yaml`, so the wizard can't silently diverge from the
@@ -470,6 +539,7 @@ mod tests {
             "tls:",
             "secretName:",
             "podDisruptionBudget:",
+            "mailPersistence:",
         ];
         for key in keys {
             assert!(
