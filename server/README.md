@@ -94,16 +94,24 @@ mid-frame.
 
 ### Configuration
 
-The service takes two settings — it still has no secrets to configure,
-and no schema/migrations, but the directory (below) does need a path.
-Everything else about its behavior (auth, TTLs, frame limits) is fixed by
-the protocol itself, not tunable at deploy time.
+Settings come from, in increasing order of precedence: the defaults, a
+`dratchet.cfg` file (TOML; read from the working directory, or the path in
+`--config` / `DRATCHETD_CONFIG`), environment variables, and command-line
+flags. An unknown key in `dratchet.cfg` is an error, so a mistyped setting
+can't be silently ignored. `server/dratchet.cfg.example` lists every key.
 
-| Setting | Flag | Environment variable | Default |
-|---|---|---|---|
-| Bind address | `--bind <addr>` | `DRATCHETD_BIND` | `127.0.0.1:8787` |
-| Directory database path | `--directory-db <path>` | `DRATCHETD_DIRECTORY_DB` | `dratchetd-directory.redb` |
-| Trusted reverse proxies (CIDRs) | `--trusted-proxies <list>` | `DRATCHETD_TRUSTED_PROXIES` | empty (use the TCP peer address) |
+| Setting | `dratchet.cfg` key | Flag | Environment variable | Default |
+|---|---|---|---|---|
+| Bind address | `bind` | `--bind` | `DRATCHETD_BIND` | `127.0.0.1:8787` |
+| Directory database path | `directory_db` | `--directory-db` | `DRATCHETD_DIRECTORY_DB` | `dratchetd-directory.redb` |
+| Trusted reverse proxies (CIDRs) | `trusted_proxies` | `--trusted-proxies` | `DRATCHETD_TRUSTED_PROXIES` | empty (use the TCP peer address) |
+| Save queued mail to disk | `persist_mailboxes` | `--persist-mailboxes` | `DRATCHETD_PERSIST_MAILBOXES` | off; on below 2 GB of usable memory |
+| Fragment directories (two or more) | `fragment_dirs` | `--fragment-dir` (repeat) | `DRATCHETD_FRAGMENT_DIRS` (comma-separated) | none |
+| Mail store index | `mailbox_index_db` | `--mailbox-index-db` | `DRATCHETD_MAILBOX_INDEX_DB` | `dratchetd-mailbox-index.redb` |
+| Seconds between saves (0–15) | `flush_interval` | `--flush-interval` | `DRATCHETD_FLUSH_INTERVAL` | `10` |
+| Bytes of unsaved mail held in memory | `memory_limit` | `--memory-limit` | `DRATCHETD_MEMORY_LIMIT` | a tenth of usable memory |
+| Mail store key file | `mailbox_key_file` | `--mailbox-key-file` | `DRATCHETD_MAILBOX_KEY_FILE` | none |
+| Mail store key itself | never in the file | — | `DRATCHETD_MAILBOX_KEY` | none |
 
 ```sh
 # Listen on all interfaces, a non-default port, via the flag:
@@ -113,15 +121,51 @@ the protocol itself, not tunable at deploy time.
 DRATCHETD_BIND=0.0.0.0:8787 ./target/release/dratchetd
 ```
 
-The directory database (`username#NNNN` → prekey bundle) is the one piece
-of durable state this service keeps — everything else (presence, Tier 1
-mailboxes, rate-limit buckets) stays in-memory-only by design (§1.3/§1.4
-of `docs/SERVERS.md`). Point `--directory-db` at a path on storage that
-actually survives a restart; the default (a file in the working
-directory) does not survive a container recreate. Without durable
-storage behind it, a restart forgets every registration and reopens the
-squatting window `docs/ARCHITECTURE.md` §6.1 describes — the client-side
-mitigation there narrows that window but doesn't close it on its own.
+The directory database (`username#NNNN` → prekey bundle) is durable
+state. Point `--directory-db` at a path on storage that actually survives
+a restart; the default (a file in the working directory) does not survive
+a container recreate. Without durable storage behind it, a restart forgets
+every registration and reopens the squatting window
+`docs/ARCHITECTURE.md` §6.1 describes.
+
+#### Queued mail: in memory, or saved to disk (`docs/adr/0001`)
+
+By default, queued mail lives only in memory: a seized disk holds no mail,
+and a restart loses whatever was waiting. Clients detect that through the
+**Server Epoch** sent when they connect, and offer to resend anything not
+yet delivered.
+
+With `persist_mailboxes` on, each queued message is encrypted with the
+mail store key into a Sealed Message and split into Fragments, one per
+fragment directory, in files named by random UUIDs. An encrypted index
+holds which Fragments make up which message and each message's SHA-256.
+Put the fragment directories on different volumes where you can: someone
+holding only one of them holds no complete message. In this mode:
+
+- A sender's single checkmark waits until its message is on disk. Saves
+  run every `flush_interval` seconds, and immediately once unsaved mail
+  reaches half of `memory_limit`. Clients are told the interval and wait
+  that much longer for the checkmark.
+- When memory holds `memory_limit` bytes of unsaved mail, new writes are
+  refused without saying why.
+- A clean shutdown (SIGTERM or Ctrl-C) makes a last save and records it;
+  the next start keeps the same Server Epoch. A start without that record,
+  a message that can't be rebuilt intact, or a store that can't be opened
+  with the configured key starts a new epoch, so senders are offered Retry.
+- Starting with a different key discards the old store. Changing the key
+  without losing queued mail is planned for v1.5.
+
+Persistence refuses to start without a key (64 hex characters; a key file
+must be readable only by its owner) and at least two different fragment
+directories, and says everything that is missing at once. Below 2 GB of
+usable memory it is on by default, so a small host needs either both, or
+`persist_mailboxes = false` set explicitly. "Usable memory" is the smaller
+of total RAM and the container's memory limit.
+
+```sh
+# Generate a key file:
+umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > /etc/dratchetd/mailbox.key
+```
 
 Run `./target/release/dratchetd --help` for the auto-generated usage text.
 

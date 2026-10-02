@@ -181,7 +181,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         FrameTag::AuthChallenge,
         &AuthChallenge {
             nonce: nonce.to_vec(),
-            server_boot_id: state.boot_id.to_vec(),
+            server_boot_id: state.epoch_wire_id(),
+            server_epoch: state.epoch.read().expect("epoch lock").number,
+            save_interval_ms: state.save_interval.as_millis().min(u32::MAX as u128) as u32,
         },
     ));
 
@@ -447,12 +449,13 @@ async fn dispatch(
                 .as_slice()
                 .try_into()
                 .map_err(|_| Error::MalformedFrame("mailbox_id must be 16 bytes"))?;
-            let entry = MailboxEntry {
-                entry_id: random_16(),
-                envelope: req.envelope,
-                expires_at: std::time::SystemTime::now() + crate::state::ttl_from_secs(req.ttl),
-                written_by: writer,
-            };
+            let mut entry = MailboxEntry::new(
+                req.envelope,
+                std::time::SystemTime::now() + crate::state::ttl_from_secs(req.ttl),
+                writer,
+            );
+            let entry_id = entry.entry_id;
+            let len = entry.envelope.len() as u64;
             let mut inner = state.inner.write().await;
             // DRA-0018: originating a brand-new mailbox id costs a token;
             // writing into one that already exists (the overwhelming
@@ -479,8 +482,47 @@ async fn dispatch(
             if writer_entries >= crate::state::MAX_ENTRIES_PER_WRITER_PER_MAILBOX {
                 return Err(Error::WriterQuotaExceeded);
             }
-            entries.push(entry);
+            // `docs/adr/0001`: memory holds only unsaved mail, up to
+            // `memory_limit`. The running total can overcount (removals
+            // elsewhere don't update it), so it's recounted before refusing.
+            if inner.memory_bytes + len > state.memory_limit
+                && inner.recount_memory() + len > state.memory_limit
+            {
+                return Err(Error::WriteRefused);
+            }
+            entry.flush_seq = inner.next_flush_seq;
+            let flush_seq = entry.flush_seq;
+            inner
+                .mailboxes
+                .get_mut(&mailbox_id)
+                .expect("created above")
+                .push(entry);
+            inner.memory_bytes += len;
+            let half_full = inner.memory_bytes * 2 >= state.memory_limit;
             drop(inner);
+
+            // `docs/adr/0001`: with persistence on, the single checkmark
+            // means "on disk", so the Ack waits for the save that covers
+            // this entry.
+            if state.mail_store.is_some() {
+                if state.save_interval.is_zero() || half_full {
+                    state.flush_notify.notify_one();
+                }
+                let mut saved = state.flushed.subscribe();
+                let was_saved = tokio::time::timeout(
+                    state.save_interval + std::time::Duration::from_secs(10),
+                    saved.wait_for(|done| *done >= flush_seq),
+                )
+                .await
+                .is_ok_and(|r| r.is_ok());
+                if !was_saved {
+                    let mut inner = state.inner.write().await;
+                    if let Some(entries) = inner.mailboxes.get_mut(&mailbox_id) {
+                        entries.retain(|e| e.entry_id != entry_id || e.saved);
+                    }
+                    return Err(Error::WriteRefused);
+                }
+            }
             let _ = tx.try_send(encode(FrameTag::Ack, &Ack { ok: true }));
             Ok(())
         }
@@ -513,7 +555,8 @@ async fn dispatch(
             // limiter exists to bound. A fetch of a mailbox that doesn't
             // exist now simply returns nothing, which is what it always
             // reported anyway.
-            let wire_entries: Vec<MailboxEntryWire> = match inner.mailboxes.get_mut(&mailbox_id) {
+            let listed: Vec<(Vec<u8>, Option<Vec<u8>>)> = match inner.mailboxes.get_mut(&mailbox_id)
+            {
                 Some(entries) => {
                     prune_expired(entries);
                     // `ARCHITECTURE.md` §11.1: this mailbox is
@@ -525,15 +568,13 @@ async fn dispatch(
                     entries
                         .iter()
                         .filter(|e| e.written_by != fetcher)
-                        .map(|e| MailboxEntryWire {
-                            entry_id: e.entry_id.to_vec(),
-                            envelope: e.envelope.clone(),
-                        })
+                        .map(|e| (e.entry_id.to_vec(), (!e.saved).then(|| e.envelope.clone())))
                         .collect()
                 }
                 None => Vec::new(),
             };
             drop(inner);
+            let wire_entries = read_saved_envelopes(state, &mailbox_id, listed).await;
             let _ = tx.try_send(encode(
                 FrameTag::MailboxEntries,
                 &MailboxEntries {
@@ -634,6 +675,61 @@ fn mailbox_id_belongs_to_someone_else(
     // key on every call, while holding the global write lock, on a
     // directory that is never pruned.
     inner.bootstrap_mailbox_belongs_to_another(mailbox_id, caller)
+}
+
+/// `docs/adr/0001`: fill in the envelopes of saved entries from the mail
+/// store. An entry that no longer reads back intact is lost: it's dropped,
+/// and the Server Epoch advances so its sender is offered Retry on their
+/// next connection.
+async fn read_saved_envelopes(
+    state: &Arc<AppState>,
+    mailbox_id: &[u8; 16],
+    listed: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+) -> Vec<MailboxEntryWire> {
+    let Some(store) = state.mail_store.clone() else {
+        return listed
+            .into_iter()
+            .filter_map(|(entry_id, envelope)| {
+                envelope.map(|envelope| MailboxEntryWire { entry_id, envelope })
+            })
+            .collect();
+    };
+    let (wire, lost) = tokio::task::spawn_blocking(move || {
+        let mut wire = Vec::new();
+        let mut lost = Vec::new();
+        for (entry_id, envelope) in listed {
+            match envelope {
+                Some(envelope) => wire.push(MailboxEntryWire { entry_id, envelope }),
+                None => {
+                    let id: [u8; 16] = entry_id.as_slice().try_into().expect("16-byte id");
+                    match store.read_envelope(&id) {
+                        Ok(envelope) => wire.push(MailboxEntryWire { entry_id, envelope }),
+                        Err(e) => {
+                            tracing::error!("mail store: a saved entry was lost: {e}");
+                            lost.push(id);
+                        }
+                    }
+                }
+            }
+        }
+        (wire, lost)
+    })
+    .await
+    .expect("mail store read task panicked");
+    if !lost.is_empty() {
+        let mut inner = state.inner.write().await;
+        if let Some(entries) = inner.mailboxes.get_mut(mailbox_id) {
+            entries.retain(|e| !lost.contains(&e.entry_id));
+        }
+        drop(inner);
+        if let Some(store) = &state.mail_store {
+            match store.advance_epoch() {
+                Ok(epoch) => *state.epoch.write().expect("epoch lock") = epoch,
+                Err(e) => tracing::error!("mail store: could not advance the epoch: {e}"),
+            }
+        }
+    }
+    wire
 }
 
 async fn publish_bundle(state: &Arc<AppState>, wire: PrekeyBundleWire) -> Result<()> {

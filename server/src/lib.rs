@@ -6,7 +6,10 @@
 
 pub mod abuse;
 pub mod address;
+pub mod config;
 pub mod error;
+pub mod flush;
+pub mod mailstore;
 pub mod persistence;
 pub mod protocol;
 pub mod pruning;
@@ -57,4 +60,28 @@ pub fn app_with_directory_db(
 
 async fn healthz() -> &'static str {
     "ok"
+}
+
+/// `docs/adr/0001`: like [`app_with_directory_db`] (or [`app`], without a
+/// directory path), with queued mail persisted to an encrypted,
+/// fragmented mail store, which is opened and rebuilt first. Starts the
+/// save task, so it must be called inside a Tokio runtime.
+pub fn app_with_mail_store(
+    directory_db_path: Option<&Path>,
+    mail: &config::MailPersistence,
+    memory_limit: u64,
+) -> Result<(Router, Arc<AppState>), String> {
+    let directory = directory_db_path
+        .map(persistence::Persistence::open)
+        .transpose()
+        .map_err(|e| format!("directory database: {e}"))?;
+    let opened = mailstore::MailStore::open(&mail.index_db, &mail.fragment_dirs, &mail.key)
+        .map_err(|e| e.to_string())?;
+    let state = AppState::with_mail_store(directory, opened, mail.flush_interval, memory_limit);
+    flush::spawn_flusher(state.clone());
+    let router = Router::new()
+        .route("/v1/ws", get(ws::ws_handler))
+        .route("/healthz", get(healthz))
+        .with_state(state.clone());
+    Ok((router, state))
 }
