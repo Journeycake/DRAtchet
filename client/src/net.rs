@@ -71,8 +71,25 @@ pub struct Connection {
 
 impl Connection {
     pub async fn connect(url: &str) -> Result<Self, NetError> {
-        let (ws, _resp) = connect_async(url)
+        Self::connect_with_timeout(url, REQUEST_TIMEOUT).await
+    }
+
+    /// DRA-0068: [`connect`](Self::connect), giving up after `timeout`. A
+    /// server that accepts the TCP connection but never answers (a hung
+    /// process: the kernel still completes the handshake) otherwise left
+    /// the caller waiting indefinitely.
+    pub async fn connect_with_timeout(
+        url: &str,
+        timeout: std::time::Duration,
+    ) -> Result<Self, NetError> {
+        let (ws, _resp) = tokio::time::timeout(timeout, connect_async(url))
             .await
+            .map_err(|_| {
+                NetError::Connection(format!(
+                    "no response from {url} within {}s",
+                    timeout.as_secs_f32()
+                ))
+            })?
             .map_err(|e| NetError::Connection(format!("failed to connect to {url}: {e}")))?;
         Ok(Connection {
             ws,

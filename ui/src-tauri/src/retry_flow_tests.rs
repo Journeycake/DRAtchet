@@ -657,6 +657,22 @@ async fn spawn_slow_link(server_url: &str, delay: Duration) -> String {
     format!("ws://{addr}/v1/ws")
 }
 
+/// Accepts connections and never answers: a hung server process (the
+/// kernel still completes the TCP handshake), or a middlebox swallowing
+/// traffic.
+async fn spawn_silent_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            held.push(socket);
+        }
+    });
+    format!("ws://{addr}/v1/ws")
+}
+
 /// DRA-0067: every command locks the connection, then the account; the
 /// loop's reconnect locked the account, then the connection. Sending while
 /// a reconnect was under way deadlocked the two for good.
@@ -697,4 +713,35 @@ fn sending_while_the_app_is_reconnecting_does_not_deadlock_it() {
         }),
         "and the reconnect still completes"
     );
+}
+
+/// DRA-0068: the reconnect held the account lock while connecting, with no
+/// time limit on the connection attempt. A server that accepts connections
+/// but never answers left every command that needs the account -- reading
+/// a conversation included -- waiting for good.
+#[test]
+fn the_app_stays_usable_while_the_server_accepts_connections_but_never_answers() {
+    let p = on_runtime(async {
+        let url = spawn_server().await;
+        paired(&url, "u6").await
+    });
+    let silent = on_runtime(spawn_silent_server());
+    let fingerprint = hex::encode(&p.alice_contact.fingerprint);
+    let (app, webview) = desktop_app(app_state(p.alice_db, p.alice, None, &silent));
+    tauri::async_runtime::spawn(poll_loop(app.handle().clone()));
+    std::thread::sleep(Duration::from_millis(300));
+
+    let listed = invoke_within(
+        &webview,
+        "list_messages",
+        json!({ "fingerprint": fingerprint }),
+        Duration::from_secs(5),
+    );
+    assert!(
+        listed.is_some(),
+        "VULNERABILITY: while the app tried to reach a server that never answers, it couldn't \
+         even show the user's own conversation -- the reconnect held the account lock with no \
+         time limit"
+    );
+    assert!(listed.unwrap().is_ok());
 }

@@ -109,6 +109,7 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0065 | Medium | `client/src/net.rs:105 (Connection::is_lost); app/src/lib.rs:977 (transmit_chat), app/src/lib.rs:496 (ensure_connection_usable)` | [`9cd43d8`](https://github.com/Journeycake/dratchet/commit/9cd43d812e3862b1ad2e6db0026ae84d2b8b3c4d) | this doc |
 | DRA-0066 | Medium | `app/src/lib.rs:939 (reannounce_routing_id_if_unconfirmed), app/src/lib.rs:1161 (receive_pending confirms the switch), app/src/lib.rs:1648 (announce_routing_id keeps the envelope); store/src/contacts.rs:106 (Contact::routing_confirmed, routing_announce)` | [`d739e0f`](https://github.com/Journeycake/dratchet/commit/d739e0f7d688b6c4cc0fa0c1037400b205318f32) | this doc |
 | DRA-0067 | Medium | `ui/src-tauri/src/lib.rs:821 (poll_loop reconnect)` | [`bc8e05b`](https://github.com/Journeycake/dratchet/commit/bc8e05b4e85ca4fa6e09929be07c26fd46c58009) | this doc |
+| DRA-0068 | Medium | `client/src/net.rs:81 (Connection::connect_with_timeout); ui/src-tauri/src/lib.rs:833 (poll_loop reconnect)` | pending | this doc |
 
 
 ## Summary
@@ -4454,4 +4455,31 @@ Validation: `ui/src-tauri` `cargo fmt --check`, `cargo clippy --all-targets -- -
 
 - **Commands still wait while a reconnect holds the account lock.** That includes connecting itself, with no time limit on the attempt (DRA-0068).
 - **The order is a convention, not enforced.** A future code path that holds the account lock while waiting for the connection lock would bring it back. One lock around both would rule that out, at the cost of serializing reads behind the network.
+
+## DRA-0068: a server that accepted connections but never answered froze the desktop app (DRA-0061's residual, extended to connecting; confirmed real, fixed) — **MEDIUM**
+
+> **DRA-0068** · Location: `client/src/net.rs:81 (Connection::connect_with_timeout); ui/src-tauri/src/lib.rs:833 (poll_loop reconnect)` · Fix: pending
+
+DRA-0061 put a time limit on every send and every wait for a reply, but not on connecting. `Connection::connect` waited for the WebSocket handshake indefinitely. The desktop app's reconnect also connected while holding the account lock, which every command that touches the account needs, including reading a conversation.
+
+So against a server that accepts the TCP connection but never answers, the reconnect never ended, and the app couldn't even show the user's own history. A hung `dratchetd` process does exactly this: the kernel still completes the TCP handshake. So does a middlebox that swallows traffic, or an on-path attacker. Against a host that drops packets, the operating system gives up after about two minutes, so the app froze for that long on every attempt.
+
+Rated **Medium**, as DRA-0061 is: anyone able to make the server address accept and stay silent can freeze the client indefinitely.
+
+### Confirmation
+
+- `ui/src-tauri/src/retry_flow_tests.rs`, `the_app_stays_usable_while_the_server_accepts_connections_but_never_answers`. It runs the real `poll_loop` and commands on the mock runtime, against a listener that accepts and never answers, and asks to show a conversation 300 ms in. Before the fix the command never answered within 5 seconds and the test failed with its `VULNERABILITY:` assertion. It still fails with only the lock change reverted and the time limit kept, because the limit (20 s) is longer than the test allows.
+- `client/tests/connect_timeout.rs`, `connecting_to_a_server_that_never_answers_gives_up`. With only the new time limit disabled, the attempt was still waiting after 10 seconds, and the test failed with its `VULNERABILITY:` assertion.
+
+### Fixed
+
+- **Connecting has a time limit.** `Connection::connect` gives up after `REQUEST_TIMEOUT` (20 s). `connect_with_timeout` takes another limit.
+- **No lock is held while connecting.** The background loop now connects first, then takes the account lock only to authenticate and reconcile on the established connection (`authenticate_and_reconcile`, split out of `connect_authenticate_and_reconcile`).
+
+Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (344 passed). `ui/src-tauri` fmt, clippy and `cargo test` (22 passed). `npm run check` (0 errors, 0 warnings).
+
+### Known residual scope
+
+- **Authenticating still holds the account lock.** A server that completes the WebSocket handshake and then goes silent makes commands that need the account wait up to `REQUEST_TIMEOUT` per step. That's bounded, but noticeable.
+- **20 seconds is a constant**, as in DRA-0061.
 

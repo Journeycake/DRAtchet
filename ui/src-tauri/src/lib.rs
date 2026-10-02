@@ -674,7 +674,19 @@ async fn connect_authenticate_and_reconcile(
     db: &Db,
     account: &mut Account,
 ) -> Result<(Connection, Option<OwnDiscriminatorChangeNoticeDto>), String> {
-    let mut conn = Connection::connect(url).await?;
+    let conn = Connection::connect(url).await?;
+    authenticate_and_reconcile(conn, db, account).await
+}
+
+/// The part of [`connect_authenticate_and_reconcile`] that needs the
+/// account, for a connection already established. `poll_loop` connects
+/// first, with no lock held (DRA-0068), and only then takes the account
+/// lock for this.
+async fn authenticate_and_reconcile(
+    mut conn: Connection,
+    db: &Db,
+    account: &mut Account,
+) -> Result<(Connection, Option<OwnDiscriminatorChangeNoticeDto>), String> {
     conn.authenticate(account).await?;
     // DRA-0064: before anything is sent on this connection -- a changed
     // server boot id means the server restarted and lost every queued
@@ -818,9 +830,18 @@ async fn poll_loop<R: Runtime>(app_handle: AppHandle<R>) {
             if std::time::Instant::now() < due {
                 continue;
             }
-            let reconnected = {
-                let mut account = state.account.lock().await;
-                connect_authenticate_and_reconcile(&state.server_url, &state.db, &mut account).await
+            // DRA-0068: the connection is established before the account
+            // lock is taken, and gives up after `REQUEST_TIMEOUT`. Holding
+            // the lock across an unbounded connect left every command that
+            // needs the account -- even showing a conversation -- waiting
+            // for as long as the server accepted connections without
+            // answering.
+            let reconnected = match Connection::connect(&state.server_url).await {
+                Ok(conn) => {
+                    let mut account = state.account.lock().await;
+                    authenticate_and_reconcile(conn, &state.db, &mut account).await
+                }
+                Err(e) => Err(e.to_string()),
             };
             match reconnected {
                 Ok((new_conn, notice)) => {
