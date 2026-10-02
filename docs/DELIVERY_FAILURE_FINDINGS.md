@@ -106,7 +106,7 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0062 | Low | `ui/src-tauri/src/lib.rs:652 (connect_at_startup; AppState::conn as Option; connected; poll_loop); app/src/lib.rs:847 (save_unsent_message)` | [`c9fe0a3`](https://github.com/Journeycake/dratchet/commit/c9fe0a32e3fba2cc6268f949ad6a91cc8c3a49d4) | this doc |
 | DRA-0063 | Medium | `app/src/lib.rs:73 (mark_expired_sends); store/src/messages.rs:570 (Db::mark_expired_sends, Message::last_sent_at); ui/src-tauri poll_loop` | [`38c3c6f`](https://github.com/Journeycake/dratchet/commit/38c3c6f1e5137b9543779b231d866b12d2516e71) | this doc |
 | DRA-0064 | Medium | `app/src/lib.rs:76 (note_server_boot); server/src/protocol.rs (AuthChallenge::server_boot_id); server/src/state.rs (AppState::boot_id); store/src/messages.rs (mark_unconfirmed_lost_in_restart)` | [`e7c69fd`](https://github.com/Journeycake/dratchet/commit/e7c69fd0fcd27d6a7e7e7909c53e65f494af24bd) | this doc |
-| DRA-0065 | Medium | `client/src/net.rs:105 (Connection::is_lost); app/src/lib.rs:977 (transmit_chat), app/src/lib.rs:496 (ensure_connection_usable)` | pending | this doc |
+| DRA-0065 | Medium | `client/src/net.rs:105 (Connection::is_lost); app/src/lib.rs:977 (transmit_chat), app/src/lib.rs:496 (ensure_connection_usable)` | [`9cd43d8`](https://github.com/Journeycake/dratchet/commit/9cd43d812e3862b1ad2e6db0026ae84d2b8b3c4d) | this doc |
 
 
 ## Summary
@@ -4358,7 +4358,7 @@ Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D w
 
 ## DRA-0065: repeated send attempts on a dead connection permanently broke the conversation for the recipient (found closing the retry test gaps; confirmed real, fixed) — **MEDIUM**
 
-> **DRA-0065** · Location: `client/src/net.rs:105 (Connection::is_lost); app/src/lib.rs:977 (transmit_chat), app/src/lib.rs:496 (ensure_connection_usable)` · Fix: pending
+> **DRA-0065** · Location: `client/src/net.rs:105 (Connection::is_lost); app/src/lib.rs:977 (transmit_chat), app/src/lib.rs:496 (ensure_connection_usable)` · Fix: [`9cd43d8`](https://github.com/Journeycake/dratchet/commit/9cd43d812e3862b1ad2e6db0026ae84d2b8b3c4d)
 
 DRA-0059 made every ratchet send commit its chain position before the envelope goes out, so a failed attempt is never retried under the same key. The cost is one used-up position per failed attempt, which the recipient skips over when the next message arrives. The recipient skips at most `max_skip` positions (`DEFAULT_MAX_SKIP`, 100) in one go.
 
