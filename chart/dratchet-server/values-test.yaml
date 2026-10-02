@@ -34,6 +34,11 @@ resources:
     cpu: 250m
     memory: 128Mi
 
+# A throwaway test cluster may have no storage provisioner: keep queued mail
+# on emptyDir volumes (lost when the pod is replaced) with a generated key.
+mailPersistence:
+  ephemeral: true
+
 # A single-pod smoke test has no meaningful "unavailable during rollout"
 # window to protect, and a short grace period gets a stuck test deploy out
 # of the way faster than the chart's production default (30s).

@@ -1,3 +1,4 @@
+{{- include "dratchet-server.validateMailPersistence" . }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -9,12 +10,25 @@ spec:
   # values.yaml's replicaCount comment explains why this chart defaults to
   # (and expects) exactly 1 — dratchetd's state is in-memory and per-pod,
   # not shared. Proceeding anyway; make sure that's actually intentional.
+  {{- if and .Values.mailPersistence.enabled (not .Values.mailPersistence.ephemeral) }}
+  # WARNING (docs/adr/0001): with mailPersistence on, the mail store's
+  # volumes are ReadWriteOnce and its index admits one process, so only one
+  # of these replicas can start. Set replicaCount: 1, or turn
+  # mailPersistence off or ephemeral.
+  {{- end }}
   {{- end }}
   replicas: {{ .Values.replicaCount }}
   selector:
     matchLabels:
       {{- include "dratchet-server.selectorLabels" . | nindent 6 }}
   strategy:
+    {{- if and .Values.mailPersistence.enabled (not .Values.mailPersistence.ephemeral) }}
+    # docs/adr/0001: the mail store's volumes are ReadWriteOnce and its
+    # index admits one process at a time, so the old pod must stop (making
+    # its final save) before the new one starts. A rolling update would
+    # leave the new pod unable to open the store.
+    type: Recreate
+    {{- else }}
     # A rolling update on a stateful-per-pod, long-lived-WebSocket service
     # should bring the replacement up before tearing the old one down, and
     # never take down more than one at a time (relevant even at
@@ -25,6 +39,7 @@ spec:
     rollingUpdate:
       maxUnavailable: 0
       maxSurge: 1
+    {{- end }}
   template:
     metadata:
       labels:
@@ -52,6 +67,22 @@ spec:
           envFrom:
             - configMapRef:
                 name: {{ include "dratchet-server.fullname" . }}
+          {{- if .Values.mailPersistence.enabled }}
+          env:
+            # docs/adr/0001: the key comes from a Secret, never the config.
+            - name: DRATCHETD_MAILBOX_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "dratchet-server.mailboxKeySecret" . }}
+                  key: {{ .Values.mailPersistence.key.secretKey }}
+          volumeMounts:
+            {{- range .Values.mailPersistence.fragments }}
+            - name: fragments-{{ .name }}
+              mountPath: {{ include "dratchet-server.mailDataRoot" $ }}/fragments-{{ .name }}
+            {{- end }}
+            - name: mail-index
+              mountPath: {{ include "dratchet-server.mailDataRoot" . }}/mail-index
+          {{- end }}
           livenessProbe:
             httpGet:
               path: /healthz
@@ -70,6 +101,25 @@ spec:
             failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+      {{- if .Values.mailPersistence.enabled }}
+      volumes:
+        {{- range .Values.mailPersistence.fragments }}
+        - name: fragments-{{ .name }}
+          {{- if $.Values.mailPersistence.ephemeral }}
+          emptyDir: {}
+          {{- else }}
+          persistentVolumeClaim:
+            claimName: {{ include "dratchet-server.fullname" $ }}-fragments-{{ .name }}
+          {{- end }}
+        {{- end }}
+        - name: mail-index
+          {{- if .Values.mailPersistence.ephemeral }}
+          emptyDir: {}
+          {{- else }}
+          persistentVolumeClaim:
+            claimName: {{ include "dratchet-server.fullname" . }}-mail-index
+          {{- end }}
+      {{- end }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}

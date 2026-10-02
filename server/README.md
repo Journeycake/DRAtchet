@@ -328,6 +328,14 @@ helm test dratchet
 | `ingress.enabled` | `false` | See the WebSocket-upgrade note in `templates/ingress.yaml` if you enable it — your ingress controller needs WebSocket support and long-enough proxy timeouts for a persistent connection. |
 | `ingress.tls` | `[]` | See [TLS / wss://](#tls--wss) directly below — required to get `wss://` instead of plain `ws://` externally. |
 | `podDisruptionBudget.enabled` | `false` | Off by default since it's only meaningful once you've deliberately decided to run more than one replica. |
+| `mailPersistence.enabled` | `true` | Save queued mail to an encrypted, fragmented store ([Queued mail](#queued-mail-in-memory-or-saved-to-disk-docsadr0001)). Always set explicitly: under this chart's memory limits, dratchetd would otherwise turn it on by itself. With it on, the Deployment uses the `Recreate` strategy, and only one replica can run. |
+| `mailPersistence.flushInterval` | `10` | Seconds between saves, 0–15. |
+| `mailPersistence.memoryLimit` | `""` | Bytes of unsaved mail held in memory; empty is a tenth of the container's memory limit. |
+| `mailPersistence.key.existingSecret` / `.secretKey` | `""` / `key` | A Secret you manage holding the 64-hex-character key. |
+| `mailPersistence.key.generate` | `true` | Without `existingSecret`, generate a key into a chart-owned Secret, reused across upgrades; the key never lives on the fragment volumes. Set `false` to make an install without `existingSecret` fail. |
+| `mailPersistence.fragments` | two 1 Gi volumes, `a` and `b` | One PersistentVolumeClaim per fragment directory (at least two). Use different storage classes where you can, so no single volume holds a complete message. |
+| `mailPersistence.index` | 256 Mi | The PersistentVolumeClaim for the encrypted index. |
+| `mailPersistence.ephemeral` | `false` | emptyDir volumes instead of claims, for clusters without a storage provisioner; queued mail is lost when the pod is replaced. `values-test.yaml` sets it. |
 
 Full reference: [`chart/dratchet-server/values.yaml`](../chart/dratchet-server/values.yaml).
 
