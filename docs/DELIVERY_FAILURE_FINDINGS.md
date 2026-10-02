@@ -102,6 +102,7 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0058 | Medium | `app/src/error.rs:69 (From<NetError>, From<String>); client/src/net.rs:22 (NetError); server/src/protocol.rs:304 (ErrorCode); ui/src-tauri/src/lib.rs (is_connection_error)` | [`73dfc1c`](https://github.com/Journeycake/dratchet/commit/73dfc1cbc9eb71fb0b9a640c216313e7fd4e968b) | this doc |
 | DRA-0059 | High | `app/src/lib.rs:817 (send_message) and the five other ratchet senders (announce_profile, receive_pending's DeliveryAck, announce_routing_id, announce_wipe_policy, request_conversation_wipe)` | [`041d25d`](https://github.com/Journeycake/dratchet/commit/041d25dff0257988035ec8dd6f82e136ddcf4612) | this doc |
 | DRA-0060 | Medium | `app/src/lib.rs:830 (send_message, retry_message, transmit_chat); store/src/messages.rs:373 (save_received_chat); core/src/payload.rs (ChatContent::message_id); ui (Retry button)` | [`07ee985`](https://github.com/Journeycake/dratchet/commit/07ee985cee52a1822f602469d29f10d1a2e4f512) | this doc |
+| DRA-0061 | Medium | `client/src/net.rs:62 (REQUEST_TIMEOUT; Connection::send, Connection::recv_raw)` | this commit | this doc |
 
 
 ## Summary
@@ -4240,4 +4241,29 @@ Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D w
 - **Older senders get no deduplication.** A message from a sender that predates this change carries no id, so a manual resend from an old client still shows twice.
 - **Deduplication scans the conversation.** `save_received_chat` checks every stored message in the conversation for the id: linear in conversation length, the same cost shape as the existing DRA-0012 check.
 - **Not seen in a live window.** The Retry button was type-checked, not viewed in a running Tauri window.
+
+## DRA-0061: a send to a server that stopped answering waited indefinitely, stalling the desktop app (confirmed real, fixed) — **MEDIUM**
+
+> **DRA-0061** · Location: `client/src/net.rs:62 (REQUEST_TIMEOUT; Connection::send, Connection::recv_raw)` · Fix: this commit
+
+Nothing bounded how long `net::Connection` waited, either to send a frame or for the server's reply. If the network stalled without the connection closing (packets silently dropped, a NAT mapping expiring, a server process frozen), a send waited until the operating system gave up on the TCP connection, which can take many minutes. The desktop app holds its connection lock across every exchange, so incoming mail and every other command were blocked for the same time.
+
+Rated **Medium**: availability. Anyone positioned to drop packets on the path can stall a client indefinitely without closing anything.
+
+### Confirmation
+
+`app/tests/stalled_server_does_not_hang_a_send.rs`, `a_send_to_a_server_that_stopped_answering_fails_instead_of_hanging`. A stand-in server authenticates the client, then reads every request and answers none, keeping the connection open. With only the new `recv_raw` timeout removed, the send was still waiting after 10 seconds and the test failed with its `VULNERABILITY:` assertion.
+
+### Fixed
+
+`Connection` bounds every send and every wait for a reply by `REQUEST_TIMEOUT` (20 seconds; `set_request_timeout` overrides it per connection, which the test uses). Every exchange on a `Connection` is request/response, so a healthy server answers well within that.
+
+A timeout is reported as `NetError::Connection`, so the app treats it as a lost connection and the poll loop reconnects. That's deliberate: after a timeout, a late reply could still arrive and be mistaken for the answer to the next request, so the connection can't be reused. With DRA-0060 the timed-out message stays in history, flagged for retry.
+
+Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (331 passed). `ui/src-tauri` `cargo test` (14 passed).
+
+### Known residual scope
+
+- **Not configurable at runtime.** 20 seconds is a constant. A very slow link could time out a send that would have succeeded; the message is then flagged for retry rather than lost.
+- **Push frames could still be misread.** If the server ever sends an unsolicited frame (a presence update) while a request is waiting, `recv` would read it as the reply. That's a separate, pre-existing issue that the timeout doesn't change.
 

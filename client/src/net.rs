@@ -53,8 +53,17 @@ impl From<NetError> for String {
     }
 }
 
+/// DRA-0061: the longest a single send, or a wait for the server's reply,
+/// may take before the connection is treated as lost. Every exchange on a
+/// `Connection` is request/response, so a healthy server answers well
+/// within this; without it, a stalled network (packets dropped, connection
+/// never closed) left a caller waiting until the OS gave up on the socket,
+/// holding whatever lock guarded the connection the whole time.
+pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 pub struct Connection {
     ws: WsStream,
+    request_timeout: std::time::Duration,
 }
 
 impl Connection {
@@ -62,22 +71,43 @@ impl Connection {
         let (ws, _resp) = connect_async(url)
             .await
             .map_err(|e| NetError::Connection(format!("failed to connect to {url}: {e}")))?;
-        Ok(Connection { ws })
+        Ok(Connection {
+            ws,
+            request_timeout: REQUEST_TIMEOUT,
+        })
+    }
+
+    /// Override [`REQUEST_TIMEOUT`] for this connection (tests use a short
+    /// one).
+    pub fn set_request_timeout(&mut self, timeout: std::time::Duration) {
+        self.request_timeout = timeout;
+    }
+
+    fn timed_out(&self) -> NetError {
+        NetError::Connection(format!(
+            "no response from the server within {}s",
+            self.request_timeout.as_secs_f32()
+        ))
     }
 
     pub async fn send<T: Serialize>(&mut self, tag: FrameTag, body: &T) -> Result<(), NetError> {
         let frame = encode(tag, body);
-        self.ws
-            .send(WsMessage::Binary(frame))
+        match tokio::time::timeout(self.request_timeout, self.ws.send(WsMessage::Binary(frame)))
             .await
-            .map_err(|e| NetError::Connection(format!("send failed: {e}")))
+        {
+            Ok(sent) => sent.map_err(|e| NetError::Connection(format!("send failed: {e}"))),
+            Err(_) => Err(self.timed_out()),
+        }
     }
 
     /// Wait for the next binary frame, skipping any non-binary control
     /// frames the underlying transport surfaces.
     pub async fn recv_raw(&mut self) -> Result<Vec<u8>, NetError> {
         loop {
-            match self.ws.next().await {
+            let Ok(next) = tokio::time::timeout(self.request_timeout, self.ws.next()).await else {
+                return Err(self.timed_out());
+            };
+            match next {
                 Some(Ok(WsMessage::Binary(b))) => return Ok(b),
                 Some(Ok(_)) => continue,
                 Some(Err(e)) => return Err(NetError::Connection(format!("connection error: {e}"))),
