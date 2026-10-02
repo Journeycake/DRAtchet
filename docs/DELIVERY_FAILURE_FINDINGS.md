@@ -104,6 +104,7 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0060 | Medium | `app/src/lib.rs:830 (send_message, retry_message, transmit_chat); store/src/messages.rs:373 (save_received_chat); core/src/payload.rs (ChatContent::message_id); ui (Retry button)` | [`07ee985`](https://github.com/Journeycake/dratchet/commit/07ee985cee52a1822f602469d29f10d1a2e4f512) | this doc |
 | DRA-0061 | Medium | `client/src/net.rs:62 (REQUEST_TIMEOUT; Connection::send, Connection::recv_raw)` | [`4cf0f3a`](https://github.com/Journeycake/dratchet/commit/4cf0f3add2925232227c71f4a4e5ec5f92417f41) | this doc |
 | DRA-0062 | Low | `ui/src-tauri/src/lib.rs:652 (connect_at_startup; AppState::conn as Option; connected; poll_loop); app/src/lib.rs:847 (save_unsent_message)` | [`c9fe0a3`](https://github.com/Journeycake/dratchet/commit/c9fe0a32e3fba2cc6268f949ad6a91cc8c3a49d4) | this doc |
+| DRA-0063 | Medium | `app/src/lib.rs:73 (mark_expired_sends); store/src/messages.rs:570 (Db::mark_expired_sends, Message::last_sent_at); ui/src-tauri poll_loop` | this commit | this doc |
 
 
 ## Summary
@@ -4295,4 +4296,32 @@ Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D w
 
 - **Offline messages need a manual retry.** They're kept and flagged, but not sent automatically on reconnect. An automatic resend of `SendFailed` messages after reconnecting would be a small follow-up; it's left manual here so nothing is sent without the user seeing it.
 - **Not run as a real desktop app.** The startup path was tested through `connect_at_startup`, not by launching the Tauri app against a stopped server.
+
+## DRA-0063: a message nobody collected within 14 days expired silently, with no notice or retry for the sender (audit scenario 1; confirmed real, fixed) — **MEDIUM**
+
+> **DRA-0063** · Location: `app/src/lib.rs:73 (mark_expired_sends); store/src/messages.rs:570 (Db::mark_expired_sends, Message::last_sent_at); ui/src-tauri poll_loop` · Fix: this commit
+
+The relay keeps an uncollected message for 14 days (`MAILBOX_TTL_SECS`, `ARCHITECTURE.md` §4.5) and then discards it, telling nobody. Audit scenario 1 recorded this as "silent loss, no signal". `DeliveryAck` shows when a message *was* delivered, but nothing marked one that never would be. The sender's copy stayed "sent, not yet delivered" forever, indistinguishable from one still waiting, and the only way to send it again was to retype it.
+
+Rated **Medium**: silent message loss. Anyone able to keep a recipient offline, or the recipient simply being away, makes it happen without either side knowing.
+
+### Confirmation
+
+`app/tests/expired_sends_are_flagged.rs`, `a_message_undelivered_past_the_mailbox_lifetime_is_flagged_for_retry`. A message the recipient never collects is checked one second before and exactly at the server's expiry point. With only the new flagging step disabled, the test fails with its `VULNERABILITY:` assertion: the message is still shown as merely sent.
+
+### Fixed
+
+- **When the clock starts.** `Message::last_sent_at` records when the server last *accepted* the message, which is when its 14-day lifetime starts (a retry restarts it).
+- **Flagging.** `Db::mark_expired_sends` / `dratchet_app::mark_expired_sends` flag every own message the server accepted but nobody confirmed within `MAILBOX_TTL_SECS + EXPIRY_GRACE_SECS` (one hour of grace for clock differences) as `RetryReason::Expired`.
+- **Desktop app.** The background loop runs the check on its first tick and about once a minute, offline too, and refreshes the UI when it flags anything. The message then reads "Not delivered within 14 days — the server discarded it" with a **Retry** button.
+- **Retry.** Retrying re-encrypts with a fresh key (DRA-0059) under the same message id, so a recipient who somehow already has it doesn't see it twice (DRA-0060).
+- **Late receipts.** A delivery receipt arriving after the flag clears it. That's guarded by `a_late_delivery_receipt_clears_the_expired_flag`, and delivery now clears any retry flag, which also covers DRA-0060's lost-`Ack` case.
+
+Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (334 passed). `ui/src-tauri` fmt, clippy and `cargo test` (16 passed).
+
+### Known residual scope
+
+- **In-app notice only.** It appears in the conversation; there's no operating-system notification. The app's existing notification setting (with its three privacy levels) could carry one.
+- **Messages sent before this change** have no `last_sent_at`, so their creation time is used instead. That's slightly early for anything that was retried, never late.
+- **The check runs on the sender's clock.** A badly wrong device clock flags too early or too late. The one-hour grace only absorbs ordinary drift.
 

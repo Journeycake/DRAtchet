@@ -58,6 +58,27 @@ use dratchet_store::{
 /// (`ARCHITECTURE.md` §4.5's default). Also what DRA-0063 measures an
 /// unconfirmed send against.
 pub const MAILBOX_TTL_SECS: u32 = 14 * 24 * 60 * 60;
+
+/// DRA-0063: extra time allowed past [`MAILBOX_TTL_SECS`] before an
+/// unconfirmed message is declared expired, to absorb a clock difference
+/// between this device and the server.
+pub const EXPIRY_GRACE_SECS: u64 = 60 * 60;
+
+/// DRA-0063: flag every message this side sent that has gone unconfirmed
+/// for longer than the server keeps it ([`MAILBOX_TTL_SECS`] +
+/// [`EXPIRY_GRACE_SECS`]) as `RetryReason::Expired`, across every
+/// conversation, so the sender is told and offered a retry instead of
+/// seeing it as "sent" forever. `now` is a Unix timestamp. Needs no
+/// connection. Returns how many were newly flagged.
+pub fn mark_expired_sends(db: &Db, account: &Account, now: u64) -> Result<usize> {
+    let mut total = 0;
+    for contact in db.list_contacts()? {
+        let conv_id = conversation_id_for(account, &contact);
+        total +=
+            db.mark_expired_sends(conv_id, u64::from(MAILBOX_TTL_SECS), EXPIRY_GRACE_SECS, now)?;
+    }
+    Ok(total)
+}
 use rand_core::{OsRng, RngCore};
 use x25519_dalek::PublicKey;
 
@@ -947,6 +968,8 @@ async fn transmit_chat(
     match sent {
         Ok(()) => {
             message.retry_reason = None;
+            // DRA-0063: the server's mailbox lifetime for it starts now.
+            message.last_sent_at = Some(now_unix());
             db.save_message(conv_id, &message)?;
             Ok(message)
         }

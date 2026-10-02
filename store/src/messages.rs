@@ -115,6 +115,12 @@ pub struct Message {
     /// shown twice. `None` for messages from a sender that predates it.
     #[serde(default, with = "serde_bytes")]
     pub peer_message_id: Option<Vec<u8>>,
+    /// DRA-0063: when the server last accepted this (own) message -- the
+    /// start of the server's mailbox lifetime for it, which a retry
+    /// restarts. `None` for received messages and for sends not yet
+    /// accepted (then `timestamp` stands in).
+    #[serde(default)]
+    pub last_sent_at: Option<u64>,
 }
 
 /// Why one of this side's own messages is offered for a resend.
@@ -154,6 +160,7 @@ impl fmt::Debug for Message {
             .field("uncertain", &self.uncertain)
             .field("retry_reason", &self.retry_reason)
             .field("peer_message_id", &self.peer_message_id.as_deref().map(hex))
+            .field("last_sent_at", &self.last_sent_at)
             .finish()
     }
 }
@@ -264,6 +271,7 @@ impl Db {
             uncertain: false,
             retry_reason: None,
             peer_message_id: None,
+            last_sent_at: None,
         };
         self.save_message(conversation_id, &message)?;
         Ok(message)
@@ -321,6 +329,7 @@ impl Db {
             uncertain: false,
             retry_reason: None,
             peer_message_id: None,
+            last_sent_at: None,
         };
         self.save_message(conversation_id, &message)?;
         Ok(message)
@@ -347,6 +356,7 @@ impl Db {
             uncertain: false,
             retry_reason: Some(RetryReason::SendFailed),
             peer_message_id: None,
+            last_sent_at: None,
         }
     }
 
@@ -493,6 +503,9 @@ impl Db {
         };
         matched.delivered = true;
         matched.uncertain = false;
+        // DRA-0060/0063: delivered after all (a lost Ack, or a receipt
+        // arriving late) -- nothing left to retry.
+        matched.retry_reason = None;
         self.save_message(conversation_id, &matched)?;
         Ok(Some(matched))
     }
@@ -532,6 +545,7 @@ impl Db {
         }) {
             m.delivered = true;
             m.uncertain = false;
+            m.retry_reason = None;
             self.save_message(conversation_id, &m)?;
             newly_delivered.push(m);
         }
@@ -547,6 +561,36 @@ impl Db {
     /// messages were newly marked (already-uncertain or already-delivered
     /// messages are left untouched, so calling this repeatedly across
     /// several short reconnects in a row is harmless).
+    /// DRA-0063: flag as `RetryReason::Expired` every own message the server
+    /// accepted but nobody confirmed receiving within `ttl_secs` (plus
+    /// `grace_secs` for clock differences between this device and the
+    /// server), measured from when it was last accepted. The server has
+    /// discarded such a message by now, so without this the sender saw it
+    /// as merely "sent" forever. Returns how many were newly flagged.
+    pub fn mark_expired_sends(
+        &self,
+        conversation_id: [u8; 16],
+        ttl_secs: u64,
+        grace_secs: u64,
+        now: u64,
+    ) -> Result<usize> {
+        let mut count = 0;
+        for mut m in self.list_messages(conversation_id)? {
+            let sent_at = m.last_sent_at.unwrap_or(m.timestamp);
+            if m.sender_is_local
+                && !m.delivered
+                && m.retry_reason.is_none()
+                && m.send_n.is_some()
+                && now >= sent_at.saturating_add(ttl_secs).saturating_add(grace_secs)
+            {
+                m.retry_reason = Some(RetryReason::Expired);
+                self.save_message(conversation_id, &m)?;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     pub fn mark_undelivered_uncertain(&self, conversation_id: [u8; 16]) -> Result<usize> {
         let messages = self.list_messages(conversation_id)?;
         let mut count = 0;
@@ -667,6 +711,7 @@ mod tests {
             uncertain: false,
             retry_reason: None,
             peer_message_id: None,
+            last_sent_at: None,
         }
     }
 

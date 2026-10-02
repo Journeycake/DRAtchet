@@ -287,6 +287,7 @@ mod tests {
             uncertain: false,
             retry_reason: None,
             peer_message_id: None,
+            last_sent_at: None,
         }
     }
 
@@ -345,6 +346,7 @@ mod tests {
             uncertain: false,
             retry_reason: None,
             peer_message_id: None,
+            last_sent_at: None,
         }
     }
 

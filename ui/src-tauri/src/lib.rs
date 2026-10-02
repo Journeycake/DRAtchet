@@ -46,6 +46,9 @@ const PREKEY_REPLENISH_CHECK_EVERY_N_TICKS: u32 = 30;
 // down server is retried every minute rather than abandoned.
 const RECONNECT_INITIAL_BACKOFF: Duration = POLL_INTERVAL;
 const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// DRA-0063: how often (in poll ticks) to check for sent messages that
+/// expired undelivered -- about once a minute; expiry is measured in days.
+const EXPIRY_CHECK_EVERY_N_TICKS: u32 = 30;
 
 struct AppState {
     db: Db,
@@ -773,6 +776,24 @@ async fn poll_loop(app_handle: AppHandle) {
         let state = app_handle.state::<AppState>();
 
         let mut changed = false;
+        // DRA-0063: needs no connection, so it runs even while offline.
+        if tick_count == 1 || tick_count.is_multiple_of(EXPIRY_CHECK_EVERY_N_TICKS) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let account = state.account.lock().await;
+            match dratchet_app::mark_expired_sends(&state.db, &account, now) {
+                Ok(0) => {}
+                Ok(n) => {
+                    eprintln!("poll: {n} sent message(s) expired undelivered");
+                    // Emitted now, not via `changed`: a pending reconnect
+                    // below `continue`s past the end-of-tick emit.
+                    let _ = app_handle.emit(INBOX_UPDATED_EVENT, ());
+                }
+                Err(e) => eprintln!("poll: mark_expired_sends failed: {e}"),
+            }
+        }
         // DRA-0062: not connected yet (the server was unreachable at
         // launch) -- attempt it now, through the same backoff-gated path a
         // reconnect uses.

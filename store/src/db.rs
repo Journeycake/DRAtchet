@@ -746,6 +746,7 @@ mod tests {
             uncertain: false,
             retry_reason: None,
             peer_message_id: None,
+            last_sent_at: None,
         };
         db.save_message(alice, &message).unwrap();
 
@@ -1145,6 +1146,7 @@ mod tests {
                 uncertain: false,
                 retry_reason: None,
                 peer_message_id: None,
+                last_sent_at: None,
             },
         )
         .unwrap();
@@ -1207,6 +1209,7 @@ mod tests {
                 uncertain: false,
                 retry_reason: None,
                 peer_message_id: None,
+                last_sent_at: None,
             },
         )
         .unwrap();

@@ -77,6 +77,7 @@ fn sample_message(id: u32, timestamp: u64, sequence: u64) -> Message {
         uncertain: false,
         retry_reason: None,
         peer_message_id: None,
+        last_sent_at: None,
     }
 }
 
