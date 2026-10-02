@@ -86,6 +86,8 @@ fn new_contact(fingerprint: Vec<u8>, routing_id: Vec<u8>) -> Contact {
         wipe_boundary_sequence: None,
         peer_wipe_boundary_timestamp: None,
         peer_wipe_boundary_sequence: None,
+        routing_confirmed: false,
+        routing_announce: Vec::new(),
     }
 }
 

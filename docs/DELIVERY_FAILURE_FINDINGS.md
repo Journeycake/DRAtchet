@@ -107,6 +107,7 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0063 | Medium | `app/src/lib.rs:73 (mark_expired_sends); store/src/messages.rs:570 (Db::mark_expired_sends, Message::last_sent_at); ui/src-tauri poll_loop` | [`38c3c6f`](https://github.com/Journeycake/dratchet/commit/38c3c6f1e5137b9543779b231d866b12d2516e71) | this doc |
 | DRA-0064 | Medium | `app/src/lib.rs:76 (note_server_boot); server/src/protocol.rs (AuthChallenge::server_boot_id); server/src/state.rs (AppState::boot_id); store/src/messages.rs (mark_unconfirmed_lost_in_restart)` | [`e7c69fd`](https://github.com/Journeycake/dratchet/commit/e7c69fd0fcd27d6a7e7e7909c53e65f494af24bd) | this doc |
 | DRA-0065 | Medium | `client/src/net.rs:105 (Connection::is_lost); app/src/lib.rs:977 (transmit_chat), app/src/lib.rs:496 (ensure_connection_usable)` | [`9cd43d8`](https://github.com/Journeycake/dratchet/commit/9cd43d812e3862b1ad2e6db0026ae84d2b8b3c4d) | this doc |
+| DRA-0066 | Medium | `app/src/lib.rs:939 (reannounce_routing_id_if_unconfirmed), app/src/lib.rs:1161 (receive_pending confirms the switch), app/src/lib.rs:1648 (announce_routing_id keeps the envelope); store/src/contacts.rs:106 (Contact::routing_confirmed, routing_announce)` | pending | this doc |
 
 
 ## Summary
@@ -4390,4 +4391,39 @@ Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D w
 - **One position per failed connection is still used.** A link that drops and reconnects more than 100 times, each time failing a send, with no message delivered in between, would still exceed the limit. Each cycle needs a reconnect (with backoff), so this is far harder to reach.
 - **A conversation already broken this way isn't repaired.** The fix stops new breakage; it doesn't recover a conversation past the limit. That would need a session reset.
 - **The recipient isn't told.** An undecryptable entry is still dropped with only a log line, which predates this finding.
+
+## DRA-0066: losing one side's pairing-time routing announce split the conversation for good, retries included (found closing the retry test gaps; confirmed real, fixed) — **MEDIUM**
+
+> **DRA-0066** · Location: `app/src/lib.rs:939 (reannounce_routing_id_if_unconfirmed), app/src/lib.rs:1161 (receive_pending confirms the switch), app/src/lib.rs:1648 (announce_routing_id keeps the envelope); store/src/contacts.rs:106 (Contact::routing_confirmed, routing_announce)` · Fix: pending
+
+After pairing, each side sends the other a `RoutingIdAnnounce`, to the other's identity-derived bootstrap inbox. Each side switches to the shared routing-id mailbox, for both writing and reading, as soon as it receives the other's announce. Nothing checked that the *other* side had switched too.
+
+If one announce is lost, the two sides end up on different mailboxes. A server restart before the peer collects it loses it (mailboxes aren't persisted), and so does the 14-day mailbox lifetime if the peer stays offline. Say Alice has Bob's announce but hers to Bob was lost. Alice now writes to, and reads only, the routing-id mailbox, while Bob writes to, and reads, the bootstrap inboxes. Every message in either direction goes unread, silently and permanently. DRA-0064's restart detection flags Alice's lost message, but the retry goes to the same unread mailbox, so retrying can't help.
+
+Found while closing the desktop-layer test gap for the retry flows: an end-to-end restart test through the app's background loop delivered nothing to the recipient. The app-level restart tests had passed only because the sender never processed the peer's announce before the crash.
+
+Rated **Medium**: permanent, silent loss of one conversation in both directions. It needs the announce lost in the window between pairing and the peer's next poll. That window is short if both are online, but lasts as long as the peer stays offline.
+
+### Confirmation
+
+`app/tests/server_restart_is_detected.rs`, `a_routing_announce_lost_in_a_restart_does_not_split_the_conversation`. The server runs with its directory persisted. Alice and Bob pair, Alice picks up Bob's announce, and Bob doesn't poll. Alice sends, then the server is crashed and restarted on the same address. Alice reconnects, the restart is detected, and she retries. Bob then reads the way the desktop loop does: a fresh contact record per pass, three passes. With only the re-send disabled, the test fails with its `VULNERABILITY:` assertion: Bob never receives the message.
+
+### Fixed
+
+- **Record when the switch is confirmed.** `Contact::routing_confirmed` is set when anything from the peer decrypts off the routing-id mailbox, which proves the peer has switched (`receive_pending`).
+- **Keep the original announce.** `announce_routing_id` stores the encrypted announce as sent (`Contact::routing_announce`).
+- **Re-send it until confirmed.** After each chat message the server accepts (send or retry), a side that has switched but isn't confirmed re-sends that announce, byte for byte, to the peer's bootstrap inbox. A peer that missed it decrypts it at its original chain position and switches. A peer that already has it rejects the copy as a replay.
+
+A first version re-encrypted a fresh announce instead. The existing test `uncertain_delivery_piggyback` caught that this used a new chain position that a peer who had already switched never receives. The gap stopped cumulative piggyback acks for the rest of that chain. Re-sending the original bytes uses no chain position, and that test passes unchanged.
+
+Guard: `a_confirmed_conversation_sends_no_further_announces` checks that, after an ordinary exchange, both sides are confirmed and further sends put nothing in the peer's bootstrap inbox. The confirming test also checks the reverse direction works afterwards and that Alice ends up confirmed.
+
+Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (343 passed).
+
+### Known residual scope
+
+- **Healing needs a send from the side that switched.** If that side never sends anything, nothing re-sends the announce. Messages the other side sent in the meantime went to the old inbox, and are recovered only through the 14-day expiry flag and a retry (DRA-0063).
+- **Contacts paired before this change** have no stored announce, so they aren't healed.
+- **Extra writes to the peer's bootstrap inbox** until the switch is confirmed, normally the peer's next poll. A peer that has already switched never reads them; they expire with the mailbox lifetime.
+- **The 14-day path is covered by the same mechanism but not by its own test.** Only the restart case is tested.
 

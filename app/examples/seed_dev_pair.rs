@@ -247,6 +247,8 @@ async fn main() {
         wipe_boundary_sequence: None,
         peer_wipe_boundary_timestamp: None,
         peer_wipe_boundary_sequence: None,
+        routing_confirmed: false,
+        routing_announce: Vec::new(),
     };
     db_alice
         .save_contact(&alice_contact)
@@ -275,6 +277,8 @@ async fn main() {
         wipe_boundary_sequence: None,
         peer_wipe_boundary_timestamp: None,
         peer_wipe_boundary_sequence: None,
+        routing_confirmed: false,
+        routing_announce: Vec::new(),
     };
     db_bob
         .save_contact(&bob_contact)

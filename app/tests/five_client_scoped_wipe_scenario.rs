@@ -243,6 +243,8 @@ async fn pair_new_peer(
         wipe_boundary_sequence: None,
         peer_wipe_boundary_timestamp: None,
         peer_wipe_boundary_sequence: None,
+        routing_confirmed: false,
+        routing_announce: Vec::new(),
     };
     db_wendy.save_contact(&wendy_contact).unwrap();
     db_wendy.save_ratchet(conv_id, &wendy_ratchet).unwrap();
@@ -267,6 +269,8 @@ async fn pair_new_peer(
         wipe_boundary_sequence: None,
         peer_wipe_boundary_timestamp: None,
         peer_wipe_boundary_sequence: None,
+        routing_confirmed: false,
+        routing_announce: Vec::new(),
     };
     db_peer.save_contact(&peer_contact).unwrap();
     db_peer.save_ratchet(conv_id, &peer_ratchet).unwrap();

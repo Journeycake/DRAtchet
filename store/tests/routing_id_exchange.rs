@@ -244,6 +244,8 @@ async fn both_sides_exchange_routing_ids_over_the_real_server_and_converge_on_th
         wipe_boundary_sequence: None,
         peer_wipe_boundary_timestamp: None,
         peer_wipe_boundary_sequence: None,
+        routing_confirmed: false,
+        routing_announce: Vec::new(),
     };
     db_alice.save_contact(&alice_contact).unwrap();
 
@@ -266,6 +268,8 @@ async fn both_sides_exchange_routing_ids_over_the_real_server_and_converge_on_th
         wipe_boundary_sequence: None,
         peer_wipe_boundary_timestamp: None,
         peer_wipe_boundary_sequence: None,
+        routing_confirmed: false,
+        routing_announce: Vec::new(),
     };
     db_bob.save_contact(&bob_contact).unwrap();
 

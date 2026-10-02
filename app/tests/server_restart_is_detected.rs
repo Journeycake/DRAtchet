@@ -433,3 +433,180 @@ async fn a_message_collected_just_before_the_crash_is_not_shown_twice_after_a_re
     assert!(alice_copy.delivered);
     assert_eq!(alice_copy.retry_reason, None);
 }
+
+/// Fetch whatever is waiting for `account` in its own bootstrap inbox
+/// (entries others wrote there), without processing anything.
+async fn bootstrap_inbox_len(conn: &mut Connection, account: &Account) -> usize {
+    use dratchet_server::protocol::{MailboxEntries, MailboxFetch};
+    conn.send(
+        FrameTag::MailboxFetch,
+        &MailboxFetch {
+            mailbox_id: dratchet_core::x3dh::bootstrap_mailbox_id(
+                account.identity.fingerprint().as_bytes(),
+            )
+            .to_vec(),
+        },
+    )
+    .await
+    .unwrap();
+    let (_, entries): (_, MailboxEntries) = conn.recv().await.unwrap();
+    entries.entries.len()
+}
+
+/// Receive for `contact` the way the desktop loop does: a fresh contact
+/// record each pass, a few passes (a pass that switches mailboxes reads
+/// the new one on the next).
+async fn receive_passes(
+    db: &Db,
+    conn: &mut Connection,
+    account: &Account,
+    contact: &Contact,
+) -> Vec<Vec<u8>> {
+    let mut got = Vec::new();
+    for _ in 0..3 {
+        let current = db.load_contact(&contact.fingerprint).unwrap().unwrap();
+        let received = receive_pending(db, conn, account, &current).await.unwrap();
+        got.extend(received.messages.into_iter().map(|m| m.content));
+    }
+    got
+}
+
+/// DRA-0066: pairing has each side announce a routing id; each switches to
+/// the shared routing-id mailbox when it receives the other's. Here Alice
+/// has Bob's announce (and switched), but hers is still waiting in Bob's
+/// inbox when the server restarts and loses it. Alice now writes only to
+/// the new mailbox and Bob reads only the old one: before the fix, every
+/// message, and every retry of it, went unread for good.
+#[tokio::test]
+async fn a_routing_announce_lost_in_a_restart_does_not_split_the_conversation() {
+    let dir = tempfile::tempdir().unwrap();
+    let directory = dir.path().join("directory.redb");
+    let server = ServerProcess::start("127.0.0.1:0".parse().unwrap(), &directory);
+    let url = server.url();
+    let mut p = paired(&url, "66a").await;
+    // Alice picks up Bob's announce and switches; Bob doesn't poll yet.
+    receive_pending(&p.db_alice, &mut p.alice_conn, &p.alice, &p.alice_contact)
+        .await
+        .unwrap();
+    let alice_view = p
+        .db_alice
+        .load_contact(&p.alice_contact.fingerprint)
+        .unwrap()
+        .unwrap();
+    assert!(alice_view.peer_routing_id.is_some(), "Alice has switched");
+    note_server_boot(&p.db_alice, &p.alice, &p.alice_conn).unwrap();
+    let sent = send_message(
+        &p.db_alice,
+        &mut p.alice_conn,
+        &p.alice,
+        &alice_view,
+        b"hello after pairing",
+    )
+    .await
+    .unwrap();
+
+    let _server = server.crash_and_restart(&directory);
+
+    let mut alice_conn = Connection::connect(&url).await.unwrap();
+    alice_conn.authenticate(&p.alice).await.unwrap();
+    assert_eq!(
+        note_server_boot(&p.db_alice, &p.alice, &alice_conn).unwrap(),
+        1
+    );
+    retry_message(
+        &p.db_alice,
+        &mut alice_conn,
+        &p.alice,
+        &alice_view,
+        &sent.id,
+    )
+    .await
+    .unwrap();
+
+    let mut bob_conn = Connection::connect(&url).await.unwrap();
+    bob_conn.authenticate(&p.bob).await.unwrap();
+    let got = receive_passes(&p.db_bob, &mut bob_conn, &p.bob, &p.bob_contact).await;
+    assert!(
+        got.contains(&b"hello after pairing".to_vec()),
+        "VULNERABILITY: the restart lost Alice's routing-id announce, so Alice writes to the \
+         routing-id mailbox while Bob still reads his old inbox -- her retried message (and \
+         everything after it, in both directions) is never read"
+    );
+
+    // Both directions work afterwards.
+    let bob_view = p
+        .db_bob
+        .load_contact(&p.bob_contact.fingerprint)
+        .unwrap()
+        .unwrap();
+    send_message(&p.db_bob, &mut bob_conn, &p.bob, &bob_view, b"got it")
+        .await
+        .unwrap();
+    let got = receive_passes(&p.db_alice, &mut alice_conn, &p.alice, &p.alice_contact).await;
+    assert_eq!(got, vec![b"got it".to_vec()]);
+    let alice_view = p
+        .db_alice
+        .load_contact(&p.alice_contact.fingerprint)
+        .unwrap()
+        .unwrap();
+    assert!(
+        alice_view.routing_confirmed,
+        "hearing from Bob on the new mailbox confirms the switch"
+    );
+}
+
+/// Guard: once each side has heard from the other on the routing-id
+/// mailbox, sends stop re-announcing -- nothing more lands in the peer's
+/// identity-derived inbox.
+#[tokio::test]
+async fn a_confirmed_conversation_sends_no_further_announces() {
+    let url = spawn_server().await;
+    let mut p = paired(&url, "66b").await;
+    let bob_view = |p: &Pair| {
+        p.db_bob
+            .load_contact(&p.bob_contact.fingerprint)
+            .unwrap()
+            .unwrap()
+    };
+    let alice_view = |p: &Pair| {
+        p.db_alice
+            .load_contact(&p.alice_contact.fingerprint)
+            .unwrap()
+            .unwrap()
+    };
+    // An ordinary first exchange.
+    receive_passes(&p.db_alice, &mut p.alice_conn, &p.alice, &p.alice_contact).await;
+    receive_passes(&p.db_bob, &mut p.bob_conn, &p.bob, &p.bob_contact).await;
+    let view = alice_view(&p);
+    send_message(&p.db_alice, &mut p.alice_conn, &p.alice, &view, b"one")
+        .await
+        .unwrap();
+    assert_eq!(
+        receive_passes(&p.db_bob, &mut p.bob_conn, &p.bob, &p.bob_contact).await,
+        vec![b"one".to_vec()]
+    );
+    let view = bob_view(&p);
+    send_message(&p.db_bob, &mut p.bob_conn, &p.bob, &view, b"two")
+        .await
+        .unwrap();
+    assert_eq!(
+        receive_passes(&p.db_alice, &mut p.alice_conn, &p.alice, &p.alice_contact).await,
+        vec![b"two".to_vec()]
+    );
+    receive_passes(&p.db_bob, &mut p.bob_conn, &p.bob, &p.bob_contact).await;
+    assert!(alice_view(&p).routing_confirmed);
+    assert!(bob_view(&p).routing_confirmed);
+
+    let before = bootstrap_inbox_len(&mut p.bob_conn, &p.bob).await;
+    for text in [b"three".as_slice(), b"four"] {
+        let view = alice_view(&p);
+        send_message(&p.db_alice, &mut p.alice_conn, &p.alice, &view, text)
+            .await
+            .unwrap();
+    }
+    assert_eq!(bootstrap_inbox_len(&mut p.bob_conn, &p.bob).await, before);
+    assert_eq!(
+        receive_passes(&p.db_bob, &mut p.bob_conn, &p.bob, &p.bob_contact).await,
+        vec![b"three".to_vec(), b"four".to_vec()]
+    );
+}

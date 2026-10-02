@@ -97,6 +97,20 @@ pub struct Contact {
     pub peer_wipe_boundary_timestamp: Option<u64>,
     #[serde(default)]
     pub peer_wipe_boundary_sequence: Option<u64>,
+    /// DRA-0066: something from the peer has been decrypted off the
+    /// routing-id mailbox, which proves the peer switched to it too. Until
+    /// then, this side can't know whether its own `RoutingIdAnnounce`
+    /// arrived (a server restart or the mailbox lifetime can lose it), so
+    /// `dratchet_app` re-sends it alongside each chat message.
+    #[serde(default)]
+    pub routing_confirmed: bool,
+    /// DRA-0066: the encrypted `RoutingIdAnnounce` envelope as first sent,
+    /// so it can be re-sent byte for byte. Re-encrypting it would use a
+    /// fresh chain position the peer may never receive, leaving a gap
+    /// that stops cumulative piggyback acks for the rest of that chain.
+    /// Empty for contacts paired before this was recorded.
+    #[serde(default, with = "serde_bytes")]
+    pub routing_announce: Vec<u8>,
 }
 
 fn contact_key(fingerprint: &[u8]) -> String {
@@ -197,6 +211,8 @@ mod tests {
             wipe_boundary_sequence: None,
             peer_wipe_boundary_timestamp: None,
             peer_wipe_boundary_sequence: None,
+            routing_confirmed: false,
+            routing_announce: Vec::new(),
         }
     }
 

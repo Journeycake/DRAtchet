@@ -75,6 +75,8 @@ async fn a_send_to_a_server_that_stopped_answering_fails_instead_of_hanging() {
         wipe_boundary_sequence: None,
         peer_wipe_boundary_timestamp: None,
         peer_wipe_boundary_sequence: None,
+        routing_confirmed: false,
+        routing_announce: Vec::new(),
     };
     db.save_contact(&contact).unwrap();
     let conv = dratchet_core::conversation_id(

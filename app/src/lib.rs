@@ -675,6 +675,8 @@ pub async fn add_contact_by_username(
         wipe_boundary_sequence: None,
         peer_wipe_boundary_timestamp: None,
         peer_wipe_boundary_sequence: None,
+        routing_confirmed: false,
+        routing_announce: Vec::new(),
     };
     db.save_contact(&contact)?;
     db.save_ratchet(conv_id, &ratchet)?;
@@ -871,6 +873,8 @@ fn try_accept_first_contact(
         wipe_boundary_sequence: None,
         peer_wipe_boundary_timestamp: None,
         peer_wipe_boundary_sequence: None,
+        routing_confirmed: false,
+        routing_announce: Vec::new(),
     };
     db.save_contact(&contact)?;
     db.save_ratchet(conv_id, &ratchet)?;
@@ -919,6 +923,49 @@ pub fn save_unsent_message(
     let message = db.new_outgoing_message(content.to_vec());
     db.save_message(conv_id, &message)?;
     Ok(message)
+}
+
+/// DRA-0066: this side has switched to the routing-id mailbox (it has the
+/// peer's routing id) but hasn't heard from the peer there yet, so the
+/// peer may never have received this side's `RoutingIdAnnounce` -- a
+/// server restart or the mailbox lifetime can lose it. The peer would then
+/// keep reading its old inbox while this side writes to the new one, and
+/// every message, retries included, would go unread. Re-sending the
+/// original announce, byte for byte, to the old inbox after each chat
+/// message lets the peer catch up. It uses no new chain position: a peer
+/// that already has it rejects the copy as a replay. Best-effort: the
+/// chat message itself was already accepted, so a failure here only means
+/// the next send tries again.
+async fn reannounce_routing_id_if_unconfirmed(db: &Db, conn: &mut Connection, contact: &Contact) {
+    let Ok(Some(current)) = db.load_contact(&contact.fingerprint) else {
+        return;
+    };
+    if current.peer_routing_id.is_none()
+        || current.routing_confirmed
+        || current.routing_announce.is_empty()
+    {
+        return;
+    }
+    let resent: Result<()> = async {
+        conn.send(
+            FrameTag::MailboxWrite,
+            &MailboxWrite {
+                mailbox_id: bootstrap_mailbox_id(&current.fingerprint).to_vec(),
+                envelope: current.routing_announce.clone(),
+                ttl: MAILBOX_TTL_SECS,
+            },
+        )
+        .await?;
+        let (_, ack): (_, Ack) = conn.recv().await?;
+        if !ack.ok {
+            return Err(Error::NotAcknowledged);
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(e) = resent {
+        eprintln!("re-sending the routing-id announce failed (retried on the next send): {e}");
+    }
 }
 
 /// DRA-0060/0063/0064: resend one of this side's own messages that is
@@ -1028,6 +1075,7 @@ async fn transmit_chat(
             // DRA-0063: the server's mailbox lifetime for it starts now.
             message.last_sent_at = Some(now_unix());
             db.save_message(conv_id, &message)?;
+            reannounce_routing_id_if_unconfirmed(db, conn, contact).await;
             Ok(message)
         }
         Err(cause) => Err(Error::NotSent {
@@ -1110,7 +1158,8 @@ pub async fn receive_pending(
     // processed partway through this same batch moves `contact.mailbox_id`
     // forward (that mutation affects only our *send* address, computed
     // fresh below regardless).
-    let fetch_mailbox_id = if contact.peer_routing_id.is_some() {
+    let fetched_from_routing_mailbox = contact.peer_routing_id.is_some();
+    let fetch_mailbox_id = if fetched_from_routing_mailbox {
         contact.mailbox_id.clone()
     } else {
         bootstrap_mailbox_id(account.identity.fingerprint().as_bytes()).to_vec()
@@ -1136,6 +1185,8 @@ pub async fn receive_pending(
     // still-live in-memory `ratchet`, needed to keep decrypting the rest
     // of this batch) must not resurrect it.
     let mut session_wiped = false;
+    // DRA-0066: whether anything from the peer decrypted in this pass.
+    let mut decrypted_any = false;
     // `contact`'s verification state (used by `decrypt_gated`) doesn't
     // change mid-loop — only its `mailbox_id`, tracked separately above —
     // so gating against the caller's original `contact` for every entry
@@ -1161,7 +1212,9 @@ pub async fn receive_pending(
         // message — never a duplicate.
         let mut ack_after_delete: Option<(Vec<u8>, u32)> = None;
 
-        match apply_entry(db, &mut ratchet, contact, conv_id, &entry.envelope) {
+        let applied = apply_entry(db, &mut ratchet, contact, conv_id, &entry.envelope);
+        decrypted_any |= applied.is_ok();
+        match applied {
             Ok(EntryEffect::None) => {}
             Ok(EntryEffect::Message(message, dh_pub, acked_n, piggyback_delivered)) => {
                 ack_after_delete = Some((dh_pub, acked_n));
@@ -1255,6 +1308,11 @@ pub async fn receive_pending(
 
     if !session_wiped {
         db.save_ratchet(conv_id, &ratchet)?;
+    }
+    // DRA-0066: mail from the peer on the routing-id mailbox proves the
+    // peer has this side's routing id, so the re-announcing can stop.
+    if fetched_from_routing_mailbox && decrypted_any && !contact.routing_confirmed {
+        db.mark_routing_confirmed(&contact.fingerprint)?;
     }
     Ok(Received {
         messages: received,
@@ -1584,11 +1642,17 @@ pub async fn announce_routing_id(
     // so a retry after a lost Ack encrypts at a fresh chain position
     // (fresh key and nonce) instead of reusing this one.
     db.save_ratchet(conv_id, &ratchet)?;
+    let encoded = envelope.encode();
+    // DRA-0066: kept so it can be re-sent unchanged if it turns out lost.
+    if let Some(mut current) = db.load_contact(&contact.fingerprint)? {
+        current.routing_announce = encoded.clone();
+        db.save_contact(&current)?;
+    }
     conn.send(
         FrameTag::MailboxWrite,
         &MailboxWrite {
             mailbox_id: bootstrap_mailbox_id(&contact.fingerprint).to_vec(),
-            envelope: envelope.encode(),
+            envelope: encoded,
             ttl: MAILBOX_TTL_SECS,
         },
     )

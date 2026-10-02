@@ -51,6 +51,8 @@ fn sample_contact(fingerprint: Vec<u8>, wipe_request_pending: bool) -> Contact {
         wipe_boundary_sequence: None,
         peer_wipe_boundary_timestamp: None,
         peer_wipe_boundary_sequence: None,
+        routing_confirmed: false,
+        routing_announce: Vec::new(),
     }
 }
 

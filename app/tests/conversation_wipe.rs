@@ -194,6 +194,8 @@ async fn verified_pair() -> (Peer, Peer, [u8; 16]) {
         wipe_boundary_sequence: None,
         peer_wipe_boundary_timestamp: None,
         peer_wipe_boundary_sequence: None,
+        routing_confirmed: false,
+        routing_announce: Vec::new(),
     };
     db_alice.save_contact(&alice_contact).unwrap();
     db_alice.save_ratchet(conv_id, &alice_ratchet).unwrap();
@@ -218,6 +220,8 @@ async fn verified_pair() -> (Peer, Peer, [u8; 16]) {
         wipe_boundary_sequence: None,
         peer_wipe_boundary_timestamp: None,
         peer_wipe_boundary_sequence: None,
+        routing_confirmed: false,
+        routing_announce: Vec::new(),
     };
     db_bob.save_contact(&bob_contact).unwrap();
     db_bob.save_ratchet(conv_id, &bob_ratchet).unwrap();
