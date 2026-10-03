@@ -209,8 +209,31 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     file.sync_all()
 }
 
+/// Marks a directory as one this store created or adopted while empty.
+const OWNED_MARKER: &str = ".dratchet-fragments";
+
+/// Make `dir` a fragment directory this store owns: create it, or adopt it
+/// if it exists and is empty, marking it either way. A directory that
+/// already holds anything else and isn't marked is refused, so pointing
+/// `fragment_dirs` at a shared directory by mistake never changes its
+/// permissions or deletes its files (the store removes `*.frag` files it
+/// doesn't recognise, and all of them when its key changes).
 fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    let marker = dir.join(OWNED_MARKER);
+    if dir.exists() && !marker.exists() && fs::read_dir(dir)?.next().is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "fragment directory {} already holds other files; give the mail store an \
+                 empty or new directory of its own",
+                dir.display()
+            ),
+        ));
+    }
     fs::create_dir_all(dir)?;
+    if !marker.exists() {
+        fs::write(&marker, b"")?;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

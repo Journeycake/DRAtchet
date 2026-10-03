@@ -45,7 +45,10 @@ impl Store {
         for dir in self.dirs() {
             if let Ok(rd) = std::fs::read_dir(&dir) {
                 for e in rd {
-                    out.push(e.unwrap().path());
+                    let path = e.unwrap().path();
+                    if path.extension().is_some_and(|x| x == "frag") {
+                        out.push(path);
+                    }
                 }
             }
         }
@@ -387,4 +390,61 @@ async fn a_full_memory_area_refuses_without_saying_why() {
         "the refusal must not describe the relay's state, got {:?}",
         err.message
     );
+}
+
+/// A fragment directory the store didn't create, already holding other
+/// files, must be left alone: an operator who points `fragment_dirs` at
+/// the wrong (shared) directory gets an error, not changed permissions and
+/// deleted files.
+#[cfg(unix)]
+#[test]
+fn a_store_never_takes_over_a_directory_it_did_not_create() {
+    use std::os::unix::fs::PermissionsExt;
+    let store = Store::new();
+    let shared = store.root.join("shared");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let someone_elses = shared.join("report.frag");
+    std::fs::write(&someone_elses, b"not the relay's").unwrap();
+
+    let mut mail = store.settings(KEY, Duration::from_secs(1));
+    mail.fragment_dirs = vec![store.root.join("a"), shared.clone()];
+    let opened =
+        dratchet_server::mailstore::MailStore::open(&mail.index_db, &mail.fragment_dirs, &KEY);
+
+    let mode = std::fs::metadata(&shared).unwrap().permissions().mode() & 0o777;
+    assert!(
+        someone_elses.exists() && mode == 0o755,
+        "VULNERABILITY: opening the mail store changed a directory it didn't create (mode now \
+         {mode:o}) or deleted a file in it (still there: {})",
+        someone_elses.exists()
+    );
+    assert!(
+        opened.is_err(),
+        "the store refuses a directory that isn't its own"
+    );
+}
+
+/// Guard: a directory the store created (or adopted while empty) keeps
+/// working across restarts.
+#[test]
+fn the_store_reopens_directories_it_created() {
+    let store = Store::new();
+    let mail = store.settings(KEY, Duration::from_secs(1));
+    for _ in 0..2 {
+        let opened =
+            dratchet_server::mailstore::MailStore::open(&mail.index_db, &mail.fragment_dirs, &KEY);
+        assert!(opened.is_ok(), "{:?}", opened.err());
+    }
+    let empty = store.root.join("empty-existing");
+    std::fs::create_dir_all(&empty).unwrap();
+    let mut adopt = store.settings(KEY, Duration::from_secs(1));
+    adopt.fragment_dirs = vec![store.root.join("a"), empty];
+    adopt.index_db = store.root.join("index2.redb");
+    assert!(dratchet_server::mailstore::MailStore::open(
+        &adopt.index_db,
+        &adopt.fragment_dirs,
+        &KEY
+    )
+    .is_ok());
 }

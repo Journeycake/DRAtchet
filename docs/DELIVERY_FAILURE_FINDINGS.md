@@ -110,6 +110,7 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0066 | Medium | `app/src/lib.rs:939 (reannounce_routing_id_if_unconfirmed), app/src/lib.rs:1161 (receive_pending confirms the switch), app/src/lib.rs:1648 (announce_routing_id keeps the envelope); store/src/contacts.rs:106 (Contact::routing_confirmed, routing_announce)` | [`d739e0f`](https://github.com/Journeycake/dratchet/commit/d739e0f7d688b6c4cc0fa0c1037400b205318f32) | this doc |
 | DRA-0067 | Medium | `ui/src-tauri/src/lib.rs:821 (poll_loop reconnect)` | [`bc8e05b`](https://github.com/Journeycake/dratchet/commit/bc8e05b4e85ca4fa6e09929be07c26fd46c58009) | this doc |
 | DRA-0068 | Medium | `client/src/net.rs:81 (Connection::connect_with_timeout); ui/src-tauri/src/lib.rs:833 (poll_loop reconnect)` | [`970ffcc`](https://github.com/Journeycake/dratchet/commit/970ffcc9436f63178c35bafdaf5fc6ba1c64f0d9) | this doc |
+| DRA-0071 | Low | `server/src/mailstore.rs:221 (ensure_private_dir)` | pending | this doc |
 
 
 ## Summary
@@ -4482,4 +4483,30 @@ Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D w
 
 - **Authenticating still holds the account lock.** A server that completes the WebSocket handshake and then goes silent makes commands that need the account wait up to `REQUEST_TIMEOUT` per step. That's bounded, but noticeable.
 - **20 seconds is a constant**, as in DRA-0061.
+
+## DRA-0071: the mail store took over any directory it was pointed at (found in the persistence security check; confirmed real, fixed) — **LOW**
+
+> **DRA-0071** · Location: `server/src/mailstore.rs:221 (ensure_private_dir)` · Fix: pending
+
+At startup the mail store (`docs/adr/0001`) treated every configured fragment directory as its own. It restricted each one to its owner (mode 0700), deleted every `*.frag` file it didn't recognise, and deleted all of them when the key changed. Pointing `fragment_dirs` at an existing shared directory by mistake, such as a data directory or a mount used by something else, would change that directory's permissions and delete any files in it with that suffix. A relay running as root could do this to a system directory.
+
+Rated **Low**: it takes an operator misconfiguration, but the damage lands outside the relay and can't be undone.
+
+### Confirmation
+
+`server/tests/mail_persistence.rs`, `a_store_never_takes_over_a_directory_it_did_not_create`. A fragment directory that already exists has mode 0755 and holds someone else's `report.frag`. Opening the store changed the mode to 700 and deleted the file, and the test failed with its `VULNERABILITY:` assertion.
+
+### Fixed
+
+A fragment directory is the store's own only if the store created it, or adopted it while it was empty. Either way it writes a `.dratchet-fragments` marker. A directory that exists, isn't empty and has no marker is refused with an error asking for an empty or new directory, before anything in it is touched.
+
+Guard: `the_store_reopens_directories_it_created`, covering restarts and adopting an existing empty directory. The test helper that counts Fragments now counts only `*.frag` files, since the marker lives alongside them.
+
+Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (364 passed).
+
+### Known residual scope
+
+- **A marked directory is trusted.** Copying the marker into another directory makes the store treat that directory as its own.
+- **The index database path isn't checked the same way.** It's a single file the store creates.
+- **This check covered robustness, not adversarial attacks.** It looked at the code's handling of operator configuration. The adversarial pass on the stored data (reading, linking, tampering, replay, epoch spoofing) is part of the scheduled full test and penetration test. The existing tests already cover tampered and missing Fragments and a wrong key.
 
