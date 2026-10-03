@@ -298,3 +298,143 @@ async fn a_client_waits_out_the_relays_save_interval_for_its_checkmark() {
     let (tag, ack): (_, dratchet_server::protocol::Ack) = conn.recv().await.unwrap();
     assert!(tag == dratchet_server::protocol::FrameTag::Ack && ack.ok);
 }
+
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    if from.is_dir() {
+        std::fs::create_dir_all(to).unwrap();
+        for e in std::fs::read_dir(from).unwrap() {
+            let e = e.unwrap();
+            copy_tree(&e.path(), &to.join(e.file_name()));
+        }
+    } else {
+        std::fs::copy(from, to).unwrap();
+    }
+}
+
+/// The mail store files (index and Fragments), not the directory.
+fn mail_store_paths(root: &std::path::Path) -> [PathBuf; 3] {
+    [root.join("index.redb"), root.join("f1"), root.join("f2")]
+}
+
+/// Rolling the relay's mail store back to an older copy (sealed state and
+/// all, so it still verifies) hands the recipient mail it already
+/// collected. That's the store's known residual (DRA-0074); this checks
+/// the recipient shows nothing twice and the conversation carries on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rolled_back_mail_store_redelivers_nothing_the_recipient_shows_twice() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let backup = tempfile::tempdir().unwrap();
+    let relay = Relay::start("127.0.0.1:0".parse().unwrap(), root.clone(), Duration::ZERO);
+    let url = relay.url();
+    let mut p = paired(&url, "rb").await;
+    let conv = conversation_id_for(&p.bob, &p.bob_contact);
+
+    let alice_view = p
+        .db_alice
+        .load_contact(&p.alice_contact.fingerprint)
+        .unwrap()
+        .unwrap();
+    send_message(&p.db_alice, &mut p.alice_conn, &p.alice, &alice_view, b"m1")
+        .await
+        .unwrap();
+
+    // Snapshot the store while m1 is queued.
+    let addr = relay.stop(true);
+    for path in mail_store_paths(&root) {
+        copy_tree(&path, &backup.path().join(path.file_name().unwrap()));
+    }
+    let relay = Relay::start(addr, root.clone(), Duration::ZERO);
+    let mut bob_conn = reconnect(&url, &p.bob).await;
+    let bob_view = p
+        .db_bob
+        .load_contact(&p.bob_contact.fingerprint)
+        .unwrap()
+        .unwrap();
+    let first = receive_pending(&p.db_bob, &mut bob_conn, &p.bob, &bob_view)
+        .await
+        .unwrap();
+    assert_eq!(first.messages.len(), 1, "Bob collects m1");
+
+    // Roll the store back to the snapshot: m1 is queued again.
+    let addr = relay.stop(true);
+    for path in mail_store_paths(&root) {
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path).unwrap();
+        } else {
+            std::fs::remove_file(&path).unwrap();
+        }
+        copy_tree(&backup.path().join(path.file_name().unwrap()), &path);
+    }
+    let _relay = Relay::start(addr, root.clone(), Duration::ZERO);
+    let mut bob_conn = reconnect(&url, &p.bob).await;
+    let bob_view = p
+        .db_bob
+        .load_contact(&p.bob_contact.fingerprint)
+        .unwrap()
+        .unwrap();
+    let again = receive_pending(&p.db_bob, &mut bob_conn, &p.bob, &bob_view)
+        .await
+        .unwrap();
+    assert!(
+        again.messages.is_empty(),
+        "VULNERABILITY: a rolled-back relay made Bob show m1 a second time"
+    );
+    let m1_count = p
+        .db_bob
+        .list_messages(conv)
+        .unwrap()
+        .iter()
+        .filter(|m| m.content == b"m1")
+        .count();
+    assert_eq!(m1_count, 1);
+
+    // The conversation still works afterwards, once both sides have
+    // caught up on each other's receipts and routing-id switch.
+    let mut alice_conn = reconnect(&url, &p.alice).await;
+    for _ in 0..2 {
+        let alice_view = p
+            .db_alice
+            .load_contact(&p.alice_contact.fingerprint)
+            .unwrap()
+            .unwrap();
+        receive_pending(&p.db_alice, &mut alice_conn, &p.alice, &alice_view)
+            .await
+            .unwrap();
+        let bob_view = p
+            .db_bob
+            .load_contact(&p.bob_contact.fingerprint)
+            .unwrap()
+            .unwrap();
+        let settled = receive_pending(&p.db_bob, &mut bob_conn, &p.bob, &bob_view)
+            .await
+            .unwrap();
+        assert!(
+            settled.messages.is_empty(),
+            "nothing shown twice while settling"
+        );
+    }
+    let alice_view = p
+        .db_alice
+        .load_contact(&p.alice_contact.fingerprint)
+        .unwrap()
+        .unwrap();
+    send_message(&p.db_alice, &mut alice_conn, &p.alice, &alice_view, b"m2")
+        .await
+        .unwrap();
+    let bob_view = p
+        .db_bob
+        .load_contact(&p.bob_contact.fingerprint)
+        .unwrap()
+        .unwrap();
+    let next = receive_pending(&p.db_bob, &mut bob_conn, &p.bob, &bob_view)
+        .await
+        .unwrap();
+    assert_eq!(
+        next.messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>(),
+        vec![b"m2".to_vec()]
+    );
+}
