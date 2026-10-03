@@ -663,16 +663,20 @@ impl MailStore {
         Ok(gone.len())
     }
 
-    /// Read back a saved entry's envelope.
-    pub fn read_envelope(&self, entry_id: &[u8; 16]) -> Result<Vec<u8>, StoreError> {
-        let record = self
+    /// Read back a saved entry's envelope. `Ok(None)` means the store no
+    /// longer holds it because a save removed it after it was collected or
+    /// expired (DRA-0072). That isn't lost mail, unlike an `Err`.
+    pub fn read_envelope(&self, entry_id: &[u8; 16]) -> Result<Option<Vec<u8>>, StoreError> {
+        let Some(record) = self
             .records
             .lock()
             .expect("records lock")
             .get(entry_id)
             .cloned()
-            .ok_or(StoreError::Unreadable("no such entry"))?;
-        Ok(self.read_record(entry_id, &record)?.envelope)
+        else {
+            return Ok(None);
+        };
+        Ok(Some(self.read_record(entry_id, &record)?.envelope))
     }
 
     /// Queued mail may have been lost while running (a saved entry failed

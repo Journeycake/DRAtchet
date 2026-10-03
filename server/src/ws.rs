@@ -703,7 +703,10 @@ async fn read_saved_envelopes(
                 None => {
                     let id: [u8; 16] = entry_id.as_slice().try_into().expect("16-byte id");
                     match store.read_envelope(&id) {
-                        Ok(envelope) => wire.push(MailboxEntryWire { entry_id, envelope }),
+                        Ok(Some(envelope)) => wire.push(MailboxEntryWire { entry_id, envelope }),
+                        // DRA-0072: collected or expired, and removed by a
+                        // save, since this fetch listed it. Not lost.
+                        Ok(None) => {}
                         Err(e) => {
                             tracing::error!("mail store: a saved entry was lost: {e}");
                             lost.push(id);
@@ -1087,4 +1090,69 @@ fn to_core_bundle(
         },
         one_time_prekey,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::MailboxEntry;
+    use std::time::{Duration, SystemTime};
+
+    /// A `MailboxFetch` lists a saved entry, then reads it from disk with
+    /// the lock released. If the entry is collected in between (deleted,
+    /// or expired, then removed from the store by a save), the read finds
+    /// nothing. That's not lost mail and must not start a new epoch for
+    /// every client of the relay.
+    #[tokio::test]
+    async fn an_entry_collected_during_a_fetch_is_not_treated_as_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let dirs = vec![dir.path().join("a"), dir.path().join("b")];
+        let opened =
+            crate::mailstore::MailStore::open(&dir.path().join("index.redb"), &dirs, &[7; 32])
+                .unwrap();
+        let state = AppState::with_mail_store(None, opened, Duration::from_secs(10), u64::MAX);
+        let mailbox = [3u8; 16];
+        let collected = MailboxEntry::new(
+            b"collected".to_vec(),
+            SystemTime::now() + Duration::from_secs(3600),
+            [1; 32],
+        );
+        let kept = MailboxEntry::new(
+            b"kept".to_vec(),
+            SystemTime::now() + Duration::from_secs(3600),
+            [1; 32],
+        );
+        let (collected_id, kept_id) = (collected.entry_id, kept.entry_id);
+        state
+            .inner
+            .write()
+            .await
+            .mailboxes
+            .insert(mailbox, vec![collected, kept]);
+        crate::flush::flush_now(&state).await.unwrap();
+        let epoch_before = *state.epoch.read().unwrap();
+
+        // What the fetch listed before releasing the lock.
+        let listed = vec![(collected_id.to_vec(), None), (kept_id.to_vec(), None)];
+        // Meanwhile: the owner deletes one, and a save removes it from disk.
+        state
+            .inner
+            .write()
+            .await
+            .mailboxes
+            .get_mut(&mailbox)
+            .unwrap()
+            .retain(|e| e.entry_id != collected_id);
+        crate::flush::flush_now(&state).await.unwrap();
+
+        let wire = read_saved_envelopes(&state, &mailbox, listed).await;
+        assert_eq!(
+            *state.epoch.read().unwrap(),
+            epoch_before,
+            "VULNERABILITY: an entry collected while a fetch was reading it started a new Server \
+             Epoch for every client"
+        );
+        assert_eq!(wire.len(), 1, "the collected entry isn't handed out");
+        assert_eq!(wire[0].envelope, b"kept");
+    }
 }
