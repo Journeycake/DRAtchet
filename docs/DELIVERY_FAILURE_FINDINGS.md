@@ -110,7 +110,7 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0066 | Medium | `app/src/lib.rs:939 (reannounce_routing_id_if_unconfirmed), app/src/lib.rs:1161 (receive_pending confirms the switch), app/src/lib.rs:1648 (announce_routing_id keeps the envelope); store/src/contacts.rs:106 (Contact::routing_confirmed, routing_announce)` | [`d739e0f`](https://github.com/Journeycake/dratchet/commit/d739e0f7d688b6c4cc0fa0c1037400b205318f32) | this doc |
 | DRA-0067 | Medium | `ui/src-tauri/src/lib.rs:821 (poll_loop reconnect)` | [`bc8e05b`](https://github.com/Journeycake/dratchet/commit/bc8e05b4e85ca4fa6e09929be07c26fd46c58009) | this doc |
 | DRA-0068 | Medium | `client/src/net.rs:81 (Connection::connect_with_timeout); ui/src-tauri/src/lib.rs:833 (poll_loop reconnect)` | [`970ffcc`](https://github.com/Journeycake/dratchet/commit/970ffcc9436f63178c35bafdaf5fc6ba1c64f0d9) | this doc |
-| DRA-0071 | Low | `server/src/mailstore.rs:221 (ensure_private_dir)` | pending | this doc |
+| DRA-0071 | Low | `server/src/mailstore.rs:221 (ensure_private_dir)` | [`07bcb62`](https://github.com/Journeycake/dratchet/commit/07bcb6224ea738eaa74d14fa6e5decf6a83c9848) | this doc |
 
 
 ## Summary
@@ -4486,7 +4486,7 @@ Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D w
 
 ## DRA-0071: the mail store took over any directory it was pointed at (found in the persistence security check; confirmed real, fixed) — **LOW**
 
-> **DRA-0071** · Location: `server/src/mailstore.rs:221 (ensure_private_dir)` · Fix: pending
+> **DRA-0071** · Location: `server/src/mailstore.rs:221 (ensure_private_dir)` · Fix: [`07bcb62`](https://github.com/Journeycake/dratchet/commit/07bcb6224ea738eaa74d14fa6e5decf6a83c9848)
 
 At startup the mail store (`docs/adr/0001`) treated every configured fragment directory as its own. It restricted each one to its owner (mode 0700), deleted every `*.frag` file it didn't recognise, and deleted all of them when the key changed. Pointing `fragment_dirs` at an existing shared directory by mistake, such as a data directory or a mount used by something else, would change that directory's permissions and delete any files in it with that suffix. A relay running as root could do this to a system directory.
 
