@@ -94,6 +94,20 @@ pub struct RatchetState {
     /// already removed from `skipped` via a cache hit; those are harmless no-ops when
     /// popped, since eviction only ever removes-if-present.
     skipped_order: VecDeque<(DhPubBytes, u32)>,
+
+    /// Highest `n` such that every message `0..=n` on the *current* receiving chain
+    /// has genuinely had its content decrypted (as opposed to merely skipped-and-
+    /// cached, per `skipped` above) — the basis for [`RatchetState::receiving_progress`].
+    /// Deliberately distinct from `recv_n`, which also advances past skipped,
+    /// not-yet-received positions: conflating the two let a cumulative piggyback ack
+    /// falsely claim a skipped-and-never-arrived message as delivered, since `recv_n`
+    /// alone can't tell "decrypted" apart from "skipped over." Reset to `None` on
+    /// every DH ratchet step — a fresh chain starts with nothing delivered.
+    content_delivered_contiguous: Option<u32>,
+    /// `n`s beyond `content_delivered_contiguous` that have already been decrypted
+    /// out of order (arrived ahead of a still-missing earlier message) — folded into
+    /// `content_delivered_contiguous` once the gap closes via [`Self::record_content_delivered`].
+    content_delivered_out_of_order: std::collections::BTreeSet<u32>,
 }
 
 impl RatchetState {
@@ -129,6 +143,8 @@ impl RatchetState {
             prev_chain_len: 0,
             skipped: HashMap::new(),
             skipped_order: VecDeque::new(),
+            content_delivered_contiguous: None,
+            content_delivered_out_of_order: std::collections::BTreeSet::new(),
         })
     }
 
@@ -160,6 +176,8 @@ impl RatchetState {
             prev_chain_len: 0,
             skipped: HashMap::new(),
             skipped_order: VecDeque::new(),
+            content_delivered_contiguous: None,
+            content_delivered_out_of_order: std::collections::BTreeSet::new(),
         })
     }
 
@@ -217,6 +235,24 @@ impl RatchetState {
     /// conversation for both legitimate parties, even though that envelope itself gets
     /// correctly rejected — see `tests::garbage_envelope_does_not_desync_the_ratchet`.
     pub fn decrypt_raw(&mut self, envelope: &Envelope) -> Result<Vec<u8>> {
+        // DRA-0042 (`docs/DELIVERY_FAILURE_FINDINGS.md`): the envelope names
+        // the conversation it claims to belong to, but nothing checked that
+        // claim against the session actually decrypting it. The field rides
+        // in the AEAD-authenticated header, so a third party cannot alter it
+        // -- but the *sender* chooses it freely, and a peer with a live
+        // session could name any conversation they liked. Nothing routes on
+        // the field today, so this rejects a mismatch before it can ever
+        // become one; `app`'s own `DeliveryAck.conversation_id` check is the
+        // same guard one layer up.
+        //
+        // Placed above every other path, including the skipped-key fast
+        // path, and returning before any mutation: a rejected envelope must
+        // leave the ratchet exactly as it found it, for the same reason
+        // documented below.
+        if envelope.conversation_id != self.conversation_id {
+            return Err(Error::ConversationIdMismatch);
+        }
+
         let skipped_id = (DhPubBytes(envelope.dh_pub), envelope.n);
 
         // Fast path: an already-cached skipped-message key. Peek, don't remove, until
@@ -227,6 +263,14 @@ impl RatchetState {
             let plaintext =
                 aead_decrypt(message_key, &envelope.header_bytes(), &envelope.ciphertext)?;
             self.skipped.remove(&skipped_id);
+            // Only fold into the current chain's contiguous-delivery tracker if this
+            // skipped key actually belonged to the *current* chain — a stale skipped
+            // key from a chain that's since been superseded by a DH ratchet step
+            // (still in cache until evicted) is irrelevant to the current chain's
+            // progress.
+            if self.dh_remote.map(|r| r.to_bytes()) == Some(envelope.dh_pub) {
+                self.record_content_delivered(envelope.n);
+            }
             return Ok(plaintext);
         }
 
@@ -263,11 +307,15 @@ impl RatchetState {
                 .dh_self
                 .as_ref()
                 .ok_or(Error::RatchetNotInitialized("dh_self"))?;
+            // DRA-0038: rejected here, before the commit block below, so a
+            // low-order `dh_pub` leaves the ratchet exactly as it was —
+            // the same transactional discipline this method's own doc
+            // comment describes for a forged envelope.
             Some(compute_dh_ratchet_step(
                 &self.root_key,
                 dh_self_secret,
                 &incoming_dh,
-            ))
+            )?)
         } else {
             None
         };
@@ -308,6 +356,10 @@ impl RatchetState {
             self.prev_chain_len = self.send_n;
             self.send_n = 0;
             self.sending_chain_key = Some(Zeroizing::new(step.new_sending_chain_key));
+            // A fresh chain starts with nothing delivered yet — see
+            // `content_delivered_contiguous`'s doc.
+            self.content_delivered_contiguous = None;
+            self.content_delivered_out_of_order.clear();
         }
         self.receiving_chain_key = Some(Zeroizing::new(final_receiving_chain_key));
         self.recv_n = envelope.n + 1;
@@ -316,8 +368,38 @@ impl RatchetState {
             self.skipped_order.push_back(id);
         }
         self.evict_oldest_skipped_beyond_lifetime_bound();
+        self.record_content_delivered(envelope.n);
 
         Ok(plaintext)
+    }
+
+    /// Fold a just-decrypted `n` into the current chain's contiguous-delivery
+    /// frontier (`content_delivered_contiguous`), pulling in any already-delivered
+    /// out-of-order entries the gap's closure now makes contiguous too. Called for
+    /// every successful decrypt on the *current* chain — both the fast (cached
+    /// skipped-key) and slow paths in [`Self::decrypt_raw`] — never for a stale
+    /// chain's skipped key or before a DH step's reset has already run.
+    fn record_content_delivered(&mut self, n: u32) {
+        let expected_next = self.content_delivered_contiguous.map_or(0, |c| c + 1);
+        match n.cmp(&expected_next) {
+            std::cmp::Ordering::Equal => {
+                let mut new_contig = n;
+                while self
+                    .content_delivered_out_of_order
+                    .remove(&(new_contig + 1))
+                {
+                    new_contig += 1;
+                }
+                self.content_delivered_contiguous = Some(new_contig);
+            }
+            std::cmp::Ordering::Greater => {
+                self.content_delivered_out_of_order.insert(n);
+            }
+            // Already covered by the contiguous frontier (a duplicate/retransmit) —
+            // decrypt_raw's skipped-key removal and AEAD authentication already
+            // prevent this from happening in practice; harmless no-op if it ever did.
+            std::cmp::Ordering::Less => {}
+        }
     }
 
     /// Enforce [`SKIPPED_CACHE_LIFETIME_MULTIPLIER`] `* max_skip` as a hard cap on the
@@ -354,18 +436,48 @@ impl RatchetState {
         self.skipped.len()
     }
 
+    /// The current receiving chain's identity (`dh_pub`) and the highest
+    /// message index such that *every* message `0..=n` on it has genuinely
+    /// had its content decrypted — used to build a TCP-style cumulative
+    /// "next expected sequence" ack piggybacked on outgoing chat messages
+    /// (`dratchet_core::payload::ChatContent`'s `piggyback_ack`), on top of
+    /// the existing dedicated per-message `DeliveryAck`. `None` until
+    /// message `0` on the current chain has actually been decrypted —
+    /// deliberately **not** the same as "`recv_n` advanced past it": `recv_n`
+    /// also advances past a *skipped* position (out-of-order delivery, or a
+    /// message that never arrives at all), which only caches a key for
+    /// later, decrypting nothing. Reporting `recv_n`'s position here would
+    /// let a cumulative ack falsely claim a still-undelivered skipped
+    /// message as received — see `content_delivered_contiguous`'s doc and
+    /// `tests::receiving_progress_never_claims_a_permanently_skipped_message_as_delivered`.
+    /// Deliberately scoped to only the *current* chain, not every
+    /// historical one this ratchet has ever stepped through — the same
+    /// "next expected in the current stream" scope TCP's cumulative ack
+    /// has, not a full historical ledger.
+    pub fn receiving_progress(&self) -> Option<(Vec<u8>, u32)> {
+        let dh_remote = self.dh_remote?;
+        let highest = self.content_delivered_contiguous?;
+        Some((dh_remote.to_bytes().to_vec(), highest))
+    }
+
     /// Serialize this ratchet's full live state to bytes — CBOR-encoded,
     /// covering every field (root key, both chain keys, the DH keypair, and
     /// the skipped-message-key cache). **Not an at-rest-safe format on its
     /// own**: this is exactly the key material forward secrecy protects, so
     /// a caller persisting these bytes (`store/`'s local database) must
     /// encrypt them first and never write them anywhere unencrypted.
-    pub fn export(&self) -> Vec<u8> {
+    ///
+    /// DRA-0047 (`docs/DELIVERY_FAILURE_FINDINGS.md`): the returned buffer
+    /// is [`Zeroizing`], so this material -- which the paragraph above
+    /// correctly calls "exactly the key material forward secrecy
+    /// protects" -- is wiped when the caller drops it instead of being
+    /// left in freed heap memory for a core dump or debugger.
+    pub fn export(&self) -> Zeroizing<Vec<u8>> {
         let exported = ExportedRatchetState::from(self);
         let mut bytes = Vec::new();
         ciborium::into_writer(&exported, &mut bytes)
             .expect("CBOR encoding of a well-formed struct cannot fail");
-        bytes
+        Zeroizing::new(bytes)
     }
 
     /// The inverse of [`RatchetState::export`] — reconstructs a ratchet
@@ -420,6 +532,18 @@ struct ExportedRatchetState {
     prev_chain_len: u32,
     skipped: Vec<ExportedSkippedEntry>,
     skipped_order: Vec<ExportedSkippedOrderEntry>,
+    /// Added after the initial `receiving_progress` shipped conflating
+    /// "skipped past" with "delivered" (the bug this field's introduction
+    /// fixed) — defaults to "nothing delivered yet" on an older export
+    /// that predates it. That's a conservative, safe default: it can only
+    /// under-report an already-delivered message as not-yet-confirmed
+    /// (never the reverse), and self-heals the moment this chain's next DH
+    /// ratchet step resets it fresh — same as any other still-genuinely-
+    /// mid-chain gap.
+    #[serde(default)]
+    content_delivered_contiguous: Option<u32>,
+    #[serde(default)]
+    content_delivered_out_of_order: Vec<u32>,
 }
 
 impl From<&RatchetState> for ExportedRatchetState {
@@ -452,6 +576,12 @@ impl From<&RatchetState> for ExportedRatchetState {
                     dh_pub: dh.0.to_vec(),
                     n: *n,
                 })
+                .collect(),
+            content_delivered_contiguous: r.content_delivered_contiguous,
+            content_delivered_out_of_order: r
+                .content_delivered_out_of_order
+                .iter()
+                .copied()
                 .collect(),
         }
     }
@@ -527,6 +657,8 @@ impl TryFrom<ExportedRatchetState> for RatchetState {
             prev_chain_len: e.prev_chain_len,
             skipped,
             skipped_order,
+            content_delivered_contiguous: e.content_delivered_contiguous,
+            content_delivered_out_of_order: e.content_delivered_out_of_order.into_iter().collect(),
         })
     }
 }
@@ -624,26 +756,47 @@ struct RatchetStep {
     new_dh_self_public: PublicKey,
 }
 
+/// **DRA-0038 (`docs/DELIVERY_FAILURE_FINDINGS.md`), the reason this
+/// returns `Result`:** `incoming_dh` is `envelope.dh_pub`, taken verbatim
+/// off the wire. X25519's order-8 subgroup means a low-order point makes
+/// both `diffie_hellman` calls below return all-zeros, so `kdf_rk` — which
+/// takes the DH output as its IKM and the old root key as its salt —
+/// derives the new root key and *both* chain keys as a pure, deterministic
+/// function of the **old root key alone**.
+///
+/// That destroys the Double Ratchet's break-in recovery (post-compromise
+/// security): a DH step is supposed to heal a conversation whose keys
+/// leaked, because the attacker can't compute the fresh DH. Pin every step
+/// to a low-order point and the healing never happens — anyone who learns
+/// the root key once keeps deriving every future key forever, and a
+/// malicious peer can force exactly that on a conversation they're a
+/// legitimate party to.
 fn compute_dh_ratchet_step(
     root_key: &[u8; 32],
     dh_self_secret: &StaticSecret,
     incoming_dh: &PublicKey,
-) -> RatchetStep {
+) -> Result<RatchetStep> {
     let dh_output = dh_self_secret.diffie_hellman(incoming_dh);
+    if !dh_output.was_contributory() {
+        return Err(Error::NonContributoryHandshake);
+    }
     let (root_after_recv, receiving_chain_key) = kdf_rk(root_key, dh_output.as_bytes());
 
     let new_secret = StaticSecret::random_from_rng(OsRng);
     let new_public = PublicKey::from(&new_secret);
     let dh_output = new_secret.diffie_hellman(incoming_dh);
+    if !dh_output.was_contributory() {
+        return Err(Error::NonContributoryHandshake);
+    }
     let (root_after_send, sending_chain_key) = kdf_rk(&root_after_recv, dh_output.as_bytes());
 
-    RatchetStep {
+    Ok(RatchetStep {
         new_root_key: root_after_send,
         new_receiving_chain_key: receiving_chain_key,
         new_sending_chain_key: sending_chain_key,
         new_dh_self_secret: new_secret,
         new_dh_self_public: new_public,
-    }
+    })
 }
 
 /// Derive the AEAD encryption key and nonce from a single-use message key, per
@@ -858,6 +1011,125 @@ mod tests {
     }
 
     #[test]
+    fn receiving_progress_is_none_until_message_zero_is_actually_decrypted() {
+        let (mut alice, mut bob) = matched_pair();
+        assert_eq!(
+            bob.receiving_progress(),
+            None,
+            "nothing decrypted yet on this chain"
+        );
+
+        let e0 = alice.encrypt(&chat("zero")).unwrap();
+        let e1 = alice.encrypt(&chat("one")).unwrap();
+
+        // Deliver message 1 first, skipping over message 0 — bob's `recv_n`
+        // advances past 0, but 0's *content* hasn't been decrypted, only its key
+        // cached for later. `receiving_progress` must not claim 0 as delivered.
+        bob.decrypt_raw(&e1).unwrap();
+        assert_eq!(
+            bob.receiving_progress(),
+            None,
+            "message 0 was skipped, not decrypted — nothing contiguous from the start yet"
+        );
+
+        // Once 0 actually arrives and decrypts, the gap closes and both are
+        // correctly reported as delivered.
+        bob.decrypt_raw(&e0).unwrap();
+        let (dh_pub, highest) = bob.receiving_progress().expect("now delivered");
+        assert_eq!(highest, 1);
+        assert_eq!(
+            dh_pub,
+            alice.dh_self.as_ref().unwrap().1.as_bytes().to_vec()
+        );
+    }
+
+    /// The bug this whole mechanism exists to close, found via this session's own
+    /// live UI testing: a cumulative "next expected sequence" ack must never claim a
+    /// message as delivered when it was only ever skipped-and-cached, not actually
+    /// decrypted — otherwise a sender sees a false "delivered" confirmation for a
+    /// message the recipient never really got and never will (its skipped key just
+    /// sits in the cache, unused, since no later copy of it is ever going to arrive).
+    #[test]
+    fn receiving_progress_never_claims_a_permanently_skipped_message_as_delivered() {
+        let (mut alice, mut bob) = matched_pair();
+        let e0 = alice.encrypt(&chat("lost forever")).unwrap();
+        let e1 = alice.encrypt(&chat("arrives fine")).unwrap();
+        let _ = e0; // simulates message 0 never reaching bob at all (permanent loss)
+
+        bob.decrypt_raw(&e1).unwrap();
+        assert_eq!(
+            bob.receiving_progress(),
+            None,
+            "message 1 decrypted, but message 0 — still skipped, never delivered — \
+             must not be reported as received just because the chain moved past it"
+        );
+
+        // Bob's own next message must therefore carry no piggyback ack at all yet —
+        // the app layer (`dratchet_app::send_message`) maps `None` here to "omit
+        // `piggyback_ack`", so this is the exact guarantee that closes the false-
+        // positive-delivery bug at its source.
+    }
+
+    #[test]
+    fn receiving_progress_catches_up_once_an_out_of_order_gap_closes() {
+        let (mut alice, mut bob) = matched_pair();
+        let e0 = alice.encrypt(&chat("zero")).unwrap();
+        let e1 = alice.encrypt(&chat("one")).unwrap();
+        let e2 = alice.encrypt(&chat("two")).unwrap();
+
+        bob.decrypt_raw(&e2).unwrap();
+        assert_eq!(bob.receiving_progress(), None, "0 and 1 both still missing");
+        bob.decrypt_raw(&e1).unwrap();
+        assert_eq!(
+            bob.receiving_progress(),
+            None,
+            "1 arrived, but 0 is still missing — 1 alone can't be reported \
+             without 0, since the ack is cumulative, not per-message"
+        );
+        bob.decrypt_raw(&e0).unwrap();
+        let (_, highest) = bob
+            .receiving_progress()
+            .expect("0 closes the gap, pulling in the already-delivered 1 and 2");
+        assert_eq!(highest, 2);
+    }
+
+    #[test]
+    fn receiving_progress_resets_on_a_dh_ratchet_step_not_carried_over_from_the_old_chain() {
+        let (mut alice, mut bob) = matched_pair();
+        let a0 = alice.encrypt(&chat("a0")).unwrap();
+        let a1 = alice.encrypt(&chat("a1")).unwrap();
+        let a2 = alice.encrypt(&chat("a2")).unwrap();
+        bob.decrypt_raw(&a0).unwrap();
+        bob.decrypt_raw(&a1).unwrap();
+        bob.decrypt_raw(&a2).unwrap();
+        assert_eq!(
+            bob.receiving_progress().unwrap().1,
+            2,
+            "bob has genuinely decrypted three messages on alice's first chain"
+        );
+
+        // Alice's reply-to-bob's-reply ratchets *her* sending chain onto a new
+        // key (triggered when she processes bob's own reply below) — so this
+        // next message from alice arrives on a brand-new chain from bob's
+        // point of view, restarting at n=0 on that chain.
+        let b0 = bob.encrypt(&chat("b0")).unwrap();
+        alice.decrypt_raw(&b0).unwrap();
+        let a3 = alice.encrypt(&chat("a3")).unwrap();
+        assert_ne!(
+            a3.dh_pub, a0.dh_pub,
+            "a3 really is on a different chain than a0/a1/a2"
+        );
+
+        bob.decrypt_raw(&a3).unwrap();
+        assert_eq!(
+            bob.receiving_progress().unwrap().1,
+            0,
+            "the new chain starts fresh at 0 — bob's progress must not still \
+             report 2 from the old, now-superseded chain"
+        );
+    }
+
+    #[test]
     fn each_message_key_is_single_use_replay_is_rejected() {
         let (mut alice, mut bob) = matched_pair();
         let e0 = alice.encrypt(&chat("only once")).unwrap();
@@ -882,6 +1154,65 @@ mod tests {
         let mut e0 = alice.encrypt(&chat("hello")).unwrap();
         e0.n = 5; // header field, part of the AEAD associated data
         assert!(matches!(bob.decrypt_raw(&e0), Err(Error::Aead)));
+    }
+
+    /// Penetration-test finding DRA-0042: the envelope header names the
+    /// conversation it belongs to, and `decrypt_raw` never compared that
+    /// name to the session actually decrypting it.
+    ///
+    /// The field rides inside the AEAD associated data, so a third party
+    /// cannot rewrite it in transit -- which is exactly why a naive
+    /// tamper-the-byte test proves nothing here. The real gap is that the
+    /// associated data is the envelope's *own* header, so a sender who
+    /// stamps a different conversation id produces a perfectly
+    /// self-consistent, perfectly authentic envelope, and the receiving
+    /// ratchet had nothing to compare it against. Two sessions sharing a
+    /// root key but disagreeing about which conversation they are
+    /// reproduce that exactly.
+    #[test]
+    fn an_envelope_claiming_a_different_conversation_is_rejected() {
+        let root_key = [7u8; 32];
+        let responder_secret = StaticSecret::random_from_rng(OsRng);
+        let responder_public = PublicKey::from(&responder_secret);
+
+        // Alice believes she is in conversation A...
+        let mut alice = RatchetState::init_as_initiator(
+            [0xAAu8; 16],
+            root_key,
+            responder_public,
+            DEFAULT_MAX_SKIP,
+        )
+        .unwrap();
+        // ...Bob, decrypting, is session B.
+        let mut bob = RatchetState::init_as_responder(
+            [0xBBu8; 16],
+            root_key,
+            responder_secret,
+            DEFAULT_MAX_SKIP,
+        )
+        .unwrap();
+
+        let misattributed = alice.encrypt(&chat("hello")).unwrap();
+        assert_eq!(misattributed.conversation_id, [0xAAu8; 16]);
+
+        assert!(
+            matches!(
+                bob.decrypt_raw(&misattributed),
+                Err(Error::ConversationIdMismatch)
+            ),
+            "VULNERABILITY: a ratchet accepted an envelope naming a conversation that is not \
+             its own -- the conversation_id a sender chooses must be checked against the \
+             session decrypting it, not merely carried along"
+        );
+
+        // The rejection is transactional, like every other one here: a
+        // matched session still works normally afterwards.
+        let (mut a2, mut b2) = matched_pair();
+        let genuine = a2.encrypt(&chat("still fine")).unwrap();
+        assert_eq!(
+            b2.decrypt_payload(&genuine).unwrap(),
+            (PAYLOAD_CHAT, b"still fine".to_vec())
+        );
     }
 
     #[test]
@@ -917,6 +1248,78 @@ mod tests {
         assert!(matches!(
             bob.decrypt_raw(&last.unwrap()),
             Err(Error::MaxSkipExceeded(skip)) if skip == small_max_skip
+        ));
+    }
+
+    /// Delivery-failure scenario: within one real burst, the last-arriving
+    /// message is impossibly far ahead (exactly the case above) — but does
+    /// rejecting it leave the conversation usable for whichever *other*
+    /// messages in the same burst are actually within reach? The doc
+    /// comment on `decrypt_raw` promises the rejection is "transactional"
+    /// with no side effects; this pins that promise down as a behavioral
+    /// test, not just a doc claim — the practical answer to "did one
+    /// undeliverable message wedge the whole conversation."
+    #[test]
+    fn a_maxskipexceeded_rejection_does_not_wedge_the_conversation_for_reachable_messages() {
+        let conversation_id = [1u8; 16];
+        let root_key = [7u8; 32];
+        let responder_secret = StaticSecret::random_from_rng(OsRng);
+        let responder_public = PublicKey::from(&responder_secret);
+        let small_max_skip = MIN_MAX_SKIP;
+
+        let mut alice = RatchetState::init_as_initiator(
+            conversation_id,
+            root_key,
+            responder_public,
+            small_max_skip,
+        )
+        .unwrap();
+        let mut bob = RatchetState::init_as_responder(
+            conversation_id,
+            root_key,
+            responder_secret,
+            small_max_skip,
+        )
+        .unwrap();
+
+        // Wide enough that the last message stays unreachable even *after*
+        // Bob catches up to the reachable one below — a tighter burst (e.g.
+        // `small_max_skip + 10`) turned out, in an earlier version of this
+        // test, to let the "unreachable" message become reachable once
+        // Bob's position advanced close enough — a real, useful finding in
+        // its own right (reachability is relative to *current* position,
+        // not fixed at arrival time), but not the thing this test is
+        // proving, so the gap here is widened to keep the two effects
+        // separate.
+        let burst_size = small_max_skip * 4;
+        let envelopes: Vec<_> = (0..burst_size)
+            .map(|i| alice.encrypt(&chat(&format!("msg {i}"))).unwrap())
+            .collect();
+
+        // The far-ahead message is rejected, exactly as the sibling test
+        // above already proves.
+        assert!(matches!(
+            bob.decrypt_raw(&envelopes[(burst_size - 1) as usize]),
+            Err(Error::MaxSkipExceeded(_))
+        ));
+
+        // A message from earlier in the *same* burst, still within reach of
+        // Bob's (untouched) starting position, must still decrypt — the
+        // failed attempt above left no trace to interfere with it.
+        let reachable_index = (small_max_skip / 2) as usize;
+        let recovered = bob
+            .decrypt_raw(&envelopes[reachable_index])
+            .expect("an in-range message must decrypt fine after a prior rejection");
+        assert_eq!(read_chat(&recovered), format!("msg {reachable_index}"));
+
+        // The specific far-ahead message is still out of reach even from
+        // Bob's now-advanced position (burst_size - reachable_index still
+        // exceeds max_skip) — genuinely unrecoverable, not a bug, just the
+        // inherent limit: it never arrives again once nothing will ever
+        // bring the gap back within max_skip.
+        assert!(matches!(
+            bob.decrypt_raw(&envelopes[(burst_size - 1) as usize]),
+            Err(Error::MaxSkipExceeded(_))
         ));
     }
 
@@ -1123,6 +1526,8 @@ mod tests {
             prev_chain_len: r.prev_chain_len,
             skipped: r.skipped.clone(),
             skipped_order: r.skipped_order.clone(),
+            content_delivered_contiguous: r.content_delivered_contiguous,
+            content_delivered_out_of_order: r.content_delivered_out_of_order.clone(),
         }
     }
 
@@ -1340,5 +1745,101 @@ mod tests {
             exported.dh_self_secret,
             alice.dh_self.as_ref().map(|(s, _)| s.to_bytes().to_vec())
         );
+    }
+
+    /// The all-zero X25519 point — order 1, so `diffie_hellman` against it
+    /// returns all-zeros for every private key (RFC 7748's small subgroup).
+    const LOW_ORDER_POINT: [u8; 32] = [0u8; 32];
+
+    /// Penetration-test finding DRA-0038: a DH ratchet step against a
+    /// low-order `dh_pub` must never derive its new keys from the old root
+    /// key alone. Pre-fix it did — two parties holding *completely
+    /// different* DH secrets, stepping against the same low-order point,
+    /// landed on identical new root *and* chain keys, because every DH
+    /// output was all-zeros and `kdf_rk` takes that output as its IKM.
+    /// That means an attacker who learns the root key once keeps deriving
+    /// every future key: the Double Ratchet's break-in recovery
+    /// (post-compromise security) never heals the conversation.
+    #[test]
+    fn a_low_order_dh_pub_cannot_pin_the_ratchet_step_to_the_old_root_key() {
+        let shared_root_key = [42u8; 32];
+        let low_order = PublicKey::from(LOW_ORDER_POINT);
+
+        let alice_secret = StaticSecret::random_from_rng(OsRng);
+        let bob_secret = StaticSecret::random_from_rng(OsRng);
+
+        let alice_step = compute_dh_ratchet_step(&shared_root_key, &alice_secret, &low_order);
+        let bob_step = compute_dh_ratchet_step(&shared_root_key, &bob_secret, &low_order);
+
+        match (alice_step, bob_step) {
+            // Fixed: a non-contributory ratchet step is refused.
+            (Err(_), Err(_)) => {}
+            (Ok(alice_step), Ok(bob_step)) => {
+                assert_ne!(
+                    alice_step.new_root_key, bob_step.new_root_key,
+                    "VULNERABILITY: a low-order dh_pub forced the DH output to all-zeros, so the \
+                     new root key is a pure function of the OLD root key -- break-in recovery is \
+                     defeated and anyone who ever learns the root key derives every future key"
+                );
+                assert_ne!(
+                    alice_step.new_receiving_chain_key, bob_step.new_receiving_chain_key,
+                    "VULNERABILITY: the receiving chain key is likewise determined entirely by \
+                     the old root key"
+                );
+            }
+            _ => panic!("both sides must agree on whether the step is acceptable"),
+        }
+    }
+
+    /// DRA-0038, end to end through the real decrypt path: a forged
+    /// envelope carrying a low-order `dh_pub` must be rejected and must
+    /// leave the ratchet completely untouched — the same transactional
+    /// guarantee `garbage_envelope_does_not_desync_the_ratchet` asserts
+    /// for ordinary forgeries.
+    #[test]
+    fn a_low_order_dh_pub_envelope_is_rejected_without_desyncing_the_ratchet() {
+        let (mut alice, mut bob) = matched_pair();
+
+        let envelope = alice.encrypt_payload(0, b"a real message").unwrap();
+        bob.decrypt_payload(&envelope).unwrap();
+
+        let root_before = *bob.root_key;
+        let recv_n_before = bob.recv_n;
+        let dh_remote_before = bob.dh_remote.map(|k| k.to_bytes());
+
+        let mut forged = alice.encrypt_payload(0, b"forged").unwrap();
+        forged.dh_pub = LOW_ORDER_POINT;
+
+        assert!(
+            bob.decrypt_payload(&forged).is_err(),
+            "an envelope naming a low-order dh_pub must be rejected"
+        );
+        assert_eq!(*bob.root_key, root_before, "the root key must be untouched");
+        assert_eq!(bob.recv_n, recv_n_before, "recv_n must be untouched");
+        assert_eq!(
+            bob.dh_remote.map(|k| k.to_bytes()),
+            dh_remote_before,
+            "dh_remote must be untouched"
+        );
+    }
+
+    /// The fix must not be overly strict: ordinary DH ratchet steps
+    /// between two genuine parties must keep working, and must keep
+    /// producing *different* keys for different secrets.
+    #[test]
+    fn ordinary_dh_ratchet_steps_still_succeed_and_stay_distinct() {
+        let shared_root_key = [42u8; 32];
+        let peer_secret = StaticSecret::random_from_rng(OsRng);
+        let peer_public = PublicKey::from(&peer_secret);
+
+        let alice_secret = StaticSecret::random_from_rng(OsRng);
+        let bob_secret = StaticSecret::random_from_rng(OsRng);
+
+        let alice_step = compute_dh_ratchet_step(&shared_root_key, &alice_secret, &peer_public)
+            .expect("a genuine ratchet step must still succeed");
+        let bob_step = compute_dh_ratchet_step(&shared_root_key, &bob_secret, &peer_public)
+            .expect("a genuine ratchet step must still succeed");
+
+        assert_ne!(alice_step.new_root_key, bob_step.new_root_key);
     }
 }

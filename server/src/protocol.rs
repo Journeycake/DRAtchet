@@ -55,6 +55,8 @@ frame_tags! {
     0x0E => MailboxDelete,
     0x0F => Ack,
     0x10 => Error,
+    0x11 => FetchOwnPrekeyCount,
+    0x12 => OwnPrekeyCount,
 }
 
 /// Encode a typed frame body as `[tag][CBOR]`.
@@ -90,6 +92,13 @@ pub fn decode_body<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T> {
 pub struct AuthChallenge {
     #[serde(with = "serde_bytes")]
     pub nonce: Vec<u8>,
+    /// DRA-0064: a random id this server process picked at startup. The
+    /// mailboxes live only in memory, so a different id from the one a
+    /// client saw last means the server restarted and every queued message
+    /// was lost. Empty from a server that predates it (and an older client
+    /// ignores it).
+    #[serde(default, with = "serde_bytes")]
+    pub server_boot_id: Vec<u8>,
 }
 
 /// Self-certifying: carries the raw public key itself rather than a claimed
@@ -267,18 +276,133 @@ pub struct Ack {
     pub ok: bool,
 }
 
+/// Ask how many of *this connection's own* one-time prekeys the directory
+/// still has unconsumed — `ARCHITECTURE.md` §3.4's replenishment gap: an
+/// account that only ever registers once slowly degrades every
+/// subsequent handshake's forward secrecy as `FetchBundle` calls consume
+/// its batch, with nothing telling the client it happened. No fields:
+/// the target is always the caller's own authenticated identity (never
+/// another account's — that would turn "prekey pool size" into a new
+/// enumeration/timing oracle `ARCHITECTURE.md` §11.8 already works to
+/// close for the directory), so there's nothing to name.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FetchOwnPrekeyCount {}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OwnPrekeyCount {
+    pub remaining: u32,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ErrorFrame {
     pub message: String,
+    /// DRA-0058: which refusal this is, as a value a client can branch on
+    /// instead of matching `message` text. Defaults to `Unspecified` when
+    /// absent, so a frame from a server predating this field still decodes
+    /// (and an older client simply ignores the extra field).
+    #[serde(default)]
+    pub code: ErrorCode,
+}
+
+/// DRA-0058: the machine-readable reason behind an [`ErrorFrame`], one per
+/// `crate::error::Error` variant. `Unspecified` covers a missing code and
+/// any code a newer server sends that this build doesn't know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ErrorCode {
+    MalformedFrame,
+    AuthRequired,
+    AuthFailed,
+    AlreadyAuthenticated,
+    InvalidBundle,
+    UsernameTaken,
+    ProofOfWorkRequired,
+    RateLimited,
+    NotFound,
+    NotMailboxOwner,
+    EnvelopeTooLarge,
+    MailboxFull,
+    WriterQuotaExceeded,
+    NewMailboxRateLimited,
+    TooManyOneTimePrekeys,
+    UsernameTooLong,
+    UsernameInvalidCharacters,
+    SdpTooLarge,
+    IceCandidatesInvalid,
+    #[default]
+    #[serde(other)]
+    Unspecified,
+}
+
+impl ErrorCode {
+    /// A refusal that means "slow down", not "you did something wrong":
+    /// the request can be retried later, on the same connection.
+    pub fn is_rate_limit(self) -> bool {
+        matches!(
+            self,
+            ErrorCode::RateLimited | ErrorCode::NewMailboxRateLimited
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// DRA-0058 guard: adding `code` must not break decoding across
+    /// versions -- a frame without it (an older server) and a code this
+    /// build doesn't know (a newer server) both decode as `Unspecified`.
+    #[test]
+    fn error_frames_decode_across_versions() {
+        #[derive(Serialize)]
+        struct OldErrorFrame {
+            message: String,
+        }
+        #[derive(Serialize)]
+        struct FutureErrorFrame {
+            message: String,
+            code: &'static str,
+        }
+        let mut old = Vec::new();
+        ciborium::into_writer(
+            &OldErrorFrame {
+                message: "x".into(),
+            },
+            &mut old,
+        )
+        .unwrap();
+        let decoded: ErrorFrame = decode_body(&old).unwrap();
+        assert_eq!(decoded.code, ErrorCode::Unspecified);
+
+        let mut future = Vec::new();
+        ciborium::into_writer(
+            &FutureErrorFrame {
+                message: "x".into(),
+                code: "SomethingAddedLater",
+            },
+            &mut future,
+        )
+        .unwrap();
+        let decoded: ErrorFrame = decode_body(&future).unwrap();
+        assert_eq!(decoded.code, ErrorCode::Unspecified);
+
+        let mut current = Vec::new();
+        ciborium::into_writer(
+            &ErrorFrame {
+                message: "x".into(),
+                code: ErrorCode::RateLimited,
+            },
+            &mut current,
+        )
+        .unwrap();
+        let decoded: ErrorFrame = decode_body(&current).unwrap();
+        assert_eq!(decoded.code, ErrorCode::RateLimited);
+        assert!(decoded.code.is_rate_limit());
+    }
+
     #[test]
     fn round_trips_a_typed_frame() {
         let body = AuthChallenge {
+            server_boot_id: Vec::new(),
             nonce: vec![7u8; 32],
         };
         let frame = encode(FrameTag::AuthChallenge, &body);
@@ -315,6 +439,7 @@ mod tests {
     #[test]
     fn byte_fields_encode_as_cbor_byte_strings_not_integer_arrays() {
         let body = AuthChallenge {
+            server_boot_id: Vec::new(),
             nonce: vec![1, 2, 3],
         };
         let frame = encode(FrameTag::AuthChallenge, &body);

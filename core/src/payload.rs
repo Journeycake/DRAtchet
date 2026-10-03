@@ -160,6 +160,46 @@ impl ConversationWipePolicyAnnounce {
     }
 }
 
+/// `PAYLOAD_CONVERSATION_WIPE_REQUEST`'s content — `MESSAGE_SCHEMA.md` §10.
+/// Originally empty content (no wire shape at all): the requester's own
+/// `include_session` preference alone is enough to decide the *effective*
+/// scope (`store::wipe_policy::Contact::effective_wipe_include_session`'s
+/// "most-restrictive-wins" merge means either side wanting the fuller wipe
+/// wins), but with nothing here to carry it, a recipient could only ever
+/// apply *their own* previously-announced preference
+/// (`ConversationWipePolicyAnnounce`, a separate message) — if the
+/// requester had turned `include_session` on locally without a prior,
+/// separately-landed announcement, the recipient had no way to know and
+/// wiped messages-only while the requester's own ratchet was already gone,
+/// a real, found-by-testing desync (`docs/DELIVERY_FAILURE_FINDINGS.md`
+/// finding #30). Carrying the requester's own `include_session` here
+/// closes it at the source: the recipient now folds it into their own
+/// effective decision for *this* wipe directly, without depending on
+/// announce-then-wait ordering at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationWipeRequestContent {
+    /// The requester's own `include_session` preference, computed the same
+    /// way `request_conversation_wipe` already computes it for the
+    /// requester's own local wipe — not necessarily "true" just because
+    /// this field exists; the recipient still ORs it with their own local
+    /// preference, matching most-restrictive-wins.
+    pub include_session: bool,
+}
+
+impl ConversationWipeRequestContent {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        ciborium::into_writer(self, &mut bytes)
+            .expect("CBOR encoding of a well-formed struct cannot fail");
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        ciborium::from_reader(bytes)
+            .map_err(|_| Error::MalformedPayload("not a valid ConversationWipeRequestContent"))
+    }
+}
+
 /// `PAYLOAD_FIRST_CONTACT`'s content — the pairing code the recipient
 /// generated and read out over an already-trusted channel (§6.4), plus
 /// the sender's chosen `username#NNNN` so the recipient's client can
@@ -187,6 +227,109 @@ impl FirstContactContent {
     }
 }
 
+/// A TCP-style cumulative "next expected sequence" ack, piggybacked on
+/// an ordinary outgoing chat message (`ChatContent::piggyback_ack`) —
+/// supplementary and redundant to the dedicated per-message
+/// `DeliveryAck` below, not a replacement for it. Where `DeliveryAck`
+/// names one exact message, this names "everything up to and including
+/// `highest_n` on chain `dh_pub`" — so if a dedicated `DeliveryAck` for
+/// an earlier message was itself lost (e.g. the connection dropped
+/// between decrypting that message and sending its ack), the next
+/// ordinary chat message in the same direction re-asserts coverage for
+/// it, the same way a TCP segment's ack field covers everything received
+/// so far even if an earlier discrete ACK segment never arrived. See
+/// `Db::mark_messages_delivered_up_to` for how a receiver applies this.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PiggybackAck {
+    #[serde(with = "serde_bytes")]
+    pub dh_pub: Vec<u8>,
+    pub highest_n: u32,
+}
+
+/// `PAYLOAD_CHAT`'s content. `text` is exactly what earlier versions of
+/// this protocol sent as the payload's entire (unwrapped) content —
+/// wrapped in a small CBOR struct now so an ordinary chat message can
+/// also carry `piggyback_ack` alongside it, without a second payload
+/// type or a second envelope. `piggyback_ack` is `None` whenever the
+/// sender's ratchet has nothing yet received on its current chain
+/// (`RatchetState::receiving_progress`) — most commonly, the very first
+/// message either side ever sends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatContent {
+    #[serde(with = "serde_bytes")]
+    pub text: Vec<u8>,
+    pub piggyback_ack: Option<PiggybackAck>,
+    /// DRA-0060: the sender's own id for this message, the same on every
+    /// resend of it, so the recipient can drop a copy it already has.
+    /// Encrypted with the rest of the payload; the relay never sees it.
+    /// Empty from a sender that predates it (and omitted on the wire when
+    /// empty, so an older recipient sees exactly the old shape).
+    #[serde(default, skip_serializing_if = "Vec::is_empty", with = "serde_bytes")]
+    pub message_id: Vec<u8>,
+}
+
+impl ChatContent {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        ciborium::into_writer(self, &mut bytes)
+            .expect("CBOR encoding of a well-formed struct cannot fail");
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        ciborium::from_reader(bytes).map_err(|_| Error::MalformedPayload("not a valid ChatContent"))
+    }
+}
+
+/// `PAYLOAD_DELIVERY_ACK`'s content — `MESSAGE_SCHEMA.md` §7,
+/// `ARCHITECTURE.md` §4.6. Sent by a recipient the moment a ratchet
+/// envelope **decrypts successfully** (not on mere receipt — a
+/// corrupted-in-transit message never gets falsely acked), so the sender
+/// can prune it from its local outbox/retry queue and the UI can show a
+/// delivered indicator. Deliberately *delivery*, not *read* — see
+/// `ARCHITECTURE.md` §4.6 for why those stay separate signals.
+///
+/// `conversation_id` is included even though the sending ratchet already
+/// scopes this message to one conversation — it's cheap, matches the
+/// documented wire shape exactly, and gives a receiver an explicit sanity
+/// check rather than relying purely on which session decrypted it.
+///
+/// `acked_n` is the just-decrypted envelope's ratchet header `n`
+/// (`docs/MESSAGE_SCHEMA.md` §2) — scoped to the sending chain that
+/// produced it, not globally unique across a conversation's lifetime:
+/// every Double Ratchet DH step resets the new sending chain's `n` back
+/// to 0. `dh_pub` (that same envelope's ratchet header `dh_pub`) is
+/// carried alongside it for exactly this reason — together `(dh_pub, n)`
+/// is a genuinely unique identifier for one specific message, the same
+/// pair `RatchetState`'s own skipped-message-key cache already keys by
+/// (`core/src/ratchet.rs`'s `SkippedEntry`). This closes a real gap the
+/// first implementation shipped with — `acked_n` alone collided across
+/// chains that happened to share an `n` (every fresh chain starts at 0,
+/// so this was the common case, not a rare one) — see
+/// `docs/DELIVERY_FAILURE_FINDINGS.md` finding #28 for the original
+/// limitation and why this field closes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryAck {
+    #[serde(with = "serde_bytes")]
+    pub conversation_id: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub dh_pub: Vec<u8>,
+    pub acked_n: u32,
+}
+
+impl DeliveryAck {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        ciborium::into_writer(self, &mut bytes)
+            .expect("CBOR encoding of a well-formed struct cannot fail");
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        ciborium::from_reader(bytes).map_err(|_| Error::MalformedPayload("not a valid DeliveryAck"))
+    }
+}
+
 /// `PAYLOAD_PROFILE_ANNOUNCE`'s content — the announcing side's current
 /// `username#NNNN`. Deliberately as small as `RoutingIdAnnounce`: nothing
 /// about *why* it changed travels over the wire, since the recipient
@@ -205,9 +348,21 @@ impl ProfileAnnounce {
         bytes
     }
 
+    /// DRA-0057: the announced username is held to the same rule the
+    /// directory enforces at registration (`crate::username::is_acceptable`:
+    /// length and character set) right here, at the parse boundary. Before
+    /// this, only `store::profile::record_peer_profile` checked it (DRA-0025,
+    /// DRA-0043), so any other consumer of a decoded `ProfileAnnounce` got an
+    /// unvalidated, peer-chosen string.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        ciborium::from_reader(bytes)
-            .map_err(|_| Error::MalformedPayload("not a valid ProfileAnnounce"))
+        let announce: Self = ciborium::from_reader(bytes)
+            .map_err(|_| Error::MalformedPayload("not a valid ProfileAnnounce"))?;
+        if !crate::username::is_acceptable(&announce.username) {
+            return Err(Error::MalformedPayload(
+                "ProfileAnnounce username is too long or uses disallowed characters",
+            ));
+        }
+        Ok(announce)
     }
 }
 
@@ -306,11 +461,26 @@ mod tests {
     }
 
     #[test]
-    fn conversation_wipe_request_is_empty_content_tagged_and_padded_like_any_other_payload() {
-        let padded = tag_and_pad(PAYLOAD_CONVERSATION_WIPE_REQUEST, &[]).unwrap();
-        let (ty, content) = untag_and_unpad(&padded).unwrap();
-        assert_eq!(ty, PAYLOAD_CONVERSATION_WIPE_REQUEST);
-        assert!(content.is_empty());
+    fn conversation_wipe_request_content_round_trips_through_encode_and_tag_and_pad() {
+        for include_session in [false, true] {
+            let request = ConversationWipeRequestContent { include_session };
+            let encoded = request.encode();
+            let decoded = ConversationWipeRequestContent::decode(&encoded).unwrap();
+            assert_eq!(decoded, request);
+
+            let padded = tag_and_pad(PAYLOAD_CONVERSATION_WIPE_REQUEST, &encoded).unwrap();
+            let (ty, content) = untag_and_unpad(&padded).unwrap();
+            assert_eq!(ty, PAYLOAD_CONVERSATION_WIPE_REQUEST);
+            assert_eq!(
+                ConversationWipeRequestContent::decode(&content).unwrap(),
+                request
+            );
+        }
+    }
+
+    #[test]
+    fn conversation_wipe_request_content_garbage_bytes_are_rejected_not_panicking() {
+        assert!(ConversationWipeRequestContent::decode(&[0xFF, 0x00, 0x01]).is_err());
     }
 
     #[test]
@@ -359,5 +529,84 @@ mod tests {
     #[test]
     fn profile_announce_garbage_bytes_are_rejected_not_panicking() {
         assert!(ProfileAnnounce::decode(&[0xFF, 0x00, 0x01]).is_err());
+    }
+
+    /// DRA-0057: a peer-chosen username that the directory would never
+    /// have accepted must not survive decoding, whoever consumes it next.
+    #[test]
+    fn profile_announce_decode_rejects_an_unacceptable_username() {
+        for bad in [
+            "a".repeat(crate::username::MAX_LEN + 1),
+            "\u{0430}lice".to_string(), // Cyrillic 'а' homograph
+            String::new(),
+        ] {
+            let encoded = ProfileAnnounce {
+                username: bad.clone(),
+                discriminator: 1,
+            }
+            .encode();
+            assert!(
+                ProfileAnnounce::decode(&encoded).is_err(),
+                "VULNERABILITY: ProfileAnnounce::decode accepted {bad:?}, a username the \
+                 directory rejects -- any consumer other than record_peer_profile gets it unchecked"
+            );
+        }
+        let ok = ProfileAnnounce {
+            username: "a".repeat(crate::username::MAX_LEN),
+            discriminator: 1,
+        };
+        assert_eq!(ProfileAnnounce::decode(&ok.encode()).unwrap(), ok);
+    }
+
+    #[test]
+    fn delivery_ack_round_trips_through_encode_and_tag_and_pad() {
+        let ack = DeliveryAck {
+            conversation_id: vec![9u8; 16],
+            dh_pub: vec![7u8; 32],
+            acked_n: 42,
+        };
+        let encoded = ack.encode();
+        let decoded = DeliveryAck::decode(&encoded).unwrap();
+        assert_eq!(decoded, ack);
+
+        let padded = tag_and_pad(PAYLOAD_DELIVERY_ACK, &encoded).unwrap();
+        let (ty, content) = untag_and_unpad(&padded).unwrap();
+        assert_eq!(ty, PAYLOAD_DELIVERY_ACK);
+        assert_eq!(DeliveryAck::decode(&content).unwrap(), ack);
+    }
+
+    #[test]
+    fn delivery_ack_garbage_bytes_are_rejected_not_panicking() {
+        assert!(DeliveryAck::decode(&[0xFF, 0x00, 0x01]).is_err());
+    }
+
+    #[test]
+    fn chat_content_round_trips_with_and_without_a_piggyback_ack() {
+        for piggyback_ack in [
+            None,
+            Some(PiggybackAck {
+                dh_pub: vec![3u8; 32],
+                highest_n: 7,
+            }),
+        ] {
+            let chat = ChatContent {
+                message_id: Vec::new(),
+                text: b"hi bob".to_vec(),
+                piggyback_ack,
+            };
+            let encoded = chat.encode();
+            let decoded = ChatContent::decode(&encoded).unwrap();
+            assert_eq!(decoded, chat);
+
+            let padded = tag_and_pad(PAYLOAD_CHAT, &encoded).unwrap();
+            let (ty, content) = untag_and_unpad(&padded).unwrap();
+            assert_eq!(ty, PAYLOAD_CHAT);
+            assert_eq!(ChatContent::decode(&content).unwrap(), chat);
+        }
+    }
+
+    #[test]
+    fn chat_content_garbage_bytes_are_rejected_not_panicking() {
+        assert!(ChatContent::decode(&[0xFF, 0x00, 0x01]).is_err());
     }
 }

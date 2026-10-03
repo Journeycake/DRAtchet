@@ -7,6 +7,7 @@
 //! §11.5's current text.)
 
 use std::fmt;
+use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -22,8 +23,119 @@ pub struct Message {
     pub sender_is_local: bool,
     #[serde(with = "serde_bytes")]
     pub content: Vec<u8>,
-    /// Unix seconds.
+    /// Unix seconds — coarse, and *not* on its own enough to order
+    /// messages for display (see `sequence`): plenty of real usage sends
+    /// several messages within the same second, and `list_messages`'
+    /// tie-break without a second key would otherwise fall back to
+    /// `keys_with_prefix`'s redb-key order, which is effectively random
+    /// (`id` is random, not sequential). Kept for display ("sent at
+    /// 2:30 PM") and as the primary sort key across longer gaps.
     pub timestamp: u64,
+    /// Tie-breaks `timestamp` with a real ordering guarantee —
+    /// `Db::message_sequence`, an in-memory counter incremented once per
+    /// `save_message_now` call. Starts at `0` on a brand-new `create`,
+    /// but `open` recovers it from whatever's already on disk
+    /// (`recover_message_sequence`) rather than naively resetting to
+    /// `0` — a restart landing in the same wall-clock second as
+    /// existing messages must not risk handing out a `sequence` value
+    /// that collides with, or sorts before, ones already saved (a real
+    /// bug this once was, closed after it broke the `wipe_conversation_since`
+    /// boundary comparison — `docs/DELIVERY_FAILURE_FINDINGS.md`).
+    pub sequence: u64,
+    /// Only meaningful when `sender_is_local` — the ratchet header `n`
+    /// (`docs/MESSAGE_SCHEMA.md` §2) this message was sent with, i.e. its
+    /// position within whatever sending chain was active at the time.
+    /// `None` for a received message (nothing sends *us* a `DeliveryAck`
+    /// to attach an `n` to) and for any locally-sent message predating
+    /// this field. Paired with `send_dh_pub` to match an incoming
+    /// `DeliveryAck` (`dratchet_core::payload::DeliveryAck`) back to the
+    /// message it acknowledges — see `Db::mark_message_delivered`'s doc.
+    pub send_n: Option<u32>,
+    /// Only meaningful when `sender_is_local` — the ratchet header
+    /// `dh_pub` (`docs/MESSAGE_SCHEMA.md` §2) this message was sent with,
+    /// i.e. which sending chain `send_n` is a position within. `None`
+    /// under the same conditions as `send_n`. `(send_dh_pub, send_n)`
+    /// together are a genuinely unique identifier for one specific
+    /// message — the same pair a `DeliveryAck` now carries
+    /// (`core::payload::DeliveryAck`'s doc) and the same pair
+    /// `RatchetState`'s own skipped-message-key cache already keys by.
+    /// Without this, `send_n` alone collides across sending chains, since
+    /// every Double Ratchet DH step resets a fresh chain's `n` back to 0
+    /// — the real gap `docs/DELIVERY_FAILURE_FINDINGS.md` finding #28
+    /// documents and this field closes.
+    #[serde(with = "serde_bytes")]
+    pub send_dh_pub: Option<Vec<u8>>,
+    /// Only meaningful for a *received* message — the ratchet header `n`
+    /// (`docs/MESSAGE_SCHEMA.md` §2) this message arrived with. `None`
+    /// for a locally-sent message and for any received message predating
+    /// this field (`#[serde(default)]`). Paired with `recv_dh_pub`,
+    /// mirroring `send_n`/`send_dh_pub`'s own reasoning: a ratchet header
+    /// is never legitimately reused for different content, so
+    /// `(recv_dh_pub, recv_n)` is a genuinely unique identifier for one
+    /// specific *incoming* message — what
+    /// `Db::save_received_message_idempotent` checks before inserting, to
+    /// close DRA-0012 (`docs/DELIVERY_FAILURE_FINDINGS.md`): two
+    /// overlapping `receive_pending` calls each decrypting the same
+    /// mailbox entry must not produce two stored messages.
+    #[serde(default)]
+    pub recv_n: Option<u32>,
+    /// Only meaningful for a *received* message — the ratchet header
+    /// `dh_pub` this message arrived with. See `recv_n`'s doc.
+    #[serde(default, with = "serde_bytes")]
+    pub recv_dh_pub: Option<Vec<u8>>,
+    /// Only meaningful when `sender_is_local` — whether a `DeliveryAck`
+    /// or a cumulative `PiggybackAck` for this message has been received
+    /// (`ARCHITECTURE.md` §4.6). Always `false` for a received message;
+    /// not itself a signal of anything there (a received message is
+    /// definitionally already delivered to us).
+    pub delivered: bool,
+    /// Only meaningful when `sender_is_local && !delivered` — set when
+    /// this client detected a connection interruption after sending this
+    /// message and before either acknowledgment path confirmed it, so
+    /// there's genuine reason to doubt whether it ever reached the relay
+    /// at all (as opposed to simply "sent, ack not back yet," the normal
+    /// transient state every message passes through). Cleared back to
+    /// `false` the moment `delivered` flips `true`, by either
+    /// `mark_message_delivered` or `mark_messages_delivered_up_to`.
+    /// `#[serde(default)]` so a message record written before this field
+    /// existed decodes as `false` (never uncertain) rather than failing
+    /// to decode at all.
+    #[serde(default)]
+    pub uncertain: bool,
+    /// DRA-0060/0063/0064: set on one of this side's own messages that the
+    /// user should be offered a resend for, and why. `None` for every
+    /// received message and every confirmed send. A resend re-encrypts the
+    /// same content at a fresh ratchet position (DRA-0059), never the old
+    /// key.
+    #[serde(default)]
+    pub retry_reason: Option<RetryReason>,
+    /// DRA-0060: on a *received* message, the sender's own id for it,
+    /// carried inside the encrypted `ChatContent`. A resend carries the
+    /// same id, so a copy the recipient already has is recognised and not
+    /// shown twice. `None` for messages from a sender that predates it.
+    #[serde(default, with = "serde_bytes")]
+    pub peer_message_id: Option<Vec<u8>>,
+    /// DRA-0063: when the server last accepted this (own) message -- the
+    /// start of the server's mailbox lifetime for it, which a retry
+    /// restarts. `None` for received messages and for sends not yet
+    /// accepted (then `timestamp` stands in).
+    #[serde(default)]
+    pub last_sent_at: Option<u64>,
+}
+
+/// Why one of this side's own messages is offered for a resend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RetryReason {
+    /// DRA-0060: the send didn't get the server's acknowledgement (no
+    /// connection, refused, or the Ack was lost). It may or may not have
+    /// reached the server.
+    SendFailed,
+    /// DRA-0063: accepted by the server but never confirmed delivered
+    /// within the mailbox lifetime, so the server has discarded it.
+    Expired,
+    /// DRA-0064: unconfirmed when the server restarted, which discards
+    /// every queued message.
+    ServerRestarted,
 }
 
 /// Hand-written, not `#[derive(Debug)]`: `content` is plaintext message
@@ -39,16 +151,63 @@ impl fmt::Debug for Message {
                 &format!("<{} bytes redacted>", self.content.len()),
             )
             .field("timestamp", &self.timestamp)
+            .field("sequence", &self.sequence)
+            .field("send_n", &self.send_n)
+            .field("send_dh_pub", &self.send_dh_pub.as_deref().map(hex))
+            .field("recv_n", &self.recv_n)
+            .field("recv_dh_pub", &self.recv_dh_pub.as_deref().map(hex))
+            .field("delivered", &self.delivered)
+            .field("uncertain", &self.uncertain)
+            .field("retry_reason", &self.retry_reason)
+            .field("peer_message_id", &self.peer_message_id.as_deref().map(hex))
+            .field("last_sent_at", &self.last_sent_at)
             .finish()
     }
 }
 
-fn message_key(conversation_id: [u8; 16], message_id: &[u8]) -> String {
+pub(crate) fn message_key(conversation_id: [u8; 16], message_id: &[u8]) -> String {
     format!("message:{}:{}", hex(&conversation_id), hex(message_id))
 }
 
 pub(crate) fn message_key_prefix(conversation_id: [u8; 16]) -> String {
     format!("message:{}:", hex(&conversation_id))
+}
+
+/// The correct starting value for `Db::message_sequence` when *opening*
+/// an existing database: `1 +` the highest `sequence` any already-stored
+/// message, across every conversation, currently has — or `0` if there
+/// are none. `Db::create` correctly starts at `0` (nothing is stored
+/// yet); `Db::open` must not, or this counter's own documented tie-break
+/// contract quietly breaks across a restart.
+///
+/// `Message::sequence`'s doc says a fresh-every-run counter "only ever
+/// needs to disambiguate messages saved within the same wall-clock
+/// second, and that can only happen within one continuous run" — true
+/// for the counter's *original* purpose (`list_messages`' own sort), but
+/// false the moment something *else* durably stores a "sequence value
+/// as of this saved instant" and compares it later, across a restart, to
+/// a **new** counter that has since restarted at `0` —
+/// `Contact::peer_wipe_boundary_sequence`
+/// (`store::wipe_policy::record_peer_wipe_policy`) does exactly that. A
+/// restart landing in the same wall-clock second as both the boundary
+/// being stamped and a subsequent message being saved can then hand that
+/// message `sequence = 0`, which can compare as *before* a boundary
+/// whose own sequence component was stamped pre-restart at a higher
+/// value — silently protecting a message from a scoped wipe that should
+/// have removed it (`docs/DELIVERY_FAILURE_FINDINGS.md`). Recovering the
+/// counter's true prior value on every `open` closes this at the root,
+/// rather than patching each downstream consumer that happens to compare
+/// across a restart.
+pub(crate) fn recover_message_sequence(db: &Db) -> Result<u64> {
+    let mut next = 0u64;
+    for key in db.keys_with_prefix("message:")? {
+        let bytes = db
+            .get_encrypted(Scope::Content, &key)?
+            .ok_or(Error::MalformedRecord("message key listed but not found"))?;
+        let message = decode_message(&bytes)?;
+        next = next.max(message.sequence + 1);
+    }
+    Ok(next)
 }
 
 pub(crate) fn now_unix() -> u64 {
@@ -80,21 +239,175 @@ impl Db {
     }
 
     /// Build and store a new message — the convenience path a chat UI
-    /// actually sends through.
+    /// actually sends through. Assigns the next `message_sequence` value,
+    /// the real ordering guarantee `list_messages` sorts by (see
+    /// `Message::sequence`'s doc) — `save_message` (the lower-level
+    /// primitive) does not do this itself, so any caller building a
+    /// `Message` by hand is responsible for setting `sequence` sensibly.
+    ///
+    /// `send_n`/`send_dh_pub` are the ratchet header `n`/`dh_pub` this
+    /// message was actually sent with (`Some`, for a locally-sent chat
+    /// message — see `Message::send_n`/`send_dh_pub`'s docs) or `None`
+    /// for a received message.
     pub fn save_message_now(
         &self,
         conversation_id: [u8; 16],
         content: Vec<u8>,
         sender_is_local: bool,
+        send_n: Option<u32>,
+        send_dh_pub: Option<Vec<u8>>,
     ) -> Result<Message> {
         let message = Message {
             id: random_message_id(),
             sender_is_local,
             content,
             timestamp: now_unix(),
+            sequence: self.message_sequence.fetch_add(1, Ordering::Relaxed),
+            send_n,
+            send_dh_pub,
+            recv_n: None,
+            recv_dh_pub: None,
+            delivered: false,
+            uncertain: false,
+            retry_reason: None,
+            peer_message_id: None,
+            last_sent_at: None,
         };
         self.save_message(conversation_id, &message)?;
         Ok(message)
+    }
+
+    /// Save an incoming chat message exactly once per `(recv_dh_pub,
+    /// recv_n)` — the second, independent layer of DRA-0012's fix
+    /// (`docs/DELIVERY_FAILURE_FINDINGS.md`), behind `receive_lock`'s
+    /// per-conversation lock in `app::receive_pending`. A ratchet header
+    /// is never legitimately reused for different content (the same
+    /// property `send_dh_pub`/`send_n` already relies on), so finding an
+    /// existing received message with this exact `(recv_dh_pub, recv_n)`
+    /// means this is a duplicate decrypt of an already-stored message —
+    /// returned as-is, not re-inserted and not consuming a fresh
+    /// `message_sequence` value. Scans every message currently stored for
+    /// `conversation_id`, same cost shape as `list_messages`; acceptable
+    /// here since this is a backstop against a race that should already
+    /// be rare (`receive_lock` normally prevents it entirely), not the
+    /// hot path.
+    pub fn save_received_message_idempotent(
+        &self,
+        conversation_id: [u8; 16],
+        content: Vec<u8>,
+        recv_dh_pub: Vec<u8>,
+        recv_n: u32,
+    ) -> Result<Message> {
+        for key in self.keys_with_prefix(&message_key_prefix(conversation_id))? {
+            let bytes = self
+                .get_encrypted(Scope::Content, &key)?
+                .ok_or(Error::MalformedRecord("message key listed but not found"))?;
+            let existing = decode_message(&bytes)?;
+            if !existing.sender_is_local
+                && existing.recv_n == Some(recv_n)
+                && existing.recv_dh_pub.as_deref() == Some(recv_dh_pub.as_slice())
+            {
+                tracing::debug!(
+                    conversation = %hex(&conversation_id),
+                    message_id = %hex(&existing.id),
+                    "duplicate receive_pending decrypt suppressed (DRA-0012 idempotency check)",
+                );
+                return Ok(existing);
+            }
+        }
+        let message = Message {
+            id: random_message_id(),
+            sender_is_local: false,
+            content,
+            timestamp: now_unix(),
+            sequence: self.message_sequence.fetch_add(1, Ordering::Relaxed),
+            send_n: None,
+            send_dh_pub: None,
+            recv_n: Some(recv_n),
+            recv_dh_pub: Some(recv_dh_pub),
+            delivered: false,
+            uncertain: false,
+            retry_reason: None,
+            peer_message_id: None,
+            last_sent_at: None,
+        };
+        self.save_message(conversation_id, &message)?;
+        Ok(message)
+    }
+
+    /// DRA-0060: a new outgoing message, numbered and timestamped but not
+    /// yet saved -- its id has to exist before encryption, because the id
+    /// travels inside the encrypted payload so the recipient can spot a
+    /// resend it already has. The caller saves it (marked
+    /// `RetryReason::SendFailed`) before sending and clears the mark once
+    /// the server confirms.
+    pub fn new_outgoing_message(&self, content: Vec<u8>) -> Message {
+        Message {
+            id: random_message_id(),
+            sender_is_local: true,
+            content,
+            timestamp: now_unix(),
+            sequence: self.message_sequence.fetch_add(1, Ordering::Relaxed),
+            send_n: None,
+            send_dh_pub: None,
+            recv_n: None,
+            recv_dh_pub: None,
+            delivered: false,
+            uncertain: false,
+            retry_reason: Some(RetryReason::SendFailed),
+            peer_message_id: None,
+            last_sent_at: None,
+        }
+    }
+
+    /// One message by id, if it exists and is readable.
+    pub fn load_message(
+        &self,
+        conversation_id: [u8; 16],
+        message_id: &[u8],
+    ) -> Result<Option<Message>> {
+        match self.get_encrypted(Scope::Content, &message_key(conversation_id, message_id))? {
+            Some(bytes) => Ok(Some(decode_message(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// DRA-0060: like [`save_received_message_idempotent`], plus resend
+    /// detection. A message carrying a sender id this conversation has
+    /// already received is a resend of something already shown: the
+    /// existing record is returned with `true` and nothing new is saved.
+    /// (The new envelope still gets its own `DeliveryAck`, so the sender's
+    /// copy is confirmed.)
+    ///
+    /// [`save_received_message_idempotent`]: Self::save_received_message_idempotent
+    pub fn save_received_chat(
+        &self,
+        conversation_id: [u8; 16],
+        content: Vec<u8>,
+        recv_dh_pub: Vec<u8>,
+        recv_n: u32,
+        peer_message_id: Option<Vec<u8>>,
+    ) -> Result<(Message, bool)> {
+        if let Some(peer_id) = peer_message_id.as_deref() {
+            for existing in self.list_messages(conversation_id)? {
+                if !existing.sender_is_local && existing.peer_message_id.as_deref() == Some(peer_id)
+                {
+                    tracing::debug!(
+                        conversation = %hex(&conversation_id),
+                        message_id = %hex(&existing.id),
+                        "resent message already received; not shown again (DRA-0060)",
+                    );
+                    return Ok((existing, true));
+                }
+            }
+        }
+        let mut message =
+            self.save_received_message_idempotent(conversation_id, content, recv_dh_pub, recv_n)?;
+        if peer_message_id.is_some() && message.peer_message_id != peer_message_id {
+            message.peer_message_id = peer_message_id;
+            self.save_message(conversation_id, &message)?;
+        }
+        Ok((message, false))
     }
 
     pub fn delete_message(&self, conversation_id: [u8; 16], message_id: &[u8]) -> Result<()> {
@@ -102,18 +415,225 @@ impl Db {
     }
 
     /// Every message stored for `conversation_id`, oldest first.
+    /// DRA-0048 (`docs/DELIVERY_FAILURE_FINDINGS.md`): a record that
+    /// cannot be read is *skipped*, not fatal.
+    ///
+    /// This used to decode every record with `?`, so one unreadable record
+    /// took the whole conversation with it. DRA-0041 made that reachable
+    /// deliberately -- binding the record key as associated data means a
+    /// relocated or rolled-back record now fails its AEAD check instead of
+    /// decrypting into the wrong place -- which handed anyone able to
+    /// write to the database file a way to deny the owner an entire
+    /// conversation's history by planting a single junk record, without
+    /// reading any of it.
+    ///
+    /// Losing one damaged message is strictly better than losing all of
+    /// them, and an attacker who can write the file could have deleted
+    /// that record outright anyway. The skip is counted and logged (never
+    /// with content) so genuine corruption is still visible rather than
+    /// silently swallowed.
     pub fn list_messages(&self, conversation_id: [u8; 16]) -> Result<Vec<Message>> {
+        Ok(self.list_messages_counting_unreadable(conversation_id)?.0)
+    }
+
+    /// [`list_messages`](Self::list_messages), plus how many records were
+    /// skipped as unreadable. DRA-0054: the log line alone left the user
+    /// looking at a conversation with a silent hole in it; this count is
+    /// what lets the app say so.
+    pub fn list_messages_counting_unreadable(
+        &self,
+        conversation_id: [u8; 16],
+    ) -> Result<(Vec<Message>, usize)> {
         let mut messages = Vec::new();
+        let mut unreadable = 0usize;
         for key in self.keys_with_prefix(&message_key_prefix(conversation_id))? {
-            let bytes = self
-                .get_encrypted(Scope::Content, &key)?
-                .ok_or(Error::MalformedRecord("message key listed but not found"))?;
-            messages.push(decode_message(&bytes)?);
+            match self.get_encrypted(Scope::Content, &key) {
+                Ok(Some(bytes)) => match decode_message(&bytes) {
+                    Ok(message) => messages.push(message),
+                    Err(_) => unreadable += 1,
+                },
+                // Listed but absent, or undecryptable: both mean this one
+                // record is unusable, and neither says anything about the
+                // rest of the conversation.
+                Ok(None) | Err(_) => unreadable += 1,
+            }
         }
-        messages.sort_by_key(|m| m.timestamp);
-        Ok(messages)
+        if unreadable > 0 {
+            tracing::warn!(
+                conversation = %crate::db::hex(&conversation_id),
+                unreadable,
+                "skipped unreadable message records while listing a conversation — \
+                 possible tampering or corruption of the local database",
+            );
+        }
+        messages.sort_by_key(|m| (m.timestamp, m.sequence));
+        Ok((messages, unreadable))
+    }
+
+    /// Handle an incoming `DeliveryAck` (`dratchet_core::payload::DeliveryAck`,
+    /// `ARCHITECTURE.md` §4.6): find the locally-sent, not-yet-delivered
+    /// message in `conversation_id` this ack refers to, mark it delivered,
+    /// and return it — or `Ok(None)` if nothing matches (a stale/duplicate
+    /// ack for an already-delivered message, or one naming a
+    /// `(dh_pub, n)` this side never actually sent).
+    ///
+    /// **Exact match, not a heuristic**: `(dh_pub, n)` together uniquely
+    /// identify one specific sent message — `dh_pub` names which sending
+    /// chain, `n` the position within it — the same pair
+    /// `RatchetState`'s own skipped-message-key cache already keys by.
+    /// This closes a real gap the first `DeliveryAck` implementation had:
+    /// matching on `n` alone collided across chains that happened to
+    /// share one (every fresh chain starts at `n = 0`, so this was the
+    /// common case) — see `docs/DELIVERY_FAILURE_FINDINGS.md` finding #28
+    /// for the original limitation and its resolution.
+    pub fn mark_message_delivered(
+        &self,
+        conversation_id: [u8; 16],
+        dh_pub: &[u8],
+        acked_n: u32,
+    ) -> Result<Option<Message>> {
+        let messages = self.list_messages(conversation_id)?;
+        let Some(mut matched) = messages.into_iter().find(|m| {
+            m.sender_is_local
+                && !m.delivered
+                && m.send_n == Some(acked_n)
+                && m.send_dh_pub.as_deref() == Some(dh_pub)
+        }) else {
+            return Ok(None);
+        };
+        matched.delivered = true;
+        matched.uncertain = false;
+        // DRA-0060/0063: delivered after all (a lost Ack, or a receipt
+        // arriving late) -- nothing left to retry.
+        matched.retry_reason = None;
+        self.save_message(conversation_id, &matched)?;
+        Ok(Some(matched))
+    }
+
+    /// Handle an incoming `PiggybackAck` (`dratchet_core::payload::
+    /// PiggybackAck`, carried on an ordinary chat message's
+    /// `ChatContent::piggyback_ack`): mark every locally-sent,
+    /// not-yet-delivered message on chain `dh_pub` with `send_n <=
+    /// highest_n` as delivered — cumulative, not a single exact match
+    /// like `mark_message_delivered`, the same "everything up through
+    /// this point" semantics as a TCP cumulative ack. This is what lets
+    /// an ordinary follow-up chat message resolve a message this client
+    /// had marked `uncertain` (`Message::uncertain`'s doc) even though no
+    /// dedicated `DeliveryAck` for it ever arrived — the peer's next
+    /// message re-asserts coverage for everything it has actually
+    /// received on this chain so far, so one lost dedicated ack doesn't
+    /// leave the sender guessing forever as long as the conversation
+    /// continues.
+    ///
+    /// Returns every message this call newly marked delivered, oldest
+    /// first, for a caller to react to (e.g. UI checkmarks) — mirrors
+    /// `mark_message_delivered`'s single-`Message` return, just
+    /// potentially more than one at a time.
+    pub fn mark_messages_delivered_up_to(
+        &self,
+        conversation_id: [u8; 16],
+        dh_pub: &[u8],
+        highest_n: u32,
+    ) -> Result<Vec<Message>> {
+        let messages = self.list_messages(conversation_id)?;
+        let mut newly_delivered = Vec::new();
+        for mut m in messages.into_iter().filter(|m| {
+            m.sender_is_local
+                && !m.delivered
+                && m.send_dh_pub.as_deref() == Some(dh_pub)
+                && m.send_n.is_some_and(|n| n <= highest_n)
+        }) {
+            m.delivered = true;
+            m.uncertain = false;
+            m.retry_reason = None;
+            self.save_message(conversation_id, &m)?;
+            newly_delivered.push(m);
+        }
+        newly_delivered.sort_by_key(|m| (m.timestamp, m.sequence));
+        Ok(newly_delivered)
+    }
+
+    /// Mark every currently undelivered, locally-sent message in
+    /// `conversation_id` as `uncertain` (`Message::uncertain`'s doc) —
+    /// called once per conversation right after this client detects and
+    /// recovers from a connection interruption, since any of those sends
+    /// might have never actually reached the relay. Returns how many
+    /// messages were newly marked (already-uncertain or already-delivered
+    /// messages are left untouched, so calling this repeatedly across
+    /// several short reconnects in a row is harmless).
+    /// DRA-0063: flag as `RetryReason::Expired` every own message the server
+    /// accepted but nobody confirmed receiving within `ttl_secs` (plus
+    /// `grace_secs` for clock differences between this device and the
+    /// server), measured from when it was last accepted. The server has
+    /// discarded such a message by now, so without this the sender saw it
+    /// as merely "sent" forever. Returns how many were newly flagged.
+    pub fn mark_expired_sends(
+        &self,
+        conversation_id: [u8; 16],
+        ttl_secs: u64,
+        grace_secs: u64,
+        now: u64,
+    ) -> Result<usize> {
+        let mut count = 0;
+        for mut m in self.list_messages(conversation_id)? {
+            let sent_at = m.last_sent_at.unwrap_or(m.timestamp);
+            if m.sender_is_local
+                && !m.delivered
+                && m.retry_reason.is_none()
+                && m.send_n.is_some()
+                && now >= sent_at.saturating_add(ttl_secs).saturating_add(grace_secs)
+            {
+                m.retry_reason = Some(RetryReason::Expired);
+                self.save_message(conversation_id, &m)?;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// DRA-0064: flag as `RetryReason::ServerRestarted` every own message
+    /// the server accepted that nobody has confirmed receiving -- after a
+    /// server restart it may have been lost with the server's in-memory
+    /// mailboxes. Returns how many were newly flagged.
+    pub fn mark_unconfirmed_lost_in_restart(&self, conversation_id: [u8; 16]) -> Result<usize> {
+        let mut count = 0;
+        for mut m in self.list_messages(conversation_id)? {
+            if m.sender_is_local && !m.delivered && m.retry_reason.is_none() && m.send_n.is_some() {
+                m.retry_reason = Some(RetryReason::ServerRestarted);
+                self.save_message(conversation_id, &m)?;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// DRA-0064: the server boot id this device last connected to.
+    pub fn load_server_boot_id(&self) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .get_encrypted(Scope::Content, SERVER_BOOT_ID_KEY)?
+            .map(|bytes| bytes.to_vec()))
+    }
+
+    pub fn save_server_boot_id(&self, boot_id: &[u8]) -> Result<()> {
+        self.put_encrypted(Scope::Content, SERVER_BOOT_ID_KEY, boot_id)
+    }
+
+    pub fn mark_undelivered_uncertain(&self, conversation_id: [u8; 16]) -> Result<usize> {
+        let messages = self.list_messages(conversation_id)?;
+        let mut count = 0;
+        for mut m in messages.into_iter().filter(|m| {
+            m.sender_is_local && !m.delivered && !m.uncertain && m.retry_reason.is_none()
+        }) {
+            m.uncertain = true;
+            self.save_message(conversation_id, &m)?;
+            count += 1;
+        }
+        Ok(count)
     }
 }
+
+/// DRA-0064: storage key for the last server boot id seen.
+const SERVER_BOOT_ID_KEY: &str = "server:boot_id";
 
 fn random_message_id() -> Vec<u8> {
     use rand_core::{OsRng, RngCore};
@@ -138,18 +658,90 @@ mod tests {
         Db::create(dir.join("test.redb"), "pw").unwrap()
     }
 
+    fn temp_db_path() -> std::path::PathBuf {
+        let dir = tempfile::tempdir().unwrap().keep();
+        dir.join("test.redb")
+    }
+
     fn random_id() -> Vec<u8> {
         let mut buf = [0u8; 16];
         OsRng.fill_bytes(&mut buf);
         buf.to_vec()
     }
 
+    /// Penetration-test finding DRA-0048: one unreadable record must not
+    /// take the whole conversation down with it.
+    ///
+    /// `list_messages` decoded every record with `?`, so a single record
+    /// that failed to decrypt propagated straight out and the caller got
+    /// an error instead of a message list -- every other message in that
+    /// conversation included. DRA-0041 made that reachable on purpose:
+    /// binding the record key as associated data means a relocated or
+    /// rolled-back record now fails its AEAD check rather than decrypting
+    /// into the wrong place. Anyone who can write to the `.redb` file can
+    /// therefore plant one junk record and permanently deny the owner
+    /// access to an entire conversation's history, without being able to
+    /// read a single byte of it.
+    #[test]
+    fn one_unreadable_record_does_not_deny_access_to_the_whole_conversation() {
+        let db = temp_db();
+        let conv = [7u8; 16];
+
+        let keep_one = sample_message_with_sequence(100, 0, "first");
+        let planted = sample_message_with_sequence(200, 1, "second");
+        let keep_two = sample_message_with_sequence(300, 2, "third");
+        db.save_message(conv, &keep_one).unwrap();
+        db.save_message(conv, &planted).unwrap();
+        db.save_message(conv, &keep_two).unwrap();
+        assert_eq!(db.list_messages(conv).unwrap().len(), 3);
+
+        // An attacker with the database file overwrites one record's bytes
+        // with something that cannot decrypt. No key, no plaintext, no
+        // ability to read anything -- just a write.
+        let victim_key = message_key(conv, &planted.id);
+        {
+            let write_txn = db.database.begin_write().unwrap();
+            {
+                let mut table = write_txn.open_table(crate::db::RECORDS).unwrap();
+                table.insert(victim_key.as_str(), &b"garbage"[..]).unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+
+        let surviving = db.list_messages(conv).expect(
+            "VULNERABILITY: a single unreadable record makes the entire conversation's history \
+             unreadable -- anyone able to write one junk record into the database file can deny \
+             the owner access to every message in that conversation without decrypting any of it",
+        );
+
+        let contents: Vec<&[u8]> = surviving.iter().map(|m| m.content.as_slice()).collect();
+        assert_eq!(
+            contents,
+            vec![&b"first"[..], &b"third"[..]],
+            "every still-readable message must survive, in order; only the damaged one is lost"
+        );
+    }
+
     fn sample_message(timestamp: u64, content: &str) -> Message {
+        sample_message_with_sequence(timestamp, 0, content)
+    }
+
+    fn sample_message_with_sequence(timestamp: u64, sequence: u64, content: &str) -> Message {
         Message {
             id: random_id(),
             sender_is_local: true,
             content: content.as_bytes().to_vec(),
             timestamp,
+            sequence,
+            send_n: None,
+            send_dh_pub: None,
+            recv_n: None,
+            recv_dh_pub: None,
+            delivered: false,
+            uncertain: false,
+            retry_reason: None,
+            peer_message_id: None,
+            last_sent_at: None,
         }
     }
 
@@ -182,6 +774,160 @@ mod tests {
             .map(|m| String::from_utf8(m.content.clone()).unwrap())
             .collect();
         assert_eq!(contents, vec!["first", "second", "third"]);
+    }
+
+    /// Real, previously-undiscovered bug, found by a two-real-client
+    /// 100-message conversation test (`app/tests/full_conversation_100_messages.rs`):
+    /// `now_unix()` is only 1-second resolution, so any real burst of
+    /// messages (25 in a row, the way that test's phase 1 does) lands on
+    /// the *same* timestamp — and without a second sort key, `list_messages`
+    /// fell back to `keys_with_prefix`'s redb key order, keyed by a
+    /// *random* message id, which came back essentially shuffled, not
+    /// chronological. `Message::sequence` fixes it: same timestamp, still
+    /// sorts by insertion order.
+    #[test]
+    fn messages_sharing_the_same_timestamp_still_sort_by_insertion_order() {
+        let db = temp_db();
+        let conv = [1u8; 16];
+
+        // All 5 share one timestamp — exactly the real burst scenario.
+        for (i, text) in ["a", "b", "c", "d", "e"].iter().enumerate() {
+            db.save_message(conv, &sample_message_with_sequence(500, i as u64, text))
+                .unwrap();
+        }
+
+        let messages = db.list_messages(conv).unwrap();
+        let contents: Vec<String> = messages
+            .iter()
+            .map(|m| String::from_utf8(m.content.clone()).unwrap())
+            .collect();
+        assert_eq!(
+            contents,
+            vec!["a", "b", "c", "d", "e"],
+            "same-timestamp messages must still come back in the order they were \
+             actually saved, not redb's key order"
+        );
+    }
+
+    /// The real production path (`save_message_now`, not the lower-level
+    /// `save_message` the tests above use directly) assigns `sequence`
+    /// itself, from `Db::message_sequence` — proving the *real* call sites
+    /// this fix actually matters for, not just the primitive.
+    #[test]
+    fn save_message_now_assigns_increasing_sequence_numbers() {
+        let db = temp_db();
+        let conv = [1u8; 16];
+
+        let texts = ["alpha", "beta", "gamma", "delta"];
+        for text in texts {
+            db.save_message_now(conv, text.as_bytes().to_vec(), true, None, None)
+                .unwrap();
+        }
+
+        let messages = db.list_messages(conv).unwrap();
+        let contents: Vec<String> = messages
+            .iter()
+            .map(|m| String::from_utf8(m.content.clone()).unwrap())
+            .collect();
+        assert_eq!(
+            contents, texts,
+            "save_message_now's real, in-order calls must list back in that same order, \
+             whether or not they land in the same timestamp second"
+        );
+        // Strictly increasing, not just distinct.
+        for pair in messages.windows(2) {
+            assert!(pair[0].sequence < pair[1].sequence);
+        }
+    }
+
+    /// DRA-0012's storage-layer backstop (`docs/DELIVERY_FAILURE_FINDINGS.md`):
+    /// a second `save_received_message_idempotent` call for the exact same
+    /// `(recv_dh_pub, recv_n)` must not insert a second message — this is
+    /// what a duplicate decrypt (from a race that somehow slipped past
+    /// `receive_lock`, or a crash-recovery reprocess of an undeleted
+    /// mailbox entry) now hits.
+    #[test]
+    fn save_received_message_idempotent_does_not_duplicate_the_same_ratchet_position() {
+        let db = temp_db();
+        let conv = [1u8; 16];
+        let dh_pub = vec![3u8; 32];
+
+        let first = db
+            .save_received_message_idempotent(conv, b"hello".to_vec(), dh_pub.clone(), 5)
+            .unwrap();
+        let second = db
+            .save_received_message_idempotent(conv, b"hello".to_vec(), dh_pub.clone(), 5)
+            .unwrap();
+
+        assert_eq!(
+            first.id, second.id,
+            "the second call for the same (recv_dh_pub, recv_n) must return the same, \
+             already-stored message, not create a new one"
+        );
+        let stored = db.list_messages(conv).unwrap();
+        assert_eq!(
+            stored.len(),
+            1,
+            "exactly one message should be stored despite two idempotent-save calls"
+        );
+
+        // A genuinely different ratchet position — same dh_pub, different
+        // n — must still save as a distinct message; the dedup key is the
+        // pair, not either half alone.
+        let third = db
+            .save_received_message_idempotent(conv, b"world".to_vec(), dh_pub, 6)
+            .unwrap();
+        assert_ne!(third.id, first.id);
+        assert_eq!(db.list_messages(conv).unwrap().len(), 2);
+    }
+
+    /// Regression test for the restart/tie-break bug `recover_message_sequence`
+    /// exists to close: naively resetting `message_sequence` to `0` on
+    /// `open` let a message saved shortly after a restart get a
+    /// `sequence` that collides with (or sorts *before*) one already
+    /// saved in the same wall-clock second, before the restart —
+    /// breaking `list_messages`' own ordering guarantee, the exact
+    /// invariant `sequence` exists for.
+    #[test]
+    fn sequence_survives_a_real_restart_within_the_same_wall_clock_second() {
+        let path = temp_db_path();
+        let conv = [9u8; 16];
+
+        {
+            let db = Db::create(&path, "pw").unwrap();
+            for text in ["one", "two", "three"] {
+                db.save_message_now(conv, text.as_bytes().to_vec(), true, None, None)
+                    .unwrap();
+            }
+        }
+
+        // A real close + reopen, exactly like `boundary_persists_across_a_real_db_restart`
+        // in `app/tests/scoped_wipe_edge_cases.rs` — not just continuity
+        // of one in-memory `Db` handle.
+        let db = Db::open(&path, "pw").unwrap();
+        db.save_message_now(conv, b"four".to_vec(), true, None, None)
+            .unwrap();
+
+        let messages = db.list_messages(conv).unwrap();
+        let contents: Vec<String> = messages
+            .iter()
+            .map(|m| String::from_utf8(m.content.clone()).unwrap())
+            .collect();
+        assert_eq!(
+            contents,
+            vec!["one", "two", "three", "four"],
+            "ACTUAL: the post-restart message sorts strictly after every pre-restart one, \
+             even when both land in the same wall-clock second — its sequence continued \
+             from where the pre-restart counter left off instead of restarting at 0"
+        );
+        for pair in messages.windows(2) {
+            assert!(
+                pair[0].sequence < pair[1].sequence,
+                "strictly increasing across the restart, not just distinct: {:?} then {:?}",
+                pair[0].sequence,
+                pair[1].sequence
+            );
+        }
     }
 
     #[test]
@@ -223,5 +969,165 @@ mod tests {
     fn empty_conversation_returns_no_messages_not_an_error() {
         let db = temp_db();
         assert!(db.list_messages([9u8; 16]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn mark_message_delivered_flips_the_matching_sent_message() {
+        let db = temp_db();
+        let conv = [1u8; 16];
+        let dh_pub = vec![1u8; 32];
+
+        let sent = db
+            .save_message_now(conv, b"hi".to_vec(), true, Some(7), Some(dh_pub.clone()))
+            .unwrap();
+        assert!(!sent.delivered);
+
+        let updated = db
+            .mark_message_delivered(conv, &dh_pub, 7)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.id, sent.id);
+        assert!(updated.delivered);
+
+        let reloaded = db.list_messages(conv).unwrap();
+        assert_eq!(reloaded.len(), 1);
+        assert!(reloaded[0].delivered);
+    }
+
+    #[test]
+    fn mark_message_delivered_ignores_received_messages_and_wrong_n_or_dh_pub() {
+        let db = temp_db();
+        let conv = [1u8; 16];
+        let dh_pub = vec![2u8; 32];
+        let other_dh_pub = vec![9u8; 32];
+
+        // A received message with the same send_n-shaped value would never
+        // actually have send_n set, but prove it explicitly: sender_is_local
+        // must be true to match at all.
+        db.save_message_now(conv, b"incoming".to_vec(), false, None, None)
+            .unwrap();
+        db.save_message_now(
+            conv,
+            b"outgoing".to_vec(),
+            true,
+            Some(3),
+            Some(dh_pub.clone()),
+        )
+        .unwrap();
+
+        // Right n, wrong dh_pub — no match.
+        assert!(db
+            .mark_message_delivered(conv, &other_dh_pub, 3)
+            .unwrap()
+            .is_none());
+        // Right dh_pub, wrong n — no match.
+        assert!(db
+            .mark_message_delivered(conv, &dh_pub, 99)
+            .unwrap()
+            .is_none());
+        // Both right — matches.
+        assert!(db
+            .mark_message_delivered(conv, &dh_pub, 3)
+            .unwrap()
+            .is_some());
+        // Already delivered — a duplicate/stale ack for the same (dh_pub, n) finds nothing left.
+        assert!(db
+            .mark_message_delivered(conv, &dh_pub, 3)
+            .unwrap()
+            .is_none());
+    }
+
+    /// The real fix for finding #28's collision: two messages from
+    /// *different* sending chains sharing the same `n` (every DH ratchet
+    /// step resets a fresh chain's `n` back to 0 — `n = 0` colliding is
+    /// the common case, not a rare one) are now disambiguated exactly by
+    /// `dh_pub`, not by an "oldest wins" heuristic — each ack correctly
+    /// flips the message from *its own* chain, never the other one.
+    #[test]
+    fn mark_message_delivered_disambiguates_same_n_across_different_chains() {
+        let db = temp_db();
+        let conv = [1u8; 16];
+        let chain_a = vec![0xAAu8; 32];
+        let chain_b = vec![0xBBu8; 32];
+
+        let first = db
+            .save_message_now(
+                conv,
+                b"first chain, n=0".to_vec(),
+                true,
+                Some(0),
+                Some(chain_a.clone()),
+            )
+            .unwrap();
+        let second = db
+            .save_message_now(
+                conv,
+                b"second chain, also n=0".to_vec(),
+                true,
+                Some(0),
+                Some(chain_b.clone()),
+            )
+            .unwrap();
+
+        // Acking chain B's n=0 must flip *second*, not the older *first*.
+        let updated = db
+            .mark_message_delivered(conv, &chain_b, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            updated.id, second.id,
+            "must match the message from the acked chain, not merely the oldest n=0"
+        );
+
+        let after_one_ack = db.list_messages(conv).unwrap();
+        let first_reloaded = after_one_ack.iter().find(|m| m.id == first.id).unwrap();
+        assert!(
+            !first_reloaded.delivered,
+            "the other chain's still-unacked message must not be touched"
+        );
+
+        // Acking chain A's n=0 now correctly flips *first*.
+        let updated = db
+            .mark_message_delivered(conv, &chain_a, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.id, first.id);
+    }
+
+    /// DRA-0054: DRA-0048 kept the readable messages but only logged the
+    /// skip, so the user saw a conversation with a silent hole in it. The
+    /// caller must be told how many records were lost -- and a healthy
+    /// conversation must report zero, so the notice never cries wolf.
+    #[test]
+    fn an_unreadable_message_record_is_counted_for_the_caller() {
+        let db = temp_db();
+        let conv = [8u8; 16];
+        let keep = sample_message_with_sequence(100, 0, "kept");
+        let planted = sample_message_with_sequence(200, 1, "lost");
+        db.save_message(conv, &keep).unwrap();
+        db.save_message(conv, &planted).unwrap();
+        assert_eq!(
+            db.list_messages_counting_unreadable(conv).unwrap().1,
+            0,
+            "a healthy conversation must report no unreadable records"
+        );
+
+        let victim_key = message_key(conv, &planted.id);
+        {
+            let write_txn = db.database.begin_write().unwrap();
+            {
+                let mut table = write_txn.open_table(crate::db::RECORDS).unwrap();
+                table.insert(victim_key.as_str(), &b"garbage"[..]).unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+
+        let (messages, unreadable) = db.list_messages_counting_unreadable(conv).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            unreadable, 1,
+            "VULNERABILITY: a damaged or tampered message record is dropped without the caller \
+             ever learning of it -- the user sees a conversation with a silent hole in it"
+        );
     }
 }

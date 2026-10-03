@@ -1,0 +1,3 @@
+# Mail moves from the Bootstrap Inbox to a per-pairing Conversation Mailbox
+
+After pairing, each side announces a random routing id and both switch to a Conversation Mailbox derived from the two ids, rather than writing to each other's identity-derived Bootstrap Inbox for the life of the conversation. That keeps a contact's ongoing traffic off an address anyone who knows their identity can compute (ARCHITECTURE.md §11.1). The cost is a handover: each side switches when it receives the other's announce, so a lost announce can leave the two sides on different mailboxes. Since DRA-0066 a side that has switched keeps re-sending its original announce, byte for byte, until it hears from the peer on the Conversation Mailbox.

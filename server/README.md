@@ -103,6 +103,7 @@ the protocol itself, not tunable at deploy time.
 |---|---|---|---|
 | Bind address | `--bind <addr>` | `DRATCHETD_BIND` | `127.0.0.1:8787` |
 | Directory database path | `--directory-db <path>` | `DRATCHETD_DIRECTORY_DB` | `dratchetd-directory.redb` |
+| Trusted reverse proxies (CIDRs) | `--trusted-proxies <list>` | `DRATCHETD_TRUSTED_PROXIES` | empty (use the TCP peer address) |
 
 ```sh
 # Listen on all interfaces, a non-default port, via the flag:
@@ -210,8 +211,14 @@ curls `/healthz` from inside the cluster.
 For a copy-paste-able, step-by-step walkthrough of deploying this to an
 actual test RKE2 cluster (build → ship the image → install → verify →
 tear down), including a companion script that automates all of it, see
-[`docs/DEPLOY_RKE2.md`](../docs/DEPLOY_RKE2.md). The rest of this section
-covers the chart's configuration surface in general — not tied to any one
+[`docs/DEPLOY_RKE2.md`](../docs/DEPLOY_RKE2.md). If you don't have a
+cluster yet and want to stand one up from scratch on a Raspberry Pi 5
+running Rocky Linux (ARM64), see
+[`docs/DEPLOY_K3S_PI.md`](../docs/DEPLOY_K3S_PI.md) instead — it bootstraps
+a single-node k3s cluster on the Pi itself, then runs the same
+build/ship/deploy/verify flow locally (no registry or SSH needed, since the
+cluster and the build are the same box). The rest of this section covers
+the chart's configuration surface in general — not tied to any one
 cluster.
 
 ### Before you deploy: this service does not horizontally scale by default
@@ -270,6 +277,7 @@ helm test dratchet
 | `replicaCount` | `1` | See the scaling warning above — change with care. |
 | `service.port` | `8787` | Also becomes `DRATCHETD_BIND`'s port via the chart's `ConfigMap`. |
 | `config.logLevel` | `"info"` | `RUST_LOG` value passed to the container. |
+| `config.trustedProxies` | `""` | `DRATCHETD_TRUSTED_PROXIES`. Set to the ingress controller's pod CIDR when `ingress.enabled: true`, so per-address connection limits see real client addresses (DRA-0055). |
 | `resources` | `50m`/`32Mi` requests, `500m`/`256Mi` limits | Conservative starting points — use `tests/stress.rs`'s load pattern as a starting point for load-testing your own limits before tuning these. |
 | `probes.liveness` / `probes.readiness` | both hit `/healthz` | Identical by design — there's no dependency (database, external call) for readiness to check that liveness doesn't already cover. |
 | `terminationGracePeriodSeconds` | `30` | Time given to `SIGTERM`-triggered graceful shutdown (see above) to let in-flight WebSocket connections wind down before a forced kill. |

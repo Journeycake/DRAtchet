@@ -22,6 +22,11 @@ zeroize = "1"
 qrcode = { version = "0.14", features = ["image"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 tracing = "0.1"
+# Per-conversation async lock backing `Db::receive_lock`
+# (`docs/DELIVERY_FAILURE_FINDINGS.md` DRA-0012) — `sync` only, no runtime
+# feature needed: constructing/locking a `tokio::sync::Mutex` just needs
+# an executor context at `.await` time, already provided by every caller.
+tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
 tempfile = "3"

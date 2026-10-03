@@ -35,20 +35,78 @@ use dratchet_core::envelope::Envelope;
 use dratchet_core::first_contact::FirstContactWire;
 use dratchet_core::identity::fingerprint_of_public_key;
 use dratchet_core::payload::{
-    ConversationWipePolicyAnnounce, FirstContactContent, ProfileAnnounce, RoutingIdAnnounce,
-    PAYLOAD_CHAT, PAYLOAD_CONVERSATION_WIPE_POLICY_ANNOUNCE, PAYLOAD_CONVERSATION_WIPE_REQUEST,
-    PAYLOAD_FIRST_CONTACT, PAYLOAD_PROFILE_ANNOUNCE, PAYLOAD_ROUTING_ID_ANNOUNCE,
+    ChatContent, ConversationWipePolicyAnnounce, ConversationWipeRequestContent, DeliveryAck,
+    FirstContactContent, PiggybackAck, ProfileAnnounce, RoutingIdAnnounce, PAYLOAD_CHAT,
+    PAYLOAD_CONVERSATION_WIPE_POLICY_ANNOUNCE, PAYLOAD_CONVERSATION_WIPE_REQUEST,
+    PAYLOAD_DELIVERY_ACK, PAYLOAD_FIRST_CONTACT, PAYLOAD_PROFILE_ANNOUNCE,
+    PAYLOAD_ROUTING_ID_ANNOUNCE,
 };
 use dratchet_core::prekey::{OneTimePrekeyPublic, PrekeyBundle, SignedPrekeyPublic};
 use dratchet_core::ratchet::{RatchetState, DEFAULT_MAX_SKIP};
 use dratchet_core::x3dh::{self, bootstrap_mailbox_id};
 use dratchet_server::protocol::{
-    Ack, BundleResult, ErrorFrame, FetchBundle, FetchedBundleWire, FrameTag, MailboxDelete,
-    MailboxEntries, MailboxFetch, MailboxWrite, OneTimePrekeyWire, PrekeyBundleWire, PublishBundle,
+    Ack, BundleResult, ErrorFrame, FetchBundle, FetchOwnPrekeyCount, FetchedBundleWire, FrameTag,
+    MailboxDelete, MailboxEntries, MailboxFetch, MailboxWrite, OneTimePrekeyWire, OwnPrekeyCount,
+    PrekeyBundleWire, PublishBundle,
 };
 use dratchet_store::{
-    decrypt_gated, encrypt_gated, Contact, Db, Message, OwnProfile, PairingCode, VerificationState,
+    decrypt_gated, encrypt_gated, Contact, Db, Message, OwnProfile, PairingCode, RetryReason,
+    VerificationState,
 };
+
+/// How long the relay keeps a message nobody has collected
+/// (`ARCHITECTURE.md` §4.5's default). Also what DRA-0063 measures an
+/// unconfirmed send against.
+pub const MAILBOX_TTL_SECS: u32 = 14 * 24 * 60 * 60;
+
+/// DRA-0063: extra time allowed past [`MAILBOX_TTL_SECS`] before an
+/// unconfirmed message is declared expired, to absorb a clock difference
+/// between this device and the server.
+pub const EXPIRY_GRACE_SECS: u64 = 60 * 60;
+
+/// DRA-0064: call right after authenticating, before sending anything on
+/// the new connection. If the server's boot id differs from the one this
+/// device saw last, the server restarted and its in-memory mailboxes --
+/// every message waiting for collection -- are gone, so every message this
+/// side sent that nobody has confirmed is flagged
+/// `RetryReason::ServerRestarted` and offered for a retry. Some may in
+/// fact have been collected before the restart; retrying those is safe,
+/// since the recipient drops a copy it already has (DRA-0060). Returns how
+/// many were flagged. A server that sends no boot id is ignored.
+pub fn note_server_boot(db: &Db, account: &Account, conn: &Connection) -> Result<usize> {
+    let boot_id = conn.server_boot_id();
+    if boot_id.is_empty() {
+        return Ok(0);
+    }
+    let previous = db.load_server_boot_id()?;
+    let mut flagged = 0;
+    if previous.as_deref().is_some_and(|prev| prev != boot_id) {
+        for contact in db.list_contacts()? {
+            let conv_id = conversation_id_for(account, &contact);
+            flagged += db.mark_unconfirmed_lost_in_restart(conv_id)?;
+        }
+    }
+    if previous.as_deref() != Some(boot_id) {
+        db.save_server_boot_id(boot_id)?;
+    }
+    Ok(flagged)
+}
+
+/// DRA-0063: flag every message this side sent that has gone unconfirmed
+/// for longer than the server keeps it ([`MAILBOX_TTL_SECS`] +
+/// [`EXPIRY_GRACE_SECS`]) as `RetryReason::Expired`, across every
+/// conversation, so the sender is told and offered a retry instead of
+/// seeing it as "sent" forever. `now` is a Unix timestamp. Needs no
+/// connection. Returns how many were newly flagged.
+pub fn mark_expired_sends(db: &Db, account: &Account, now: u64) -> Result<usize> {
+    let mut total = 0;
+    for contact in db.list_contacts()? {
+        let conv_id = conversation_id_for(account, &contact);
+        total +=
+            db.mark_expired_sends(conv_id, u64::from(MAILBOX_TTL_SECS), EXPIRY_GRACE_SECS, now)?;
+    }
+    Ok(total)
+}
 use rand_core::{OsRng, RngCore};
 use x25519_dalek::PublicKey;
 
@@ -73,6 +131,47 @@ pub fn list_contacts(db: &Db) -> Result<Vec<Contact>> {
 pub fn list_messages(db: &Db, account: &Account, contact: &Contact) -> Result<Vec<Message>> {
     let conv_id = conversation_id_for(account, contact);
     Ok(db.list_messages(conv_id)?)
+}
+
+/// [`list_contacts`], plus how many stored contact records could not be
+/// read and were skipped (DRA-0054) -- non-zero means the local database
+/// is damaged or was tampered with, and the user should be told.
+pub fn list_contacts_counting_unreadable(db: &Db) -> Result<(Vec<Contact>, usize)> {
+    Ok(db.list_contacts_counting_unreadable()?)
+}
+
+/// [`list_messages`], plus how many of this conversation's stored message
+/// records could not be read and were skipped (DRA-0054).
+pub fn list_messages_counting_unreadable(
+    db: &Db,
+    account: &Account,
+    contact: &Contact,
+) -> Result<(Vec<Message>, usize)> {
+    let conv_id = conversation_id_for(account, contact);
+    Ok(db.list_messages_counting_unreadable(conv_id)?)
+}
+
+/// Marks every currently undelivered, locally-sent message across every
+/// conversation as `uncertain` (`dratchet_store::Message::uncertain`'s
+/// doc) — called once right after this device detects and recovers from
+/// a connection interruption (the Tauri poll loop's reconnect-succeeded
+/// path), since any send attempted during that gap has genuine reason to
+/// be in doubt: it may never have reached the relay at all, as opposed to
+/// simply "sent, ack not back yet." Ordinary continued chat in each
+/// affected conversation resolves this without any further action here —
+/// `send_message`'s piggybacked `PiggybackAck` on the next outgoing
+/// message, or the peer's own next message's piggyback the other
+/// direction, either confirms delivery (clearing `uncertain`) or the
+/// conversation simply continues with the sender aware some prior sends
+/// are unconfirmed. Returns how many messages were newly marked, summed
+/// across every conversation.
+pub fn mark_pending_sends_uncertain(db: &Db, account: &Account) -> Result<usize> {
+    let mut total = 0;
+    for contact in db.list_contacts()? {
+        let conv_id = conversation_id_for(account, &contact);
+        total += db.mark_undelivered_uncertain(conv_id)?;
+    }
+    Ok(total)
 }
 
 fn conversation_id_for(account: &Account, contact: &Contact) -> [u8; 16] {
@@ -104,11 +203,11 @@ fn random_routing_id() -> Vec<u8> {
 fn to_core_bundle(wire: &FetchedBundleWire) -> Result<PrekeyBundle> {
     let identity_dh_public: [u8; 32] =
         wire.identity_dh_public.as_slice().try_into().map_err(|_| {
-            Error::Connection("fetched bundle: identity_dh_public must be 32 bytes".into())
+            Error::Protocol("fetched bundle: identity_dh_public must be 32 bytes".into())
         })?;
     let signed_prekey_public: [u8; 32] =
         wire.signed_prekey.as_slice().try_into().map_err(|_| {
-            Error::Connection("fetched bundle: signed_prekey must be 32 bytes".into())
+            Error::Protocol("fetched bundle: signed_prekey must be 32 bytes".into())
         })?;
     Ok(PrekeyBundle {
         identity_public_key: wire.identity_key.clone(),
@@ -124,7 +223,7 @@ fn to_core_bundle(wire: &FetchedBundleWire) -> Result<PrekeyBundle> {
             .as_ref()
             .map(|otp| -> Result<OneTimePrekeyPublic> {
                 let public: [u8; 32] = otp.key.as_slice().try_into().map_err(|_| {
-                    Error::Connection("fetched bundle: one_time_prekey.key must be 32 bytes".into())
+                    Error::Protocol("fetched bundle: one_time_prekey.key must be 32 bytes".into())
                 })?;
                 Ok(OneTimePrekeyPublic {
                     id: otp.id,
@@ -149,19 +248,23 @@ async fn publish_bundle_wire(conn: &mut Connection, wire: PrekeyBundleWire) -> R
         .await?;
     let raw = conn.recv_raw().await?;
     let (tag, body) =
-        dratchet_server::protocol::split_tag(&raw).map_err(|e| Error::Connection(e.to_string()))?;
+        dratchet_server::protocol::split_tag(&raw).map_err(|e| Error::Protocol(e.to_string()))?;
     match tag {
         FrameTag::Ack => Ok(()),
         FrameTag::Error => {
             let err: ErrorFrame = dratchet_server::protocol::decode_body(body)
-                .map_err(|e| Error::Connection(e.to_string()))?;
-            if err.message == dratchet_server::error::Error::UsernameTaken.to_string() {
+                .map_err(|e| Error::Protocol(e.to_string()))?;
+            // DRA-0058: by code, not by comparing the message text.
+            if err.code == dratchet_server::protocol::ErrorCode::UsernameTaken {
                 Err(Error::UsernameTaken)
             } else {
-                Err(Error::Connection(err.message))
+                Err(Error::ServerRefused {
+                    code: err.code,
+                    message: err.message,
+                })
             }
         }
-        other => Err(Error::Connection(format!(
+        other => Err(Error::Protocol(format!(
             "unexpected frame tag {other:?} from PublishBundle"
         ))),
     }
@@ -186,6 +289,13 @@ async fn publish_under_candidates(
     username: &str,
     candidates: impl Iterator<Item = u16>,
 ) -> Result<OwnProfile> {
+    // DRA-0040 (`docs/DELIVERY_FAILURE_FINDINGS.md`): every republish is a
+    // chance to retire a signed prekey that's aged out. Before this, the
+    // key generated at `Account::generate` was kept forever, so the window
+    // X3DH's dh1/dh3 protect never closed.
+    if account.signed_prekey_rotation_due(now_unix()) {
+        account.rotate_signed_prekey(now_unix())?;
+    }
     let otp_publics = account.generate_one_time_prekeys(ONE_TIME_PREKEY_BATCH);
     let bundle = account.publish_bundle(false)?;
     let one_time_prekeys: Vec<OneTimePrekeyWire> = otp_publics
@@ -207,7 +317,7 @@ async fn publish_under_candidates(
             signed_prekey_id: bundle.signed_prekey.id,
             signed_prekey: bundle.signed_prekey.public.as_bytes().to_vec(),
             signed_prekey_sig: bundle.signed_prekey.signature.clone(),
-            signed_prekey_expires_at: 0,
+            signed_prekey_expires_at: account.signed_prekey_expires_at(),
             one_time_prekeys: one_time_prekeys.clone(),
             registration_pow: Some(dratchet_server::abuse::solve_registration_pow(
                 username,
@@ -323,6 +433,73 @@ pub async fn reconcile_own_profile(
     }
 }
 
+/// How many of this device's own one-time prekeys the directory still
+/// has unconsumed, per `FetchOwnPrekeyCount` (`ARCHITECTURE.md` §3.4).
+async fn own_prekey_count(conn: &mut Connection) -> Result<u32> {
+    conn.send(FrameTag::FetchOwnPrekeyCount, &FetchOwnPrekeyCount {})
+        .await?;
+    let (_, count): (_, OwnPrekeyCount) = conn.recv().await?;
+    Ok(count.remaining)
+}
+
+/// A fresh batch is this many prekeys (`publish_under_candidates`);
+/// replenish once the published pool has drained to this fraction of
+/// that, leaving a buffer before a `FetchBundle` ever actually finds it
+/// empty (which degrades that handshake's forward secrecy by one DH term
+/// rather than merely being a wasted round trip).
+const PREKEY_REPLENISH_THRESHOLD: u32 = 3;
+
+/// Call periodically (the Tauri poll loop does this on a slower cadence
+/// than its normal message poll — querying and, when due, republishing
+/// are both cheap, but there's no reason to do either every tick):
+/// checks this device's remaining one-time-prekey pool via
+/// [`own_prekey_count`] and, if it has drained to
+/// [`PREKEY_REPLENISH_THRESHOLD`] or below, republishes a fresh full
+/// batch under the exact username/discriminator already on record — the
+/// same mechanism [`reconcile_own_profile`] uses to reclaim after a
+/// restart, reused here to top up instead (and just as free of protocol
+/// cost: `server/src/ws.rs`'s `publish_bundle` never requires proof-of-
+/// work for a rotation/republish of an already-owned identity, only for
+/// a brand-new registration). A no-op if this device has never
+/// registered (`db.load_own_profile` returns `None`) or the pool isn't
+/// low yet. Returns whether it actually republished — nothing here is
+/// user-visible by itself, unlike `reconcile_own_profile`'s
+/// `DiscriminatorChanged`, so a caller only needs this for logging.
+pub async fn replenish_prekeys_if_low(
+    db: &Db,
+    conn: &mut Connection,
+    account: &mut Account,
+) -> Result<bool> {
+    let Some(existing) = db.load_own_profile()? else {
+        return Ok(false);
+    };
+    // DRA-0040: republish when the signed prekey is due for rotation even
+    // if the one-time-prekey pool is still healthy -- otherwise a chatty
+    // account that never drains its pool would never rotate.
+    let rotation_due = account.signed_prekey_rotation_due(now_unix());
+    if !rotation_due && own_prekey_count(conn).await? > PREKEY_REPLENISH_THRESHOLD {
+        return Ok(false);
+    }
+
+    let candidates = std::iter::once(existing.discriminator).chain(
+        std::iter::repeat_with(random_discriminator).take(DISCRIMINATOR_RETRY_ATTEMPTS as usize),
+    );
+    publish_under_candidates(db, conn, account, &existing.username, candidates).await?;
+    Ok(true)
+}
+
+/// DRA-0065: refuse before encrypting on a connection that has already
+/// failed. Every ratchet send commits its chain position before sending
+/// (DRA-0059), so each attempt on a dead connection used one up for
+/// nothing; past the recipient's `max_skip` the recipient could no longer
+/// decrypt anything from this side in the conversation.
+fn ensure_connection_usable(conn: &Connection) -> Result<()> {
+    if conn.is_lost() {
+        return Err(Error::Connection("connection already lost".to_string()));
+    }
+    Ok(())
+}
+
 /// Send this side's current `username#NNNN` (§6.1's `ProfileAnnounce`,
 /// `MESSAGE_SCHEMA.md`) to one already-Verified contact. Purely a
 /// display-label update — see `ProfileAnnounce`'s doc for why this never
@@ -339,6 +516,7 @@ pub async fn announce_profile(
     let conv_id = conversation_id_for(account, contact);
     let mut ratchet = db.load_ratchet(conv_id)?.ok_or(Error::NoSession)?;
 
+    ensure_connection_usable(conn)?;
     let envelope = ratchet.encrypt_payload(
         PAYLOAD_PROFILE_ANNOUNCE,
         &ProfileAnnounce {
@@ -347,12 +525,16 @@ pub async fn announce_profile(
         }
         .encode(),
     )?;
+    // DRA-0059: commit the ratchet advance *before* the envelope leaves,
+    // so a retry after a lost Ack encrypts at a fresh chain position
+    // (fresh key and nonce) instead of reusing this one.
+    db.save_ratchet(conv_id, &ratchet)?;
     conn.send(
         FrameTag::MailboxWrite,
         &MailboxWrite {
             mailbox_id: contact.mailbox_id.clone(),
             envelope: envelope.encode(),
-            ttl: 14 * 24 * 60 * 60,
+            ttl: MAILBOX_TTL_SECS,
         },
     )
     .await?;
@@ -361,7 +543,6 @@ pub async fn announce_profile(
         return Err(Error::NotAcknowledged);
     }
 
-    db.save_ratchet(conv_id, &ratchet)?;
     Ok(())
 }
 
@@ -414,6 +595,18 @@ pub async fn add_contact_by_username(
     let (_, result): (_, BundleResult) = conn.recv().await?;
     let fetched = result.bundle.ok_or(Error::NoSuchAccount)?;
 
+    // DRA-0040: refuse a signed prekey that has outlived its published
+    // lifetime, so a directory can't keep serving one indefinitely after
+    // the owner has rotated past it. `0` means "no expiry published" (an
+    // account that predates DRA-0040) and is accepted, since rejecting it
+    // would lock out every already-published bundle; note that expiry is
+    // not covered by the bundle's signature chain, so this is protection
+    // against a *stale* directory, not a malicious one -- the malicious
+    // case is `ARCHITECTURE.md` §11.7's key-transparency gap.
+    if fetched.signed_prekey_expires_at != 0 && fetched.signed_prekey_expires_at < now_unix() {
+        return Err(Error::SignedPrekeyExpired);
+    }
+
     let core_bundle = to_core_bundle(&fetched)?;
     let init = x3dh::initiate(
         account.identity_dh_secret(),
@@ -454,7 +647,7 @@ pub async fn add_contact_by_username(
         &MailboxWrite {
             mailbox_id: bootstrap_mailbox_id(&peer_fp).to_vec(),
             envelope: wire.encode(),
-            ttl: 14 * 24 * 60 * 60,
+            ttl: MAILBOX_TTL_SECS,
         },
     )
     .await?;
@@ -478,6 +671,12 @@ pub async fn add_contact_by_username(
         wipe_include_session: false,
         peer_wipe_include_session: None,
         wipe_request_pending: false,
+        wipe_boundary_timestamp: None,
+        wipe_boundary_sequence: None,
+        peer_wipe_boundary_timestamp: None,
+        peer_wipe_boundary_sequence: None,
+        routing_confirmed: false,
+        routing_announce: Vec::new(),
     };
     db.save_contact(&contact)?;
     db.save_ratchet(conv_id, &ratchet)?;
@@ -584,23 +783,40 @@ fn try_accept_first_contact(
         return Ok(None);
     };
 
-    let otp_secret = init_message
-        .used_one_time_prekey_id
-        .and_then(|id| account.take_one_time_prekey_secret(id));
-    if init_message.used_one_time_prekey_id.is_some() && otp_secret.is_none() {
+    // DRA-0023 (`docs/DELIVERY_FAILURE_FINDINGS.md`): peek, don't consume
+    // yet. The pairing code that actually proves this attempt is genuine
+    // lives *inside* the ratchet-encrypted envelope below, which can't be
+    // decrypted without first deriving the root key from this secret — so
+    // there's no way to check the code before using the secret. But
+    // *using* it for the DH computation and *discarding it from local
+    // storage forever* are different things: only the latter must wait
+    // until the pairing-code check below actually succeeds, or literally
+    // anyone (no code required, no rate limit applies to writing into an
+    // already-existing bootstrap mailbox) could destroy this account's
+    // entire locally-held one-time-prekey batch just by sending garbage
+    // first-contact attempts naming every id in it — one-time-prekey ids
+    // are small sequential integers (`Account::next_otp_id`), so guessing
+    // them all needs no prior `FetchBundle` at all.
+    let otp_id = init_message.used_one_time_prekey_id;
+    let otp_secret_ref = otp_id.and_then(|id| account.peek_one_time_prekey_secret(id));
+    if otp_id.is_some() && otp_secret_ref.is_none() {
         // Named an id we don't have (already consumed, or never existed) —
         // can't derive the same root key the initiator did.
         return Ok(None);
     }
-    let root_key = x3dh::respond(
+    // DRA-0037 (`docs/DELIVERY_FAILURE_FINDINGS.md`): a first-contact
+    // attempt naming low-order X25519 points derives a root key any
+    // observer could recompute -- rejected here like every other
+    // adversarial attempt, without consuming the one-time prekey (the
+    // peek/commit split above) or touching any other local state.
+    let Ok(root_key) = x3dh::respond(
         account.identity_dh_secret(),
         account.signed_prekey_secret(),
-        otp_secret.as_ref(),
+        otp_secret_ref,
         &init_message,
-    );
-    if otp_secret.is_some() {
-        *account_dirty = true;
-    }
+    ) else {
+        return Ok(None);
+    };
 
     let peer_fp = *fingerprint_of_public_key(&wire.initiator_identity_key).as_bytes();
     let conv_id = conversation_id(account.identity.fingerprint().as_bytes(), &peer_fp);
@@ -632,6 +848,13 @@ fn try_accept_first_contact(
     }
     db.clear_pairing_code()?;
 
+    // Only now, with a genuinely matching pairing code, actually discard
+    // the one-time-prekey secret from local storage for good (DRA-0023).
+    if let Some(id) = otp_id {
+        account.take_one_time_prekey_secret(id);
+        *account_dirty = true;
+    }
+
     let contact = Contact {
         fingerprint: peer_fp.to_vec(),
         username: Some(announced.username),
@@ -646,6 +869,12 @@ fn try_accept_first_contact(
         wipe_include_session: false,
         peer_wipe_include_session: None,
         wipe_request_pending: false,
+        wipe_boundary_timestamp: None,
+        wipe_boundary_sequence: None,
+        peer_wipe_boundary_timestamp: None,
+        peer_wipe_boundary_sequence: None,
+        routing_confirmed: false,
+        routing_announce: Vec::new(),
     };
     db.save_contact(&contact)?;
     db.save_ratchet(conv_id, &ratchet)?;
@@ -653,10 +882,17 @@ fn try_accept_first_contact(
 }
 
 /// Encrypt and send `content` to `contact`, refusing (via
-/// `store::gate::encrypt_gated`) if `contact` isn't `Verified` yet —
+/// `store::gate::encrypt_gated`) if `contact` isn't `Verified` yet --
 /// `docs/ARCHITECTURE.md` §6.5's mandatory gate, enforced here, not left
-/// to the UI to remember. On success, persists both the advanced ratchet
-/// state and the sent message.
+/// to the UI to remember.
+///
+/// DRA-0060: once encrypted, the message is saved to this side's history
+/// *before* it is sent, marked `RetryReason::SendFailed`, and the mark is
+/// cleared when the server acknowledges it. A send that fails, or whose
+/// acknowledgement is lost, therefore stays visible and can be resent
+/// with [`retry_message`], instead of vanishing from the sender's history
+/// while possibly having reached the recipient. Such a failure returns
+/// [`Error::NotSent`], carrying the saved message.
 pub async fn send_message(
     db: &Db,
     conn: &mut Connection,
@@ -664,27 +900,189 @@ pub async fn send_message(
     contact: &Contact,
     content: &[u8],
 ) -> Result<Message> {
+    let message = db.new_outgoing_message(content.to_vec());
+    transmit_chat(db, conn, account, contact, message).await
+}
+
+/// DRA-0062: keep a message written while there is no connection to the
+/// server, flagged `RetryReason::SendFailed` so it is offered for
+/// [`retry_message`] once the app reconnects. Nothing is encrypted yet --
+/// that happens on the retry, at whatever ratchet position is current
+/// then. Refused for a contact that isn't `Verified`, exactly as
+/// [`send_message`] refuses.
+pub fn save_unsent_message(
+    db: &Db,
+    account: &Account,
+    contact: &Contact,
+    content: &[u8],
+) -> Result<Message> {
+    if contact.verification_state != VerificationState::Verified {
+        return Err(dratchet_store::Error::NotVerified.into());
+    }
+    let conv_id = conversation_id_for(account, contact);
+    let message = db.new_outgoing_message(content.to_vec());
+    db.save_message(conv_id, &message)?;
+    Ok(message)
+}
+
+/// DRA-0066: this side has switched to the routing-id mailbox (it has the
+/// peer's routing id) but hasn't heard from the peer there yet, so the
+/// peer may never have received this side's `RoutingIdAnnounce` -- a
+/// server restart or the mailbox lifetime can lose it. The peer would then
+/// keep reading its old inbox while this side writes to the new one, and
+/// every message, retries included, would go unread. Re-sending the
+/// original announce, byte for byte, to the old inbox after each chat
+/// message lets the peer catch up. It uses no new chain position: a peer
+/// that already has it rejects the copy as a replay. Best-effort: the
+/// chat message itself was already accepted, so a failure here only means
+/// the next send tries again.
+async fn reannounce_routing_id_if_unconfirmed(db: &Db, conn: &mut Connection, contact: &Contact) {
+    let Ok(Some(current)) = db.load_contact(&contact.fingerprint) else {
+        return;
+    };
+    if current.peer_routing_id.is_none()
+        || current.routing_confirmed
+        || current.routing_announce.is_empty()
+    {
+        return;
+    }
+    let resent: Result<()> = async {
+        conn.send(
+            FrameTag::MailboxWrite,
+            &MailboxWrite {
+                mailbox_id: bootstrap_mailbox_id(&current.fingerprint).to_vec(),
+                envelope: current.routing_announce.clone(),
+                ttl: MAILBOX_TTL_SECS,
+            },
+        )
+        .await?;
+        let (_, ack): (_, Ack) = conn.recv().await?;
+        if !ack.ok {
+            return Err(Error::NotAcknowledged);
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(e) = resent {
+        eprintln!("re-sending the routing-id announce failed (retried on the next send): {e}");
+    }
+}
+
+/// DRA-0060/0063/0064: resend one of this side's own messages that is
+/// flagged for retry (`Message::retry_reason`). The same content is
+/// encrypted again at the ratchet's next position -- a fresh key and nonce
+/// (DRA-0059), never the original ones -- and carries the same message id,
+/// so a recipient that already has the original drops the copy. Updates
+/// the stored message in place (same place in the conversation).
+pub async fn retry_message(
+    db: &Db,
+    conn: &mut Connection,
+    account: &Account,
+    contact: &Contact,
+    message_id: &[u8],
+) -> Result<Message> {
+    let conv_id = conversation_id_for(account, contact);
+    let message = db
+        .load_message(conv_id, message_id)?
+        .ok_or(Error::NothingToRetry)?;
+    if !message.sender_is_local || message.retry_reason.is_none() {
+        return Err(Error::NothingToRetry);
+    }
+    transmit_chat(db, conn, account, contact, message).await
+}
+
+/// The shared send path for [`send_message`] and [`retry_message`].
+async fn transmit_chat(
+    db: &Db,
+    conn: &mut Connection,
+    account: &Account,
+    contact: &Contact,
+    mut message: Message,
+) -> Result<Message> {
     let conv_id = conversation_id_for(account, contact);
     let mut ratchet = db.load_ratchet(conv_id)?.ok_or(Error::NoSession)?;
 
-    let envelope = encrypt_gated(&mut ratchet, contact, PAYLOAD_CHAT, content)?;
+    // TCP-style cumulative piggyback ack (`ARCHITECTURE.md` §4.6): ride
+    // "everything I've received on your current chain so far" along on
+    // this ordinary chat send, supplementary to the dedicated
+    // `DeliveryAck` `receive_pending` already sends. `None` if nothing's
+    // been received on the current receiving chain yet (most commonly,
+    // this is the first message this side has ever sent).
+    let piggyback_ack = ratchet
+        .receiving_progress()
+        .map(|(dh_pub, highest_n)| PiggybackAck { dh_pub, highest_n });
+    let chat = ChatContent {
+        text: message.content.clone(),
+        piggyback_ack,
+        message_id: message.id.clone(),
+    };
 
-    conn.send(
-        FrameTag::MailboxWrite,
-        &MailboxWrite {
-            mailbox_id: contact.mailbox_id.clone(),
-            envelope: envelope.encode(),
-            ttl: 14 * 24 * 60 * 60, // 14 days, `ARCHITECTURE.md` §4.5's default
-        },
-    )
-    .await?;
-    let (_, ack): (_, Ack) = conn.recv().await?;
-    if !ack.ok {
-        return Err(Error::NotAcknowledged);
+    // DRA-0065: the connection already failed, so this attempt can't
+    // reach the server. Keep the message flagged for retry, exactly as an
+    // offline send is kept (DRA-0062), without encrypting it -- encrypting
+    // would use up a chain position for nothing.
+    if conn.is_lost() {
+        if contact.verification_state != VerificationState::Verified {
+            return Err(dratchet_store::Error::NotVerified.into());
+        }
+        message.retry_reason = Some(RetryReason::SendFailed);
+        db.save_message(conv_id, &message)?;
+        return Err(Error::NotSent {
+            message: Box::new(message),
+            cause: Box::new(Error::Connection("connection already lost".to_string())),
+        });
     }
 
+    // Nothing is saved if this refuses (an unverified contact): same as
+    // before DRA-0060, a gated send leaves no trace.
+    let envelope = encrypt_gated(&mut ratchet, contact, PAYLOAD_CHAT, &chat.encode())?;
+
+    // DRA-0059: commit the ratchet advance *before* the envelope leaves,
+    // so a retry after a lost Ack encrypts at a fresh chain position
+    // (fresh key and nonce) instead of reusing this one.
     db.save_ratchet(conv_id, &ratchet)?;
-    Ok(db.save_message_now(conv_id, content.to_vec(), true)?)
+    // DRA-0060: saved, still flagged, before sending -- so the message
+    // survives a failed send (or a crash mid-send), and a DeliveryAck for
+    // this envelope always finds it by (dh_pub, n).
+    message.send_n = Some(envelope.n);
+    message.send_dh_pub = Some(envelope.dh_pub.to_vec());
+    message.delivered = false;
+    message.uncertain = false;
+    message.retry_reason = Some(RetryReason::SendFailed);
+    db.save_message(conv_id, &message)?;
+
+    let sent: Result<()> = async {
+        conn.send(
+            FrameTag::MailboxWrite,
+            &MailboxWrite {
+                mailbox_id: contact.mailbox_id.clone(),
+                envelope: envelope.encode(),
+                ttl: MAILBOX_TTL_SECS,
+            },
+        )
+        .await?;
+        let (_, ack): (_, Ack) = conn.recv().await?;
+        if !ack.ok {
+            return Err(Error::NotAcknowledged);
+        }
+        Ok(())
+    }
+    .await;
+
+    match sent {
+        Ok(()) => {
+            message.retry_reason = None;
+            // DRA-0063: the server's mailbox lifetime for it starts now.
+            message.last_sent_at = Some(now_unix());
+            db.save_message(conv_id, &message)?;
+            reannounce_routing_id_if_unconfirmed(db, conn, contact).await;
+            Ok(message)
+        }
+        Err(cause) => Err(Error::NotSent {
+            message: Box::new(message),
+            cause: Box::new(cause),
+        }),
+    }
 }
 
 /// Fetch and process everything currently sitting in the mailbox `contact`
@@ -722,6 +1120,29 @@ pub async fn send_message(
 /// this conversation changed — a peer-requested wipe that auto-complied,
 /// or one that only set `Contact::wipe_request_pending` — even when no
 /// chat message arrived, so it knows to refetch.
+///
+/// **Concurrency (DRA-0012, `docs/DELIVERY_FAILURE_FINDINGS.md`)**: two
+/// overlapping calls for the same `(db, conversation)` pair used to be
+/// able to race — each loading the ratchet at the same starting state,
+/// each fetching (and independently processing) the same batch of
+/// mailbox entries, and racing to `db.save_ratchet` at the end,
+/// confirmed by `app/tests/concurrent_receive_pending_race.rs`: real
+/// content duplication (each entry decrypted and stored twice), though
+/// the ratchet itself was left self-consistent and usable afterward in
+/// every trial, not permanently desynced. Previously this was purely
+/// architectural — `poll_loop` (`ui/src-tauri/src/lib.rs`) happened to be
+/// the sole call site and happened to hold `state.conn`'s mutex across
+/// the whole call — not something this function's own signature
+/// enforced. It now is: the `db.receive_lock(conv_id).lock().await`
+/// below serializes every call for the same conversation regardless of
+/// caller, so a second call site (a manual "sync now" command on its own
+/// connection, a per-contact-parallel poll loop) can no longer violate
+/// this silently. `save_message_now`'s `(conv_id, recv_dh_pub, recv_n)`
+/// dedup (`store/src/messages.rs`) is a second, independent layer behind
+/// this one — belt-and-suspenders against any future caller that
+/// bypasses this lock (a second process against the same on-disk `Db`
+/// file, for instance, which an in-process `tokio::sync::Mutex` can't
+/// reach).
 pub async fn receive_pending(
     db: &Db,
     conn: &mut Connection,
@@ -729,13 +1150,16 @@ pub async fn receive_pending(
     contact: &Contact,
 ) -> Result<Received> {
     let conv_id = conversation_id_for(account, contact);
+    let receive_lock = db.receive_lock(conv_id);
+    let _receive_guard = receive_lock.lock().await;
     let mut ratchet = db.load_ratchet(conv_id)?.ok_or(Error::NoSession)?;
     // Captured once so every delete in this pass targets the address the
     // entries were actually fetched from, even if a `RoutingIdAnnounce`
     // processed partway through this same batch moves `contact.mailbox_id`
     // forward (that mutation affects only our *send* address, computed
     // fresh below regardless).
-    let fetch_mailbox_id = if contact.peer_routing_id.is_some() {
+    let fetched_from_routing_mailbox = contact.peer_routing_id.is_some();
+    let fetch_mailbox_id = if fetched_from_routing_mailbox {
         contact.mailbox_id.clone()
     } else {
         bootstrap_mailbox_id(account.identity.fingerprint().as_bytes()).to_vec()
@@ -751,6 +1175,7 @@ pub async fn receive_pending(
     let (_, entries): (_, MailboxEntries) = conn.recv().await?;
 
     let mut received = Vec::new();
+    let mut delivered = Vec::new();
     let mut wipe_activity = false;
     let mut profile_changes = Vec::new();
     let mut skipped = 0usize;
@@ -760,15 +1185,47 @@ pub async fn receive_pending(
     // still-live in-memory `ratchet`, needed to keep decrypting the rest
     // of this batch) must not resurrect it.
     let mut session_wiped = false;
+    // DRA-0066: whether anything from the peer decrypted in this pass.
+    let mut decrypted_any = false;
     // `contact`'s verification state (used by `decrypt_gated`) doesn't
     // change mid-loop — only its `mailbox_id`, tracked separately above —
     // so gating against the caller's original `contact` for every entry
-    // in this batch is correct. Wipe-policy decisions below use this same
-    // stale-within-the-batch snapshot for the same reason.
+    // in this batch is correct. Wipe-policy decisions, by contrast,
+    // *cannot* safely use this same stale-within-the-batch snapshot — a
+    // `ConversationWipePolicyAnnounce` and the wipe request it's meant to
+    // gate can land in the very same batch (a peer catching up after
+    // being offline), so `apply_entry`'s wipe-request arm reloads
+    // `contact` fresh from `db` itself rather than trusting this one.
     for entry in &entries.entries {
-        match apply_entry(db, &mut ratchet, contact, conv_id, &entry.envelope) {
+        // Set by a successfully-decrypted chat message below — the ratchet
+        // header `n` it arrived with, still needed *after* this entry's
+        // `MailboxDelete` below to send its `DeliveryAck` (`ARCHITECTURE.md`
+        // §4.6). Sent only once the entry is confirmed deleted, not before:
+        // sending it earlier and having the ack round trip itself fail
+        // would abort this function before the delete ever ran, and a
+        // still-undeleted entry gets refetched and reprocessed next time —
+        // decrypting fine again (the ratchet's on-disk position hasn't
+        // advanced past it either, since `db.save_ratchet` below hasn't run
+        // yet) but re-saved as a second, duplicate `Message` record. Acking
+        // only after the delete has already succeeded means a lost ack
+        // costs nothing but the sender's delivered-indicator for this one
+        // message — never a duplicate.
+        let mut ack_after_delete: Option<(Vec<u8>, u32)> = None;
+
+        let applied = apply_entry(db, &mut ratchet, contact, conv_id, &entry.envelope);
+        decrypted_any |= applied.is_ok();
+        match applied {
             Ok(EntryEffect::None) => {}
-            Ok(EntryEffect::Message(message)) => received.push(message),
+            Ok(EntryEffect::Message(message, dh_pub, acked_n, piggyback_delivered)) => {
+                ack_after_delete = Some((dh_pub, acked_n));
+                received.push(message);
+                delivered.extend(piggyback_delivered);
+            }
+            Ok(EntryEffect::Resent(dh_pub, acked_n, piggyback_delivered)) => {
+                ack_after_delete = Some((dh_pub, acked_n));
+                delivered.extend(piggyback_delivered);
+            }
+            Ok(EntryEffect::Delivered(message)) => delivered.push(message),
             Ok(EntryEffect::WipeActivity { session_wiped: sw }) => {
                 wipe_activity = true;
                 if sw {
@@ -809,13 +1266,57 @@ pub async fn receive_pending(
         if !ack.ok {
             return Err(Error::NotAcknowledged);
         }
+
+        // `ARCHITECTURE.md` §4.6: sent the moment a ratchet envelope
+        // decrypts successfully, over the same mailbox path any other
+        // message uses — no special-cased transport. Uses the same live
+        // `ratchet` this whole batch already holds (not a fresh
+        // `db.load_ratchet`), so it's just the next message in whatever
+        // sending chain is currently active, persisted by the one
+        // `db.save_ratchet` at the end of this function like everything
+        // else this pass did to the ratchet.
+        if let Some((acked_dh_pub, acked_n)) = ack_after_delete {
+            let ack_content = DeliveryAck {
+                conversation_id: conv_id.to_vec(),
+                dh_pub: acked_dh_pub,
+                acked_n,
+            }
+            .encode();
+            let ack_envelope = ratchet.encrypt_payload(PAYLOAD_DELIVERY_ACK, &ack_content)?;
+            // DRA-0059: commit before sending, as every other send does. Safe
+            // mid-batch: this entry is already processed, saved and deleted
+            // from the mailbox, so committing its receive progress is
+            // correct too. A session this batch wiped stays unsaved.
+            if !session_wiped {
+                db.save_ratchet(conv_id, &ratchet)?;
+            }
+            conn.send(
+                FrameTag::MailboxWrite,
+                &MailboxWrite {
+                    mailbox_id: contact.mailbox_id.clone(),
+                    envelope: ack_envelope.encode(),
+                    ttl: MAILBOX_TTL_SECS,
+                },
+            )
+            .await?;
+            let (_, ack): (_, Ack) = conn.recv().await?;
+            if !ack.ok {
+                return Err(Error::NotAcknowledged);
+            }
+        }
     }
 
     if !session_wiped {
         db.save_ratchet(conv_id, &ratchet)?;
     }
+    // DRA-0066: mail from the peer on the routing-id mailbox proves the
+    // peer has this side's routing id, so the re-announcing can stop.
+    if fetched_from_routing_mailbox && decrypted_any && !contact.routing_confirmed {
+        db.mark_routing_confirmed(&contact.fingerprint)?;
+    }
     Ok(Received {
         messages: received,
+        delivered,
         wipe_activity,
         profile_changes,
         skipped,
@@ -827,8 +1328,25 @@ pub async fn receive_pending(
 /// to skip just this entry or abort the whole batch.
 enum EntryEffect {
     None,
-    Message(Message),
-    WipeActivity { session_wiped: bool },
+    /// A released chat message, the ratchet header `dh_pub`/`n` it
+    /// arrived with (`receive_pending` needs those after this entry's
+    /// `MailboxDelete` succeeds, to send back its `DeliveryAck`), and any
+    /// of our own previously-sent messages this entry's `PiggybackAck`
+    /// newly confirmed delivered (`Db::mark_messages_delivered_up_to`) —
+    /// usually empty, non-empty whenever the sender's chat message
+    /// carried a cumulative ack.
+    Message(Message, Vec<u8>, u32, Vec<Message>),
+    /// DRA-0060: a resend of a chat message already received. Not shown
+    /// again; carries what `Message` does minus the message itself, so the
+    /// new envelope is still acked.
+    Resent(Vec<u8>, u32, Vec<Message>),
+    /// An incoming `DeliveryAck` matched one of our own previously-sent
+    /// messages (`Db::mark_message_delivered`) — the now-delivered
+    /// message, for a caller to react to (e.g. a UI checkmark).
+    Delivered(Message),
+    WipeActivity {
+        session_wiped: bool,
+    },
     ProfileChange(ProfileChangeNotice),
 }
 
@@ -864,10 +1382,84 @@ fn apply_entry(
             db.record_peer_routing_id(&contact.fingerprint, announce.routing_id)?;
             Ok(EntryEffect::None)
         }
-        Ok((PAYLOAD_CHAT, content)) => Ok(EntryEffect::Message(
-            db.save_message_now(conv_id, content, false)?,
-        )),
+        Ok((PAYLOAD_CHAT, content)) => {
+            let chat = ChatContent::decode(&content)?;
+            // Cumulative piggyback ack, if the sender had anything to
+            // report yet — resolves any of our own messages this client
+            // may have marked `uncertain` (`Message::uncertain`'s doc)
+            // even if their dedicated `DeliveryAck` never arrived.
+            let piggyback_delivered = match &chat.piggyback_ack {
+                Some(ack) => {
+                    db.mark_messages_delivered_up_to(conv_id, &ack.dh_pub, ack.highest_n)?
+                }
+                None => Vec::new(),
+            };
+            // DRA-0012 (`docs/DELIVERY_FAILURE_FINDINGS.md`): idempotent on
+            // `(recv_dh_pub, recv_n)` — the second, independent layer
+            // behind `receive_pending`'s per-conversation lock. A
+            // duplicate decrypt of the same mailbox entry (from a race
+            // that slipped past the lock, or a crash-recovery reprocess
+            // of a not-yet-deleted entry) returns the already-stored
+            // message instead of inserting a second one.
+            let recv_dh_pub = envelope.dh_pub.to_vec();
+            let recv_n = envelope.n;
+            // DRA-0060: a resend of a message already received (same sender
+            // id) is not shown again, but its envelope is still acked so the
+            // sender's copy is confirmed.
+            let peer_message_id = (!chat.message_id.is_empty()).then_some(chat.message_id);
+            let (message, resent) = db.save_received_chat(
+                conv_id,
+                chat.text,
+                recv_dh_pub.clone(),
+                recv_n,
+                peer_message_id,
+            )?;
+            if resent {
+                return Ok(EntryEffect::Resent(
+                    recv_dh_pub,
+                    recv_n,
+                    piggyback_delivered,
+                ));
+            }
+            Ok(EntryEffect::Message(
+                message,
+                recv_dh_pub,
+                recv_n,
+                piggyback_delivered,
+            ))
+        }
+        Ok((PAYLOAD_DELIVERY_ACK, content)) => {
+            let ack = DeliveryAck::decode(&content)?;
+            if ack.conversation_id != conv_id {
+                return Err(dratchet_core::error::Error::MalformedPayload(
+                    "DeliveryAck.conversation_id doesn't match the session it arrived on",
+                )
+                .into());
+            }
+            match db.mark_message_delivered(conv_id, &ack.dh_pub, ack.acked_n)? {
+                Some(message) => Ok(EntryEffect::Delivered(message)),
+                // Stale/duplicate ack, or one naming a (dh_pub, n) this
+                // side never actually sent — not an error, just nothing
+                // to do.
+                None => Ok(EntryEffect::None),
+            }
+        }
         Ok((PAYLOAD_CONVERSATION_WIPE_POLICY_ANNOUNCE, content)) => {
+            // DRA-0032 (`docs/DELIVERY_FAILURE_FINDINGS.md`): mirrors
+            // DRA-0021's reasoning for `PAYLOAD_CONVERSATION_WIPE_REQUEST`
+            // immediately below -- this payload has a real, persisted
+            // local effect too (`peer_wipe_ask_before_delete`, and the
+            // wipe boundary a later auto-complied wipe request scopes
+            // itself against), so a session that isn't `Verified`
+            // (including one reverted to `Mismatch`) must never have it
+            // take effect, exactly like chat content. Without this, an
+            // unverified/mismatched peer could silently poison
+            // `peer_wipe_ask_before_delete` to `false`, defeating this
+            // side's own configured ask-before-delete safety net for a
+            // later, genuinely `Verified` wipe request.
+            if contact.verification_state != VerificationState::Verified {
+                return Ok(EntryEffect::None);
+            }
             let announce = ConversationWipePolicyAnnounce::decode(&content)?;
             db.record_peer_wipe_policy(
                 &contact.fingerprint,
@@ -878,17 +1470,67 @@ fn apply_entry(
                 session_wiped: false,
             })
         }
-        Ok((PAYLOAD_CONVERSATION_WIPE_REQUEST, _content)) => {
-            if contact.effective_wipe_ask_before_delete() {
-                let mut pending = contact.clone();
+        Ok((PAYLOAD_CONVERSATION_WIPE_REQUEST, content)) => {
+            // The requester's own `include_session` preference, carried in
+            // the request itself since `docs/DELIVERY_FAILURE_FINDINGS.md`
+            // finding #30 — folded into this side's effective decision
+            // below (most-restrictive-wins) without depending on a prior
+            // `ConversationWipePolicyAnnounce` having already landed.
+            // Malformed content is per-entry-skippable like any other
+            // decode failure here, not fatal to the whole batch.
+            let requested = ConversationWipeRequestContent::decode(&content)?;
+            // Reload from disk rather than trusting `contact`, the
+            // snapshot `receive_pending` captured once before this whole
+            // batch started. A `ConversationWipePolicyAnnounce` earlier
+            // in this *same* batch already updated the persisted record
+            // (the arm above, `record_peer_wipe_policy`) — the ask-
+            // before-delete gate and the wipe boundary both need to see
+            // that, not the pre-batch snapshot, or a peer who was simply
+            // offline long enough to have an announce and its wipe
+            // request land in one poll gets silently downgraded to the
+            // old unscoped, unconfirmed behavior even though the
+            // announce technically already arrived
+            // (`docs/DELIVERY_FAILURE_FINDINGS.md`, the same-batch
+            // staleness findings). Falls back to the passed-in `contact`
+            // only in the pathological case it vanished entirely between
+            // then and now.
+            let current = db
+                .load_contact(&contact.fingerprint)?
+                .unwrap_or_else(|| contact.clone());
+            // DRA-0021 (`docs/DELIVERY_FAILURE_FINDINGS.md`): unlike every
+            // other arm here, a wipe request has a genuinely destructive
+            // local effect (auto-comply deletes real message history
+            // outright; even the ask-before-delete branch below arms a
+            // confirmation prompt a user could be talked into approving).
+            // §6.5 only ever gated *chat content*, on the theory that
+            // everything else is inert "protocol machinery" — but this
+            // payload isn't inert, so a session that isn't `Verified`
+            // (including one explicitly reverted to `Mismatch`, §6.2/6.3's
+            // hard-stop for a detected identity change) must never have it
+            // take any local effect, exactly as `decrypt_gated` already
+            // withholds chat content from the same untrusted session.
+            if current.verification_state != VerificationState::Verified {
+                return Ok(EntryEffect::None);
+            }
+            if current.effective_wipe_ask_before_delete() {
+                // Not applied to this path: the requester's carried
+                // preference isn't persisted anywhere between now and
+                // `confirm_pending_wipe` running later, so an un-announced
+                // `include_session` can still be missed here — a narrower
+                // residual case than finding #30's (this one requires
+                // *both* sides to have opted into ask-before-delete in the
+                // first place, a much smaller population) left as a known
+                // limitation rather than expanding this fix's scope.
+                let mut pending = current.clone();
                 pending.wipe_request_pending = true;
                 db.save_contact(&pending)?;
                 Ok(EntryEffect::WipeActivity {
                     session_wiped: false,
                 })
             } else {
-                let include_session = contact.effective_wipe_include_session();
-                db.wipe_conversation(conv_id, include_session)?;
+                let include_session =
+                    current.effective_wipe_include_session() || requested.include_session;
+                wipe_conversation_scoped(db, conv_id, &current, include_session)?;
                 Ok(EntryEffect::WipeActivity {
                     session_wiped: include_session,
                 })
@@ -935,6 +1577,11 @@ pub struct Received {
     /// Newly received, released chat messages — what a caller used to get
     /// directly before this type existed.
     pub messages: Vec<Message>,
+    /// Previously-sent messages a `DeliveryAck` arrived for this pass
+    /// (`ARCHITECTURE.md` §4.6) — now `Message::delivered == true`. A
+    /// caller (the Tauri poll loop) uses this to refresh a delivered
+    /// indicator without needing to know which message ids to look for.
+    pub delivered: Vec<Message>,
     /// Something about this conversation changed that isn't reflected in
     /// `messages` — a wipe-policy announcement was recorded, or a wipe
     /// request either auto-complied or set `Contact::wipe_request_pending`.
@@ -985,17 +1632,28 @@ pub async fn announce_routing_id(
     let conv_id = conversation_id_for(account, contact);
     let mut ratchet = db.load_ratchet(conv_id)?.ok_or(Error::NoSession)?;
 
+    ensure_connection_usable(conn)?;
     let envelope = ratchet.encrypt_payload(
         PAYLOAD_ROUTING_ID_ANNOUNCE,
         &RoutingIdAnnounce { routing_id }.encode(),
     )?;
 
+    // DRA-0059: commit the ratchet advance *before* the envelope leaves,
+    // so a retry after a lost Ack encrypts at a fresh chain position
+    // (fresh key and nonce) instead of reusing this one.
+    db.save_ratchet(conv_id, &ratchet)?;
+    let encoded = envelope.encode();
+    // DRA-0066: kept so it can be re-sent unchanged if it turns out lost.
+    if let Some(mut current) = db.load_contact(&contact.fingerprint)? {
+        current.routing_announce = encoded.clone();
+        db.save_contact(&current)?;
+    }
     conn.send(
         FrameTag::MailboxWrite,
         &MailboxWrite {
             mailbox_id: bootstrap_mailbox_id(&contact.fingerprint).to_vec(),
-            envelope: envelope.encode(),
-            ttl: 14 * 24 * 60 * 60,
+            envelope: encoded,
+            ttl: MAILBOX_TTL_SECS,
         },
     )
     .await?;
@@ -1004,7 +1662,6 @@ pub async fn announce_routing_id(
         return Err(Error::NotAcknowledged);
     }
 
-    db.save_ratchet(conv_id, &ratchet)?;
     Ok(())
 }
 
@@ -1031,6 +1688,7 @@ pub async fn announce_wipe_policy(
     updated.wipe_include_session = include_session;
     db.save_contact(&updated)?;
 
+    ensure_connection_usable(conn)?;
     let envelope = ratchet.encrypt_payload(
         PAYLOAD_CONVERSATION_WIPE_POLICY_ANNOUNCE,
         &ConversationWipePolicyAnnounce {
@@ -1039,12 +1697,16 @@ pub async fn announce_wipe_policy(
         }
         .encode(),
     )?;
+    // DRA-0059: commit the ratchet advance *before* the envelope leaves,
+    // so a retry after a lost Ack encrypts at a fresh chain position
+    // (fresh key and nonce) instead of reusing this one.
+    db.save_ratchet(conv_id, &ratchet)?;
     conn.send(
         FrameTag::MailboxWrite,
         &MailboxWrite {
             mailbox_id: updated.mailbox_id.clone(),
             envelope: envelope.encode(),
-            ttl: 14 * 24 * 60 * 60,
+            ttl: MAILBOX_TTL_SECS,
         },
     )
     .await?;
@@ -1053,8 +1715,67 @@ pub async fn announce_wipe_policy(
         return Err(Error::NotAcknowledged);
     }
 
-    db.save_ratchet(conv_id, &ratchet)?;
+    // Stamp this side's own wipe boundary now that the announce is
+    // actually acked — "how far this side had gotten the moment the peer
+    // was told about the new policy," read back later by
+    // `preview_conversation_wipe` to estimate how much of this side's
+    // history the peer likely still has. Deliberately stamped after the
+    // ack, not at the top of this function alongside the preference save:
+    // if the send fails, no boundary should be recorded either.
+    let (boundary_timestamp, boundary_sequence) = db.current_wipe_boundary();
+    updated.wipe_boundary_timestamp = Some(boundary_timestamp);
+    updated.wipe_boundary_sequence = Some(boundary_sequence);
+    db.save_contact(&updated)?;
+
     Ok(updated)
+}
+
+/// A preview of what a [`request_conversation_wipe`] call would do right
+/// now, without sending anything — read-only, no network access, safe to
+/// call freely from the UI before the user commits to a wipe.
+///
+/// `peer_likely_keeps` is an estimate, never a guarantee: no mailbox
+/// message in this protocol ever gets a delivery receipt, so this side
+/// can only know its own `announce_wipe_policy` call was *sent*, not that
+/// the peer actually received and processed it. `0` whenever this side
+/// has never announced a wipe policy to this contact for this
+/// conversation (`contact.wipe_boundary_timestamp.is_none()`) — with no
+/// boundary recorded, a wipe request is unambiguous: everything goes.
+pub struct WipePreview {
+    /// How many messages `request_conversation_wipe` would remove from
+    /// this side's own store — always everything, unconditionally.
+    pub will_remove_locally: usize,
+    /// How many of those same messages were saved before this side's own
+    /// last-acked wipe-policy announce, and so likely still remain on the
+    /// peer's device after they comply with the wipe request.
+    pub peer_likely_keeps: usize,
+}
+
+pub fn preview_conversation_wipe(
+    db: &Db,
+    account: &Account,
+    contact: &Contact,
+) -> Result<WipePreview> {
+    let conv_id = conversation_id_for(account, contact);
+    let messages = db.list_messages(conv_id)?;
+    let will_remove_locally = messages.len();
+    let peer_likely_keeps = match (
+        contact.wipe_boundary_timestamp,
+        contact.wipe_boundary_sequence,
+    ) {
+        (Some(ts), seq) => {
+            let boundary = (ts, seq.unwrap_or(0));
+            messages
+                .iter()
+                .filter(|m| (m.timestamp, m.sequence) < boundary)
+                .count()
+        }
+        (None, _) => 0,
+    };
+    Ok(WipePreview {
+        will_remove_locally,
+        peer_likely_keeps,
+    })
 }
 
 /// `docs/ARCHITECTURE.md` §11.9a's per-conversation wipe, the requesting
@@ -1068,6 +1789,15 @@ pub async fn announce_wipe_policy(
 /// doesn't mean the peer has received it yet, just that delivery has been
 /// queued, which is the normal store-and-forward behavior every mailbox
 /// message already has). Returns how many local records were removed.
+///
+/// Carries this side's own `include_session` preference in the request
+/// content (`core::payload::ConversationWipeRequestContent`) — not just
+/// the requester's own local wipe scope, but what the *recipient* needs
+/// to correctly apply most-restrictive-wins without depending on a prior,
+/// separately-landed `announce_wipe_policy` call having already reached
+/// them (`docs/DELIVERY_FAILURE_FINDINGS.md` finding #30: without this,
+/// an un-announced `include_session` preference desynced the two sides'
+/// ratchets — one gone, one not — with no automatic recovery).
 pub async fn request_conversation_wipe(
     db: &Db,
     conn: &mut Connection,
@@ -1077,13 +1807,20 @@ pub async fn request_conversation_wipe(
     let conv_id = conversation_id_for(account, contact);
     let mut ratchet = db.load_ratchet(conv_id)?.ok_or(Error::NoSession)?;
 
-    let envelope = ratchet.encrypt_payload(PAYLOAD_CONVERSATION_WIPE_REQUEST, &[])?;
+    let include_session = contact.effective_wipe_include_session();
+    let content = ConversationWipeRequestContent { include_session }.encode();
+    ensure_connection_usable(conn)?;
+    let envelope = ratchet.encrypt_payload(PAYLOAD_CONVERSATION_WIPE_REQUEST, &content)?;
+    // DRA-0059: commit the ratchet advance *before* the envelope leaves,
+    // so a retry after a lost Ack encrypts at a fresh chain position
+    // (fresh key and nonce) instead of reusing this one.
+    db.save_ratchet(conv_id, &ratchet)?;
     conn.send(
         FrameTag::MailboxWrite,
         &MailboxWrite {
             mailbox_id: contact.mailbox_id.clone(),
             envelope: envelope.encode(),
-            ttl: 14 * 24 * 60 * 60,
+            ttl: MAILBOX_TTL_SECS,
         },
     )
     .await?;
@@ -1092,8 +1829,6 @@ pub async fn request_conversation_wipe(
         return Err(Error::NotAcknowledged);
     }
 
-    db.save_ratchet(conv_id, &ratchet)?;
-    let include_session = contact.effective_wipe_include_session();
     Ok(db.wipe_conversation(conv_id, include_session)?)
 }
 
@@ -1101,15 +1836,59 @@ pub async fn request_conversation_wipe(
 /// wipe request already set `Contact::wipe_request_pending` (via
 /// `receive_pending`); this actually performs the wipe now and clears the
 /// flag. No network access needed. Returns how many records were removed.
+///
+/// DRA-0020 (`docs/DELIVERY_FAILURE_FINDINGS.md`): reloads `contact`
+/// fresh from `db` by fingerprint and refuses with
+/// `Error::NoPendingWipeRequest` unless `wipe_request_pending` is
+/// actually set on that fresh record — this used to trust the caller's
+/// passed-in `contact` unconditionally, wiping real message history for
+/// *any* contact this was called with, pending request or not. This is
+/// the sole entry point for the destructive "ask before deleting" wipe;
+/// nothing upstream of it (the Tauri command layer) re-validates this
+/// invariant, so it belongs here, not only in the UI that happens to
+/// gate the button on the same flag.
 pub fn confirm_pending_wipe(db: &Db, account: &Account, contact: &Contact) -> Result<usize> {
-    let conv_id = conversation_id_for(account, contact);
-    let include_session = contact.effective_wipe_include_session();
-    let removed = db.wipe_conversation(conv_id, include_session)?;
+    let fresh = db
+        .load_contact(&contact.fingerprint)?
+        .ok_or(Error::NoSuchAccount)?;
+    if !fresh.wipe_request_pending {
+        return Err(Error::NoPendingWipeRequest);
+    }
 
-    let mut updated = contact.clone();
+    let conv_id = conversation_id_for(account, &fresh);
+    let include_session = fresh.effective_wipe_include_session();
+    let removed = wipe_conversation_scoped(db, conv_id, &fresh, include_session)?;
+
+    let mut updated = fresh;
     updated.wipe_request_pending = false;
     db.save_contact(&updated)?;
     Ok(removed)
+}
+
+/// Complying with an *incoming* wipe request: scoped to
+/// `contact.peer_wipe_boundary_timestamp`/`_sequence` when this side has
+/// ever recorded one (`Db::record_peer_wipe_policy`, run whenever a
+/// `ConversationWipePolicyAnnounce` from this peer was processed) — full,
+/// unconditional `Db::wipe_conversation` otherwise, which is also exactly
+/// today's behavior for a conversation where no policy was ever announced.
+/// Shared by `apply_entry`'s auto-comply branch and `confirm_pending_wipe`'s
+/// ask-before-delete branch so both read the same persisted boundary,
+/// however long a pending confirmation sat unanswered.
+fn wipe_conversation_scoped(
+    db: &Db,
+    conv_id: [u8; 16],
+    contact: &Contact,
+    include_session: bool,
+) -> Result<usize> {
+    match (
+        contact.peer_wipe_boundary_timestamp,
+        contact.peer_wipe_boundary_sequence,
+    ) {
+        (Some(ts), seq) => {
+            Ok(db.wipe_conversation_since(conv_id, (ts, seq.unwrap_or(0)), include_session)?)
+        }
+        (None, _) => Ok(db.wipe_conversation(conv_id, include_session)?),
+    }
 }
 
 /// The declining counterpart to [`confirm_pending_wipe`]: clears

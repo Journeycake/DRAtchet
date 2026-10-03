@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 use rand_core::OsRng;
 use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
 use crate::identity::Identity;
@@ -16,12 +17,28 @@ use crate::prekey::{OneTimePrekey, OneTimePrekeyPublic, PrekeyBundle, SignedPrek
 /// distinct from any real (rotating) signed-prekey id.
 pub const IDENTITY_DH_SIGNATURE_ID: u32 = u32::MAX;
 
+/// DRA-0040 (`docs/DELIVERY_FAILURE_FINDINGS.md`): how old a signed prekey
+/// may get before [`Account::rotate_signed_prekey`] should replace it.
+/// Seven days, matching the cadence Signal's X3DH write-up recommends for
+/// the same key — short enough to bound what a single key compromise
+/// exposes, long enough that an offline device isn't churning keys.
+pub const SIGNED_PREKEY_ROTATION_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// DRA-0040: how long a published signed prekey stays acceptable to a
+/// fetching initiator. Deliberately longer than
+/// [`SIGNED_PREKEY_ROTATION_SECS`] so a rotation never invalidates a bundle
+/// an initiator fetched moments earlier.
+pub const SIGNED_PREKEY_LIFETIME_SECS: u64 = 30 * 24 * 60 * 60;
+
 pub struct Account {
     pub identity: Identity,
     identity_dh_secret: StaticSecret,
     pub identity_dh_public: PublicKey,
     identity_dh_signature: Vec<u8>,
     pub signed_prekey: SignedPrekey,
+    /// DRA-0040: when `signed_prekey` was generated, so rotation and the
+    /// published expiry can be derived from it.
+    signed_prekey_created_at: u64,
     one_time_prekeys: HashMap<u32, OneTimePrekey>,
     next_otp_id: u32,
 }
@@ -41,6 +58,11 @@ impl Account {
             identity_dh_public,
             identity_dh_signature,
             signed_prekey,
+            // A brand-new account's signed prekey is brand new too, but
+            // `generate` has no clock of its own (core stays free of time
+            // dependencies); callers that care set this by rotating. `0`
+            // means "never rotated", which correctly reads as due.
+            signed_prekey_created_at: 0,
             one_time_prekeys: HashMap::new(),
             next_otp_id: 0,
         })
@@ -48,7 +70,23 @@ impl Account {
 
     /// Generate and store `count` fresh one-time prekeys, returning their public
     /// halves as they'd be uploaded to a directory (`docs/MESSAGE_SCHEMA.md` §1).
+    ///
+    /// Replaces whatever batch was stored before, rather than adding to it: a
+    /// directory's `publish_bundle` (`server/src/ws.rs`) always overwrites the
+    /// previously-published one-time-prekey set wholesale, never merges, so any
+    /// still-unconsumed secret from an earlier batch becomes permanently
+    /// unreachable the moment a new batch is published — no future `FetchBundle`
+    /// will ever name its id again. Every real caller (`app::publish_under_candidates`,
+    /// covering both first registration and later republish/replenish) already
+    /// generates a batch immediately before publishing it, so there's no
+    /// legitimate case where an old, not-yet-superseded batch needs to survive
+    /// a call here. Without this, those orphaned secrets — and the disk space
+    /// for `Account::to_bytes`'s CBOR encoding of them — would accumulate
+    /// forever, since nothing else in `Account` ever prunes `one_time_prekeys`
+    /// except [`Self::take_one_time_prekey_secret`] consuming one that's
+    /// actually still reachable.
     pub fn generate_one_time_prekeys(&mut self, count: u32) -> Vec<OneTimePrekeyPublic> {
+        self.one_time_prekeys.clear();
         let mut out = Vec::with_capacity(count as usize);
         for _ in 0..count {
             let id = self.next_otp_id;
@@ -58,6 +96,19 @@ impl Account {
             self.one_time_prekeys.insert(id, otp);
         }
         out
+    }
+
+    /// How many locally-held one-time-prekey secrets are still in the
+    /// current batch — i.e. still reachable by some future `FetchBundle`
+    /// against whatever was last published. Test/introspection support for
+    /// the cleanup [`Self::generate_one_time_prekeys`] now does; not needed
+    /// by any real caller, which never has a reason to inspect its own
+    /// count directly (`FetchOwnPrekeyCount` asks the *directory's* count,
+    /// a different, server-side number that can be lower than this one
+    /// between publishing and the server actually recording it).
+    #[cfg(test)]
+    pub fn one_time_prekey_count(&self) -> usize {
+        self.one_time_prekeys.len()
     }
 
     /// Publish a prekey bundle as an initiator would fetch it. If `include_one_time_prekey`
@@ -98,6 +149,19 @@ impl Account {
         self.one_time_prekeys.remove(&id).map(|otp| otp.secret)
     }
 
+    /// Look up the secret behind one of our own one-time prekeys by id
+    /// *without* consuming it (DRA-0023, `docs/DELIVERY_FAILURE_FINDINGS.md`)
+    /// — for a caller that needs to run the DH computation before it can
+    /// tell whether this handshake attempt is genuine (`app::try_accept_first_contact`
+    /// can't check its pairing code until *after* deriving the root key and
+    /// decrypting the envelope that carries it). Only once that later check
+    /// actually succeeds should the caller go back and call
+    /// [`Self::take_one_time_prekey_secret`] for real — peeking here must
+    /// never, by itself, make an id unrecoverable to a genuine retry.
+    pub fn peek_one_time_prekey_secret(&self, id: u32) -> Option<&StaticSecret> {
+        self.one_time_prekeys.get(&id).map(|otp| &otp.secret)
+    }
+
     pub fn identity_dh_secret(&self) -> &StaticSecret {
         &self.identity_dh_secret
     }
@@ -106,18 +170,73 @@ impl Account {
         &self.signed_prekey.secret
     }
 
+    /// When this account's current signed prekey was created — `0` for an
+    /// account persisted before DRA-0040 added the field, which is exactly
+    /// right: a signed prekey that has never rotated *is* overdue.
+    pub fn signed_prekey_created_at(&self) -> u64 {
+        self.signed_prekey_created_at
+    }
+
+    /// The `signed_prekey_expires_at` this account should publish
+    /// (DRA-0040). Deliberately later than [`SIGNED_PREKEY_ROTATION_SECS`]
+    /// so a bundle stays usable for a grace period after its replacement
+    /// is generated — an initiator who fetched just before a rotation must
+    /// not have their in-flight handshake rejected.
+    pub fn signed_prekey_expires_at(&self) -> u64 {
+        self.signed_prekey_created_at
+            .saturating_add(SIGNED_PREKEY_LIFETIME_SECS)
+    }
+
+    /// Whether the signed prekey is old enough to replace (DRA-0040).
+    pub fn signed_prekey_rotation_due(&self, now: u64) -> bool {
+        now >= self
+            .signed_prekey_created_at
+            .saturating_add(SIGNED_PREKEY_ROTATION_SECS)
+    }
+
+    /// Replace the signed prekey with a freshly generated, freshly signed
+    /// one (DRA-0040).
+    ///
+    /// X3DH derives **two** of its four Diffie-Hellman inputs from this key
+    /// (`dh1 = IK_initiator × SPK`, `dh3 = EK_initiator × SPK`). Before this
+    /// existed, the signed prekey was generated once at
+    /// [`Account::generate`] and then kept forever, so the window those two
+    /// inputs protect never closed: a single later compromise of this one
+    /// secret (together with the identity DH secret it sits beside in local
+    /// storage) retroactively exposed every session established without a
+    /// one-time prekey — the degraded mode an attacker can *force* by
+    /// draining the account's one-time-prekey pool (`ARCHITECTURE.md`
+    /// §11.8). Rotating bounds that exposure to one rotation period.
+    ///
+    /// The id increments so a rotation is distinguishable from the key it
+    /// replaced, and never collides with [`IDENTITY_DH_SIGNATURE_ID`] in
+    /// practice (that reserved id is `u32::MAX`; reaching it here would take
+    /// `u32::MAX` rotations).
+    pub fn rotate_signed_prekey(&mut self, now: u64) -> Result<()> {
+        let next_id = self.signed_prekey.id.saturating_add(1);
+        self.signed_prekey = SignedPrekey::generate(next_id, &self.identity)?;
+        self.signed_prekey_created_at = now;
+        Ok(())
+    }
+
     /// Serialize this account's full state to bytes — CBOR-encoded, covering
     /// the identity's secret key, the X3DH identity DH secret, the signed
     /// prekey (secret + signature), and every still-available one-time
     /// prekey secret. Like `RatchetState::export`, **not an at-rest-safe
     /// format on its own**: local storage must encrypt these bytes before
     /// persisting them and decrypt before calling [`Account::import`].
-    pub fn export(&self) -> Vec<u8> {
+    /// DRA-0047 (`docs/DELIVERY_FAILURE_FINDINGS.md`): the returned buffer
+    /// is [`Zeroizing`], so the plaintext secret hierarchy it carries is
+    /// overwritten when the caller drops it rather than left in freed
+    /// heap memory. `ARCHITECTURE.md` §3.4 promises exactly that of this
+    /// material, and this is the one place all of it exists in the clear
+    /// at once.
+    pub fn export(&self) -> Zeroizing<Vec<u8>> {
         let exported = ExportedAccount::from(self);
         let mut bytes = Vec::new();
         ciborium::into_writer(&exported, &mut bytes)
             .expect("CBOR encoding of a well-formed struct cannot fail");
-        bytes
+        Zeroizing::new(bytes)
     }
 
     /// The inverse of [`Account::export`].
@@ -148,6 +267,11 @@ struct ExportedAccount {
     signed_prekey_secret: Vec<u8>,
     #[serde(with = "serde_bytes")]
     signed_prekey_signature: Vec<u8>,
+    /// DRA-0040. `#[serde(default)]` so an account persisted before this
+    /// field existed still imports — as `0`, i.e. "never rotated", which is
+    /// exactly the truth for such an account.
+    #[serde(default)]
+    signed_prekey_created_at: u64,
     one_time_prekeys: Vec<ExportedOneTimePrekey>,
     next_otp_id: u32,
 }
@@ -161,6 +285,7 @@ impl From<&Account> for ExportedAccount {
             signed_prekey_id: a.signed_prekey.id,
             signed_prekey_secret: a.signed_prekey.secret.to_bytes().to_vec(),
             signed_prekey_signature: a.signed_prekey.signature.clone(),
+            signed_prekey_created_at: a.signed_prekey_created_at,
             one_time_prekeys: a
                 .one_time_prekeys
                 .values()
@@ -222,6 +347,7 @@ impl TryFrom<ExportedAccount> for Account {
             identity_dh_public,
             identity_dh_signature: e.identity_dh_signature,
             signed_prekey,
+            signed_prekey_created_at: e.signed_prekey_created_at,
             one_time_prekeys,
             next_otp_id: e.next_otp_id,
         })
@@ -301,7 +427,325 @@ mod tests {
             bob.signed_prekey_secret(),
             otp_secret.as_ref(),
             &init.message,
-        );
+        )
+        .unwrap();
         assert_eq!(bob_root_key, init.root_key);
+    }
+
+    /// The orphaned-prekey-secret gap this test guards against: a directory's
+    /// `publish_bundle` always replaces the previously-published one-time-prekey
+    /// batch wholesale (`server/src/ws.rs`), so once a second batch is published,
+    /// no `FetchBundle` will ever name an id from the first batch again — that
+    /// id is permanently unreachable. Before this fix, `generate_one_time_prekeys`
+    /// only ever inserted, so those now-unreachable secrets stayed in
+    /// `Account.one_time_prekeys` forever, growing by a full batch on every
+    /// republish/replenish cycle with nothing to ever remove them.
+    #[test]
+    fn republishing_drops_the_old_batchs_now_unreachable_secrets() {
+        let mut account = Account::generate().unwrap();
+
+        account.generate_one_time_prekeys(10);
+        assert_eq!(account.one_time_prekey_count(), 10);
+
+        // A real republish (`app::publish_under_candidates` always calls this
+        // immediately before publishing) generates a brand-new batch — the old
+        // one is no longer being published, so its secrets must not linger.
+        let second_batch = account.generate_one_time_prekeys(10);
+        assert_eq!(
+            account.one_time_prekey_count(),
+            10,
+            "a republish must replace the local batch, not accumulate on top of it"
+        );
+
+        // None of the *old* batch's ids (0..10) are consumable any more —
+        // they can never be named by a real handshake again.
+        for old_id in 0..10 {
+            assert!(
+                account.take_one_time_prekey_secret(old_id).is_none(),
+                "id {old_id} was dropped by the old batch and must not still be consumable"
+            );
+        }
+
+        // The *new* batch is fully intact and independently consumable —
+        // the fix must not have thrown away what it just generated.
+        for public in &second_batch {
+            assert!(
+                account.take_one_time_prekey_secret(public.id).is_some(),
+                "id {} is from the batch just published and must still be consumable",
+                public.id
+            );
+        }
+        assert_eq!(account.one_time_prekey_count(), 0);
+    }
+
+    /// Repeated replenish cycles (the real shape of
+    /// `dratchet_app::replenish_prekeys_if_low`, called roughly once a minute
+    /// whenever the published pool is running low) must never let local
+    /// storage grow past one batch, no matter how many cycles run.
+    #[test]
+    fn many_replenish_cycles_never_grow_storage_past_one_batch() {
+        let mut account = Account::generate().unwrap();
+        for _ in 0..25 {
+            account.generate_one_time_prekeys(10);
+        }
+        assert_eq!(
+            account.one_time_prekey_count(),
+            10,
+            "25 republish cycles must still leave exactly one batch's worth stored, \
+             not 250"
+        );
+    }
+
+    /// A secret consumed by a real, in-flight handshake response — the same
+    /// call `try_accept_first_contact`/`x3dh::respond` make while processing
+    /// a mailbox entry — must not be affected by a republish that happens to
+    /// land in between generating the batch and something consuming from it,
+    /// since both calls are made under the same `&mut Account` lock and never
+    /// interleave in practice; this pins that assumption down as a real test
+    /// rather than leaving it as only a doc-comment claim.
+    #[test]
+    fn a_consumed_secret_from_the_current_batch_is_gone_even_before_the_next_republish() {
+        let mut account = Account::generate().unwrap();
+        let batch = account.generate_one_time_prekeys(3);
+        let consumed_id = batch[0].id;
+
+        assert!(account.take_one_time_prekey_secret(consumed_id).is_some());
+        assert!(
+            account.take_one_time_prekey_secret(consumed_id).is_none(),
+            "single-use: consuming the same id twice must fail the second time"
+        );
+        assert_eq!(account.one_time_prekey_count(), 2);
+    }
+
+    /// DRA-0023 (`docs/DELIVERY_FAILURE_FINDINGS.md`, penetration test
+    /// round 3, priority 3: DoS via local one-time-prekey exhaustion) —
+    /// `peek_one_time_prekey_secret` exists precisely so
+    /// `app::try_accept_first_contact` can run the DH computation needed
+    /// to even *read* a first-contact attempt's pairing code before
+    /// deciding whether the attempt is genuine. Before this fix, the same
+    /// `take_one_time_prekey_secret` call that ran for a *genuine* attempt
+    /// also ran — irreversibly — for a bogus one with a wrong or made-up
+    /// pairing code, since one-time-prekey ids are small sequential
+    /// integers guessable with no prior `FetchBundle` at all. This test
+    /// pins the two-phase contract peeking now provides: a peek that's
+    /// never followed by a real `take` (standing in for a failed
+    /// pairing-code check) must leave the secret fully intact and still
+    /// consumable by a later, genuine attempt naming the same id.
+    #[test]
+    fn peeking_a_one_time_prekey_secret_does_not_consume_it() {
+        let mut account = Account::generate().unwrap();
+        let batch = account.generate_one_time_prekeys(3);
+        let id = batch[0].id;
+
+        // Simulates a bogus first-contact attempt: the secret is peeked
+        // (as if used for a real DH computation) but the caller's
+        // pairing-code check fails, so `take` is never called.
+        assert!(account.peek_one_time_prekey_secret(id).is_some());
+        assert!(account.peek_one_time_prekey_secret(id).is_some());
+        assert_eq!(
+            account.one_time_prekey_count(),
+            3,
+            "VULNERABILITY (pre-fix behavior): peeking must never by itself remove the secret"
+        );
+
+        // A later, genuine attempt naming the same id must still succeed —
+        // the secret is still there because nothing ever really took it.
+        assert!(
+            account.take_one_time_prekey_secret(id).is_some(),
+            "FIX VERIFIED: a secret that was only ever peeked, never taken, must still be \
+             consumable by a genuine attempt"
+        );
+        assert_eq!(account.one_time_prekey_count(), 2);
+
+        // Once genuinely taken, it behaves exactly as before: single-use,
+        // gone for any further attempt (bogus or genuine) naming this id.
+        assert!(account.peek_one_time_prekey_secret(id).is_none());
+        assert!(account.take_one_time_prekey_secret(id).is_none());
+    }
+
+    /// Penetration-test finding DRA-0047: `ARCHITECTURE.md` §3.4 promises
+    /// that "discarded" key material is "zeroized in memory, not just
+    /// dropped from scope" -- and names exactly the threat it is
+    /// protecting against, "a debugger or core dump". `export` serialises
+    /// the entire secret hierarchy (the Ed25519 identity secret, the X3DH
+    /// identity DH secret, the signed prekey secret, and every unused
+    /// one-time prekey secret) into a buffer, and that buffer used to be
+    /// a plain `Vec<u8>` -- freed without being wiped, on every single
+    /// save.
+    ///
+    /// Observing freed heap memory directly would be undefined behaviour,
+    /// so this does not attempt it. It asserts the two things that can be
+    /// checked soundly: that the buffer genuinely carries raw secret key
+    /// material (so there is something worth wiping), and that its type
+    /// carries the wipe-on-drop guarantee. If `export` ever goes back to
+    /// returning a bare `Vec<u8>`, this stops compiling.
+    #[test]
+    fn an_exported_account_carries_secret_material_in_a_self_wiping_buffer() {
+        fn assert_wipes_on_drop(_: &Zeroizing<Vec<u8>>) {}
+
+        let account = Account::generate().unwrap();
+        let identity_dh_secret = account.identity_dh_secret().to_bytes();
+        let signed_prekey_secret = account.signed_prekey_secret().to_bytes();
+
+        let exported = account.export();
+        assert_wipes_on_drop(&exported);
+
+        assert!(
+            exported.windows(32).any(|w| w == identity_dh_secret),
+            "VULNERABILITY: the export carries the raw X3DH identity DH secret in a buffer that \
+             is freed without being wiped -- ARCHITECTURE.md §3.4 promises this material is \
+             zeroized in memory, not merely dropped"
+        );
+        assert!(
+            exported.windows(32).any(|w| w == signed_prekey_secret),
+            "the export also carries the signed prekey secret, so the buffer holds more than one \
+             live secret at a time"
+        );
+    }
+
+    /// Penetration-test finding DRA-0040: a freshly generated account's
+    /// signed prekey must read as due for rotation, because it has never
+    /// rotated. Before this existed there was no rotation at all -- the key
+    /// generated at `Account::generate` was kept for the life of the
+    /// account, so X3DH's dh1/dh3 window never closed.
+    #[test]
+    fn a_never_rotated_signed_prekey_reads_as_due() {
+        let account = Account::generate().unwrap();
+        assert_eq!(account.signed_prekey_created_at(), 0);
+        // Any real wall-clock time is far past the deadline for a key
+        // stamped "never rotated".
+        let now = 1_700_000_000;
+        assert!(
+            account.signed_prekey_rotation_due(now),
+            "VULNERABILITY: a signed prekey that has never rotated must be due -- otherwise the \
+             key X3DH derives two of its four DH inputs from is kept forever"
+        );
+        // ...but the deadline is a real one, not an always-true predicate.
+        let mut rotated = Account::generate().unwrap();
+        rotated.rotate_signed_prekey(now).unwrap();
+        assert!(!rotated.signed_prekey_rotation_due(now));
+    }
+
+    /// DRA-0040: rotating must actually replace the key material, not just
+    /// the bookkeeping -- a rotation that reused the secret would bound
+    /// nothing.
+    #[test]
+    fn rotating_replaces_the_secret_and_advances_the_id() {
+        let mut account = Account::generate().unwrap();
+        let before_secret = account.signed_prekey_secret().to_bytes();
+        let before_id = account.signed_prekey.id;
+
+        let now = 9_999;
+        account.rotate_signed_prekey(now).unwrap();
+
+        assert_ne!(
+            account.signed_prekey_secret().to_bytes(),
+            before_secret,
+            "VULNERABILITY: rotation must generate a NEW secret, or the exposure window this \
+             finding closes stays open"
+        );
+        assert_eq!(account.signed_prekey.id, before_id + 1);
+        assert_eq!(account.signed_prekey_created_at(), now);
+        assert!(!account.signed_prekey_rotation_due(now));
+        assert!(account.signed_prekey_rotation_due(now + SIGNED_PREKEY_ROTATION_SECS));
+    }
+
+    /// DRA-0040: the rotated key must still be a *valid, signed* bundle
+    /// entry -- rotation must not break bundle verification.
+    #[test]
+    fn a_rotated_signed_prekey_still_verifies_in_a_published_bundle() {
+        let mut account = Account::generate().unwrap();
+        account.rotate_signed_prekey(9_999).unwrap();
+        let bundle = account.publish_bundle(false).unwrap();
+        assert!(
+            bundle.verify().is_ok(),
+            "a rotated signed prekey must still verify against the identity that signed it"
+        );
+    }
+
+    /// DRA-0040: the published expiry must sit past the rotation deadline,
+    /// so a bundle fetched moments before a rotation is still usable.
+    #[test]
+    fn the_published_expiry_outlives_the_rotation_deadline() {
+        let mut account = Account::generate().unwrap();
+        let now = 1_000_000;
+        account.rotate_signed_prekey(now).unwrap();
+        assert!(account.signed_prekey_expires_at() > now + SIGNED_PREKEY_ROTATION_SECS);
+    }
+
+    /// DRA-0040: an account persisted before this field existed must still
+    /// import, landing on `0` -- "never rotated", which reads as due.
+    #[test]
+    fn an_account_round_trips_its_rotation_timestamp() {
+        let mut account = Account::generate().unwrap();
+        account.rotate_signed_prekey(4_242).unwrap();
+        let reimported = Account::import(&account.export()).unwrap();
+        assert_eq!(reimported.signed_prekey_created_at(), 4_242);
+        assert_eq!(reimported.signed_prekey.id, account.signed_prekey.id);
+    }
+
+    /// DRA-0040, the finding's actual impact: rotation is what *bounds*
+    /// retroactive decryption after a device seizure.
+    ///
+    /// X3DH derives `dh1 = IK_initiator x SPK` and `dh3 = EK_initiator x SPK`
+    /// from the responder's signed prekey. When no one-time prekey is
+    /// available -- the degraded mode an attacker can force by draining the
+    /// account's one-time-prekey pool (`ARCHITECTURE.md` §11.8) -- the whole
+    /// root key is a function of exactly two long-lived responder secrets:
+    /// the identity DH secret and the signed prekey secret. Seize the device
+    /// and you recompute the root key of any session you recorded.
+    ///
+    /// Before this fix the signed prekey was generated once at
+    /// `Account::generate` and never replaced, so "any session you recorded"
+    /// meant *every session the account had ever established in degraded
+    /// mode*, with no time bound whatsoever. Rotating retires the secret,
+    /// so a seizure after a rotation can no longer reach back past it.
+    #[test]
+    fn rotating_retires_the_secret_that_would_otherwise_decrypt_every_past_session() {
+        let mut bob = Account::generate().unwrap();
+        // `false` -> publish without a one-time prekey: the degraded mode.
+        let old_bundle = bob.publish_bundle(false).unwrap();
+        assert!(old_bundle.one_time_prekey.is_none());
+
+        let alice = Account::generate().unwrap();
+        let recorded = crate::x3dh::initiate(
+            alice.identity_dh_secret(),
+            alice.identity_dh_public,
+            &old_bundle,
+        )
+        .unwrap();
+
+        // Baseline: while that signed prekey is still the live one, Bob's
+        // own secrets reproduce the session root key exactly -- which is
+        // also precisely what an attacker holding a seized device does.
+        let recomputed = crate::x3dh::respond(
+            bob.identity_dh_secret(),
+            bob.signed_prekey_secret(),
+            None,
+            &recorded.message,
+        )
+        .unwrap();
+        assert_eq!(recomputed, recorded.root_key);
+
+        // Now rotate, as a device that has been running for longer than
+        // `SIGNED_PREKEY_ROTATION_SECS` must.
+        bob.rotate_signed_prekey(1_700_000_000).unwrap();
+
+        // The seizure happens *after* the rotation. Everything the attacker
+        // finds on the device is current, and none of it reaches the old
+        // session any more.
+        let after_seizure = crate::x3dh::respond(
+            bob.identity_dh_secret(),
+            bob.signed_prekey_secret(),
+            None,
+            &recorded.message,
+        )
+        .unwrap();
+        assert_ne!(
+            after_seizure, recorded.root_key,
+            "VULNERABILITY: the signed prekey never rotates, so seizing the device at any point \
+             in the future recomputes the root key of every degraded-mode session the account \
+             ever established -- the X3DH forward-secrecy window never closes"
+        );
     }
 }

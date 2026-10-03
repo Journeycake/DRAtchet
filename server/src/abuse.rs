@@ -111,6 +111,262 @@ impl FetchRateLimiter {
     }
 }
 
+/// DRA-0018 (`docs/DELIVERY_FAILURE_FINDINGS.md`) — a per-writer token
+/// bucket gating how fast one identity can bring *brand-new* mailbox ids
+/// into existence via `MailboxWrite`, mirroring `FetchRateLimiter`'s
+/// exact shape. `MailboxFetch`/`MailboxDelete`/`MailboxWrite`'s
+/// per-mailbox caps (DRA-0015/DRA-0017) bound how much one *existing*
+/// mailbox can hold; nothing bounded how many *distinct* mailbox ids
+/// `Inner::mailboxes` could ever grow to, and `MailboxWrite` requires no
+/// pre-existing relationship with the target id at all — a single
+/// identity looping fresh random ids could make the server allocate an
+/// unbounded number of `HashMap` entries, exhausting server memory for
+/// every other client, not just one conversation.
+///
+/// Keyed by the caller's real, authenticated `Fingerprint` (unlike
+/// `FetchRateLimiter`, `MailboxWrite` already requires authentication —
+/// see `ws.rs`'s module doc — so there's a stable identity to key by
+/// directly, no need for `ConnectionId`'s reconnect-resets-the-budget
+/// compromise). Only consumed when the write's `mailbox_id` is not
+/// already a key in `Inner::mailboxes` — ordinary traffic within an
+/// already-existing conversation (the overwhelming majority of real
+/// usage) never touches this budget at all, only the act of originating
+/// a new mailbox address does.
+#[derive(Default)]
+pub struct NewMailboxRateLimiter {
+    buckets: HashMap<Fingerprint, RateBucket>,
+}
+
+/// Burst capacity — generous for a real client adding several new
+/// contacts in quick succession (each pairing needs at most one or two
+/// brand-new mailbox ids: the bootstrap one, then the routing-id-derived
+/// one once the exchange completes).
+pub const NEW_MAILBOX_RATE_LIMIT_CAPACITY: f64 = 20.0;
+/// Refill rate: one additional new-mailbox allowance every 30 seconds.
+/// Deliberately much slower than `FETCH_RATE_LIMIT_REFILL_PER_SEC` — this
+/// gates creating a whole new piece of server-side state, not just
+/// reading already-published, bounded-size directory data.
+const NEW_MAILBOX_RATE_LIMIT_REFILL_PER_SEC: f64 = 1.0 / 30.0;
+
+impl NewMailboxRateLimiter {
+    /// Returns `true` (and consumes one token) if `writer` may originate
+    /// another brand-new mailbox right now; `false` if the caller should
+    /// reject the write without creating one. Callers only invoke this
+    /// when the target `mailbox_id` doesn't already exist — see the
+    /// struct doc.
+    pub fn allow(&mut self, writer: Fingerprint) -> bool {
+        let now = Instant::now();
+        let bucket = self.buckets.entry(writer).or_insert_with(|| RateBucket {
+            tokens: NEW_MAILBOX_RATE_LIMIT_CAPACITY,
+            last_refill: now,
+        });
+        let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * NEW_MAILBOX_RATE_LIMIT_REFILL_PER_SEC)
+            .min(NEW_MAILBOX_RATE_LIMIT_CAPACITY);
+        bucket.last_refill = now;
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Same reasoning as `FetchRateLimiter::sweep_stale` — a bucket idle
+    /// past `older_than` would already be back at full capacity, so
+    /// removing it only frees memory, never changes throttling behavior.
+    pub fn sweep_stale(&mut self, older_than: std::time::Duration, now: Instant) -> usize {
+        let before = self.buckets.len();
+        self.buckets
+            .retain(|_, bucket| now.duration_since(bucket.last_refill) < older_than);
+        before - self.buckets.len()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.buckets.len()
+    }
+}
+
+/// DRA-0045 (`docs/DELIVERY_FAILURE_FINDINGS.md`) — gates how fast one
+/// identity may have the server relay `RendezvousOffer`/`RendezvousAnswer`
+/// frames at other clients.
+///
+/// Unlike every other client-supplied payload this server handles, a
+/// relayed rendezvous frame is pushed straight into *another* client's
+/// outbound queue, so its cost lands on a third party rather than on the
+/// sender. DRA-0026 bounded one frame's size; this bounds their rate.
+/// Keyed by the *sender*, not by the (sender, target) pair, so an
+/// attacker cannot buy fresh budget simply by spreading the flood across
+/// many victims.
+#[derive(Default)]
+pub struct RendezvousRateLimiter {
+    buckets: HashMap<Fingerprint, RateBucket>,
+}
+
+/// Burst capacity. A real WebRTC negotiation is one offer and one answer,
+/// plus a retry or two if the first attempt is missed; this is generous
+/// headroom for a user placing several calls in a row.
+pub const RENDEZVOUS_RATE_LIMIT_CAPACITY: f64 = 10.0;
+/// Refill rate: one additional relayed frame every 5 seconds. Calls are a
+/// human-paced action, so this is far slower than `FetchBundle`'s budget
+/// while still never getting in a real caller's way.
+const RENDEZVOUS_RATE_LIMIT_REFILL_PER_SEC: f64 = 1.0 / 5.0;
+
+impl RendezvousRateLimiter {
+    /// Returns `true` (and consumes one token) if `sender` may have one
+    /// more frame relayed on its behalf right now.
+    pub fn allow(&mut self, sender: Fingerprint) -> bool {
+        let now = Instant::now();
+        let bucket = self.buckets.entry(sender).or_insert_with(|| RateBucket {
+            tokens: RENDEZVOUS_RATE_LIMIT_CAPACITY,
+            last_refill: now,
+        });
+        let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * RENDEZVOUS_RATE_LIMIT_REFILL_PER_SEC)
+            .min(RENDEZVOUS_RATE_LIMIT_CAPACITY);
+        bucket.last_refill = now;
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Same reasoning as the other two limiters' `sweep_stale`.
+    pub fn sweep_stale(&mut self, older_than: std::time::Duration, now: Instant) -> usize {
+        let before = self.buckets.len();
+        self.buckets
+            .retain(|_, bucket| now.duration_since(bucket.last_refill) < older_than);
+        before - self.buckets.len()
+    }
+}
+
+/// DRA-0049 (`docs/DELIVERY_FAILURE_FINDINGS.md`) — gates how fast one
+/// identity may issue `MailboxFetch`.
+///
+/// Every other client-driven handler was already metered — `MailboxWrite`
+/// by [`NewMailboxRateLimiter`], `FetchBundle` by [`FetchRateLimiter`],
+/// the rendezvous relay by [`RendezvousRateLimiter`] (DRA-0045). Fetch was
+/// the one left open, and it is the most expensive call the server
+/// serves: it takes the global write lock for its whole duration.
+/// Polling for new mail is a normal, frequent client action, so this is
+/// deliberately the most generous of the four.
+#[derive(Default)]
+pub struct MailboxFetchRateLimiter {
+    buckets: HashMap<Fingerprint, RateBucket>,
+}
+
+/// Burst capacity, and deliberately the most generous of the four
+/// limiters.
+///
+/// The primary fix for DRA-0049 is the O(1) ownership lookup
+/// (`Inner::bootstrap_mailbox_index`), which removed the amplification
+/// that made a fetch expensive in the first place. This limiter is a
+/// backstop against sheer volume, not the load-bearing defence, so it is
+/// tuned to sit well clear of real traffic rather than as close to it as
+/// possible.
+///
+/// The number matters: an initial value of 60 broke
+/// `app/tests/hundred_round_delivery_ack_exchange.rs`, a *legitimate*
+/// 100-round bidirectional conversation, at round 68. A busy
+/// conversation or a client draining a backlog after reconnecting really
+/// does fetch this often, so the budget has to clear that by a wide
+/// margin or it is a correctness bug wearing a security hat.
+pub const MAILBOX_FETCH_RATE_LIMIT_CAPACITY: f64 = 600.0;
+/// Refill rate: 50 fetches per second sustained — orders of magnitude
+/// above `app`'s multi-second per-conversation poll cadence, while still
+/// bounding what was previously an entirely unbounded handler.
+const MAILBOX_FETCH_RATE_LIMIT_REFILL_PER_SEC: f64 = 50.0;
+
+impl MailboxFetchRateLimiter {
+    /// Returns `true` (and consumes one token) if `fetcher` may fetch
+    /// again right now.
+    pub fn allow(&mut self, fetcher: Fingerprint) -> bool {
+        let now = Instant::now();
+        let bucket = self.buckets.entry(fetcher).or_insert_with(|| RateBucket {
+            tokens: MAILBOX_FETCH_RATE_LIMIT_CAPACITY,
+            last_refill: now,
+        });
+        let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * MAILBOX_FETCH_RATE_LIMIT_REFILL_PER_SEC)
+            .min(MAILBOX_FETCH_RATE_LIMIT_CAPACITY);
+        bucket.last_refill = now;
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Same reasoning as the other limiters' `sweep_stale`.
+    pub fn sweep_stale(&mut self, older_than: std::time::Duration, now: Instant) -> usize {
+        let before = self.buckets.len();
+        self.buckets
+            .retain(|_, bucket| now.duration_since(bucket.last_refill) < older_than);
+        before - self.buckets.len()
+    }
+}
+
+/// DRA-0050 (`docs/DELIVERY_FAILURE_FINDINGS.md`) — gates how fast one
+/// identity may issue `MailboxDelete`.
+///
+/// DRA-0049 closed `MailboxFetch`'s gap but left this one open on
+/// purpose, on the reasoning that a delete is far cheaper per call (no
+/// pruning, no entry serialization, and it only ever removes the
+/// caller's own reachable entries). That is true of the *work inside the
+/// lock* — but the handler still takes `state.inner`'s global exclusive
+/// write lock for its whole duration, same as fetch did, and nothing
+/// bounded how often one identity could acquire it. Cheap-per-call and
+/// unmetered still adds up to unbounded lock-contention volume.
+#[derive(Default)]
+pub struct MailboxDeleteRateLimiter {
+    buckets: HashMap<Fingerprint, RateBucket>,
+}
+
+/// Burst capacity. A real client deletes one entry per message it just
+/// finished processing — bursty only up to the size of a backlog drained
+/// after reconnecting, the same shape `MailboxFetch`'s budget already
+/// accommodates. Matches `MAILBOX_FETCH_RATE_LIMIT_CAPACITY` /
+/// `..._REFILL_PER_SEC` deliberately: a client that fetches N entries in
+/// a burst goes on to delete roughly N of them, so giving delete a
+/// tighter budget than fetch would just move the false-positive risk
+/// DRA-0049 already paid down once.
+pub const MAILBOX_DELETE_RATE_LIMIT_CAPACITY: f64 = 600.0;
+const MAILBOX_DELETE_RATE_LIMIT_REFILL_PER_SEC: f64 = 50.0;
+
+impl MailboxDeleteRateLimiter {
+    /// Returns `true` (and consumes one token) if `deleter` may delete
+    /// again right now.
+    pub fn allow(&mut self, deleter: Fingerprint) -> bool {
+        let now = Instant::now();
+        let bucket = self.buckets.entry(deleter).or_insert_with(|| RateBucket {
+            tokens: MAILBOX_DELETE_RATE_LIMIT_CAPACITY,
+            last_refill: now,
+        });
+        let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * MAILBOX_DELETE_RATE_LIMIT_REFILL_PER_SEC)
+            .min(MAILBOX_DELETE_RATE_LIMIT_CAPACITY);
+        bucket.last_refill = now;
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Same reasoning as the other limiters' `sweep_stale`.
+    pub fn sweep_stale(&mut self, older_than: std::time::Duration, now: Instant) -> usize {
+        let before = self.buckets.len();
+        self.buckets
+            .retain(|_, bucket| now.duration_since(bucket.last_refill) < older_than);
+        before - self.buckets.len()
+    }
+}
+
 /// How many leading zero bits a solution's hash must have. ~2^12 average
 /// hash attempts to find one — sub-millisecond for a legitimate client
 /// registering one username, but a real (if deliberately modest, per the
@@ -253,5 +509,49 @@ mod tests {
             limiter.allow([9u8; 16], target),
             "a different requester has its own budget"
         );
+    }
+
+    /// DRA-0018: proves the new-mailbox rate limiter itself throttles a
+    /// burst — the real end-to-end proof that a single identity can no
+    /// longer originate unbounded distinct mailboxes is
+    /// `server/tests/unbounded_mailbox_creation.rs`, run against this
+    /// same limiter wired into `ws.rs`.
+    #[test]
+    fn new_mailbox_rate_limiter_allows_a_burst_then_rejects() {
+        let mut limiter = NewMailboxRateLimiter::default();
+        let writer = [1u8; 32];
+        for _ in 0..NEW_MAILBOX_RATE_LIMIT_CAPACITY as u32 {
+            assert!(limiter.allow(writer));
+        }
+        assert!(
+            !limiter.allow(writer),
+            "burst beyond capacity should be rejected"
+        );
+    }
+
+    #[test]
+    fn new_mailbox_rate_limiter_tracks_writers_independently() {
+        let mut limiter = NewMailboxRateLimiter::default();
+        for _ in 0..NEW_MAILBOX_RATE_LIMIT_CAPACITY as u32 {
+            assert!(limiter.allow([1u8; 32]));
+        }
+        assert!(
+            limiter.allow([9u8; 32]),
+            "a different writer has its own budget"
+        );
+    }
+
+    #[test]
+    fn new_mailbox_rate_limiter_sweep_stale_removes_idle_buckets() {
+        let mut limiter = NewMailboxRateLimiter::default();
+        limiter.allow([1u8; 32]);
+        limiter.allow([9u8; 32]);
+        assert_eq!(limiter.len(), 2);
+
+        let just_created = Instant::now();
+        let threshold = std::time::Duration::from_secs(600);
+        let removed = limiter.sweep_stale(threshold, just_created + threshold * 2);
+        assert_eq!(removed, 2);
+        assert_eq!(limiter.len(), 0);
     }
 }

@@ -185,7 +185,8 @@ async fn breaching_the_server_yields_ciphertext_only_never_plaintext_or_private_
         bob.signed_prekey_secret(),
         bob_otp_secret.as_ref(),
         &init.message,
-    );
+    )
+    .unwrap();
     let mut bob_ratchet = RatchetState::init_as_responder(
         conv_id,
         bob_root_key,

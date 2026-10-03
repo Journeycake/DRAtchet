@@ -31,11 +31,14 @@
 //! they have no reason to ever be discoverable by `username#NNNN`, only to
 //! authenticate to read/write the Tier 1 mailbox they already agreed on.
 
-use std::sync::Arc;
+use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Once};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
-use axum::response::IntoResponse;
+use axum::extract::{ConnectInfo, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tracing::debug;
@@ -64,13 +67,106 @@ const OTP_EXHAUSTION_ALERT_THRESHOLD: u32 = 10;
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
+    // DRA-0031: a hard ceiling on total concurrent connections, checked
+    // before the HTTP upgrade completes -- otherwise an attacker can open
+    // an unbounded number of bare, unauthenticated connections, each
+    // cheap to open but costing the server a spawned task and an mpsc
+    // channel, with nothing capping the total.
+    if state.active_connections.load(Ordering::Relaxed) >= state.connection_cap {
+        return (StatusCode::SERVICE_UNAVAILABLE, "too many connections").into_response();
+    }
+
+    // DRA-0055: per-source-address limits (`crate::address`), also before
+    // the upgrade. The slot is held by `address_slot`, which moves into
+    // the upgrade callback, so it is released when the connection ends --
+    // or straight away if the upgrade never completes.
+    let address_slot = match connect_info {
+        Some(ConnectInfo(peer)) => {
+            let client = state
+                .trusted_proxies
+                .read()
+                .expect("trusted proxies lock")
+                .client_ip(peer.ip(), &headers);
+            let key = crate::address::AddressKey::of(client);
+            let admitted = state
+                .address_limiter
+                .lock()
+                .expect("address limiter lock")
+                .try_acquire(key, std::time::Instant::now());
+            if let Err(refusal) = admitted {
+                tracing::warn!(?refusal, "connection refused: per-address limit (DRA-0055)");
+                return (StatusCode::TOO_MANY_REQUESTS, refusal.message()).into_response();
+            }
+            Some(AddressSlot {
+                state: state.clone(),
+                key,
+            })
+        }
+        None => {
+            // Only reachable when the router is served without
+            // `into_make_service_with_connect_info` (in-process tests).
+            // `src/main.rs` always provides it; say so loudly if not.
+            static WARN_ONCE: Once = Once::new();
+            WARN_ONCE.call_once(|| {
+                tracing::warn!(
+                    "no peer address available: per-address connection limits are disabled \
+                     (serve with into_make_service_with_connect_info::<SocketAddr>())"
+                )
+            });
+            None
+        }
+    };
+
+    // DRA-0030: without an explicit ceiling here, axum/tokio-tungstenite
+    // defaults to a 64 MiB per-message limit -- enforced transport-side,
+    // before any application-layer cap in `state.rs` (MAX_ENVELOPE_LEN,
+    // MAX_SDP_LEN, ...) ever gets a chance to run, and reachable by any
+    // TCP connection whether or not it has authenticated.
+    ws.max_message_size(crate::state::MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(crate::state::MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| async move {
+            let _address_slot = address_slot;
+            handle_socket(socket, state).await
+        })
+        .into_response()
+}
+
+/// DRA-0055: one per-address concurrent-connection slot, handed back to
+/// `AppState::address_limiter` on drop.
+struct AddressSlot {
+    state: Arc<AppState>,
+    key: crate::address::AddressKey,
+}
+
+impl Drop for AddressSlot {
+    fn drop(&mut self) {
+        if let Ok(mut limiter) = self.state.address_limiter.lock() {
+            limiter.release(self.key);
+        }
+    }
+}
+
+/// Decrements `AppState::active_connections` when dropped — guarantees the
+/// count is released whether `handle_socket` returns normally or (should
+/// one ever be introduced) via an early return, without needing to
+/// duplicate the decrement at every exit point.
+struct ConnectionCountGuard(Arc<AppState>);
+
+impl Drop for ConnectionCountGuard {
+    fn drop(&mut self) {
+        self.0.active_connections.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
+    state.active_connections.fetch_add(1, Ordering::Relaxed);
+    let _count_guard = ConnectionCountGuard(state.clone());
+
     let (mut ws_sender, mut ws_receiver) = socket.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(crate::state::MAX_QUEUED_OUTBOUND_FRAMES);
 
     let send_task = tokio::spawn(async move {
         while let Some(bytes) = rx.recv().await {
@@ -81,10 +177,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     });
 
     let nonce = random_32();
-    let _ = tx.send(encode(
+    let _ = tx.try_send(encode(
         FrameTag::AuthChallenge,
         &AuthChallenge {
             nonce: nonce.to_vec(),
+            server_boot_id: state.boot_id.to_vec(),
         },
     ));
 
@@ -117,10 +214,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             Ok(t) => t,
             Err(e) => {
                 debug!("malformed frame from client: {e}");
-                let _ = tx.send(encode(
+                let _ = tx.try_send(encode(
                     FrameTag::Error,
                     &ErrorFrame {
                         message: e.to_string(),
+                        code: e.code(),
                     },
                 ));
                 continue;
@@ -139,10 +237,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         )
         .await
         {
-            let _ = tx.send(encode(
+            let _ = tx.try_send(encode(
                 FrameTag::Error,
                 &ErrorFrame {
                     message: e.to_string(),
+                    code: e.code(),
                 },
             ));
         }
@@ -180,7 +279,7 @@ async fn dispatch(
     tag: FrameTag,
     body: &[u8],
     state: &Arc<AppState>,
-    tx: &mpsc::UnboundedSender<Vec<u8>>,
+    tx: &mpsc::Sender<Vec<u8>>,
     nonce: &[u8; 32],
     connection_id: ConnectionId,
     authenticated: &mut Option<Fingerprint>,
@@ -191,7 +290,16 @@ async fn dispatch(
                 return Err(Error::AlreadyAuthenticated);
             }
             let req: AuthResponse = decode_body(body)?;
-            if identity::verify_signature(&req.identity_key, nonce, &req.signature).is_err() {
+            // DRA-0039: verifies against the domain-separated auth payload,
+            // so a signature harvested for any other context (or minted by a
+            // malicious relay posing as this one) can never authenticate.
+            if identity::Identity::verify_auth_challenge_signature(
+                &req.identity_key,
+                nonce,
+                &req.signature,
+            )
+            .is_err()
+            {
                 tracing::debug!(
                     connection = %hex_encode(&connection_id),
                     "authentication failed: bad nonce signature",
@@ -213,7 +321,7 @@ async fn dispatch(
                 inner.connections.insert(fp, tx.clone());
                 inner.subscriptions.get(&fp).cloned().unwrap_or_default()
             };
-            let _ = tx.send(encode(FrameTag::Ack, &Ack { ok: true }));
+            let _ = tx.try_send(encode(FrameTag::Ack, &Ack { ok: true }));
             notify_presence(state, fp, PresenceState::Online, &subscribers).await;
             Ok(())
         }
@@ -229,14 +337,14 @@ async fn dispatch(
             // made that undetectable; every existing test either doesn't
             // check for a response or only checks a later `FetchBundle`, so
             // this is purely additive.
-            let _ = tx.send(encode(FrameTag::Ack, &Ack { ok: true }));
+            let _ = tx.try_send(encode(FrameTag::Ack, &Ack { ok: true }));
             Ok(())
         }
 
         FrameTag::FetchBundle => {
             let req: FetchBundle = decode_body(body)?;
             let result = fetch_bundle(state, &req, *authenticated, connection_id).await?;
-            let _ = tx.send(encode(FrameTag::BundleResult, &result));
+            let _ = tx.try_send(encode(FrameTag::BundleResult, &result));
             Ok(())
         }
 
@@ -284,7 +392,7 @@ async fn dispatch(
 
             if let Some(state_now) = current {
                 let (state_byte, last_seen) = presence_wire(state_now);
-                let _ = tx.send(encode(
+                let _ = tx.try_send(encode(
                     FrameTag::PresenceUpdate,
                     &PresenceUpdate {
                         identity_fingerprint: target.to_vec(),
@@ -299,6 +407,8 @@ async fn dispatch(
         FrameTag::RendezvousOffer => {
             let from = authenticated.ok_or(Error::AuthRequired)?;
             let req: RendezvousOffer = decode_body(body)?;
+            validate_rendezvous_payload(&req.sdp_offer, &req.ice_candidates)?;
+            authorize_rendezvous(state, from, &req.peer_fingerprint).await?;
             let relayed = encode(
                 FrameTag::RendezvousOffer,
                 &RendezvousOffer {
@@ -313,6 +423,8 @@ async fn dispatch(
         FrameTag::RendezvousAnswer => {
             let from = authenticated.ok_or(Error::AuthRequired)?;
             let req: RendezvousAnswer = decode_body(body)?;
+            validate_rendezvous_payload(&req.sdp_answer, &req.ice_candidates)?;
+            authorize_rendezvous(state, from, &req.peer_fingerprint).await?;
             let relayed = encode(
                 FrameTag::RendezvousAnswer,
                 &RendezvousAnswer {
@@ -325,8 +437,11 @@ async fn dispatch(
         }
 
         FrameTag::MailboxWrite => {
-            authenticated.ok_or(Error::AuthRequired)?;
+            let writer = authenticated.ok_or(Error::AuthRequired)?;
             let req: MailboxWrite = decode_body(body)?;
+            if req.envelope.len() > crate::state::MAX_ENVELOPE_LEN {
+                return Err(Error::EnvelopeTooLarge);
+            }
             let mailbox_id: [u8; 16] = req
                 .mailbox_id
                 .as_slice()
@@ -336,16 +451,42 @@ async fn dispatch(
                 entry_id: random_16(),
                 envelope: req.envelope,
                 expires_at: std::time::SystemTime::now() + crate::state::ttl_from_secs(req.ttl),
+                written_by: writer,
             };
             let mut inner = state.inner.write().await;
-            inner.mailboxes.entry(mailbox_id).or_default().push(entry);
+            // DRA-0018: originating a brand-new mailbox id costs a token;
+            // writing into one that already exists (the overwhelming
+            // majority of real traffic) never touches this budget at
+            // all. Checked before `.entry(...).or_default()` below, which
+            // would otherwise unconditionally create the key regardless
+            // of the outcome here.
+            if !inner.mailboxes.contains_key(&mailbox_id)
+                && !inner.new_mailbox_rate_limiter.allow(writer)
+            {
+                return Err(Error::NewMailboxRateLimited);
+            }
+            let entries = inner.mailboxes.entry(mailbox_id).or_default();
+            prune_expired(entries);
+            if entries.len() >= crate::state::MAX_MAILBOX_ENTRIES {
+                return Err(Error::MailboxFull);
+            }
+            // DRA-0017: a total-only cap let one side of a bidirectional
+            // mailbox consume the whole budget with their own entries,
+            // blocking the other side's own writes. Each writer gets
+            // their own share of the total, so neither of the two normal
+            // participants can be locked out by the other's volume alone.
+            let writer_entries = entries.iter().filter(|e| e.written_by == writer).count();
+            if writer_entries >= crate::state::MAX_ENTRIES_PER_WRITER_PER_MAILBOX {
+                return Err(Error::WriterQuotaExceeded);
+            }
+            entries.push(entry);
             drop(inner);
-            let _ = tx.send(encode(FrameTag::Ack, &Ack { ok: true }));
+            let _ = tx.try_send(encode(FrameTag::Ack, &Ack { ok: true }));
             Ok(())
         }
 
         FrameTag::MailboxFetch => {
-            authenticated.ok_or(Error::AuthRequired)?;
+            let fetcher = authenticated.ok_or(Error::AuthRequired)?;
             let req: MailboxFetch = decode_body(body)?;
             let mailbox_id: [u8; 16] = req
                 .mailbox_id
@@ -353,17 +494,47 @@ async fn dispatch(
                 .try_into()
                 .map_err(|_| Error::MalformedFrame("mailbox_id must be 16 bytes"))?;
             let mut inner = state.inner.write().await;
-            let entries = inner.mailboxes.entry(mailbox_id).or_default();
-            prune_expired(entries);
-            let wire_entries: Vec<MailboxEntryWire> = entries
-                .iter()
-                .map(|e| MailboxEntryWire {
-                    entry_id: e.entry_id.to_vec(),
-                    envelope: e.envelope.clone(),
-                })
-                .collect();
+            // DRA-0049: metered like every other client-driven handler.
+            // Checked first, so a refused fetch does no work at all.
+            if !inner.mailbox_fetch_rate_limiter.allow(fetcher) {
+                return Err(Error::RateLimited);
+            }
+            if mailbox_id_belongs_to_someone_else(&inner, &mailbox_id, &fetcher) {
+                return Err(Error::NotMailboxOwner);
+            }
+            // DRA-0046 (`docs/DELIVERY_FAILURE_FINDINGS.md`): `get_mut`,
+            // never `entry(..).or_default()`. `or_default()` *inserts*,
+            // so fetching used to create the very mailbox it was asking
+            // about — for any 16-byte id the caller invented. Originating
+            // a mailbox id is exactly what DRA-0018's
+            // `NewMailboxRateLimiter` meters on `MailboxWrite`, and
+            // `MailboxFetch` has no rate limit at all, so the read path
+            // was the cheapest way to allocate the state the write path's
+            // limiter exists to bound. A fetch of a mailbox that doesn't
+            // exist now simply returns nothing, which is what it always
+            // reported anyway.
+            let wire_entries: Vec<MailboxEntryWire> = match inner.mailboxes.get_mut(&mailbox_id) {
+                Some(entries) => {
+                    prune_expired(entries);
+                    // `ARCHITECTURE.md` §11.1: this mailbox is
+                    // bidirectional — both sides of a pairing write to and
+                    // fetch from the identical address, so without this a
+                    // fetcher would get its own not-yet-collected entries
+                    // handed back to it (see `MailboxEntry::written_by`'s
+                    // doc for what that silently breaks).
+                    entries
+                        .iter()
+                        .filter(|e| e.written_by != fetcher)
+                        .map(|e| MailboxEntryWire {
+                            entry_id: e.entry_id.to_vec(),
+                            envelope: e.envelope.clone(),
+                        })
+                        .collect()
+                }
+                None => Vec::new(),
+            };
             drop(inner);
-            let _ = tx.send(encode(
+            let _ = tx.try_send(encode(
                 FrameTag::MailboxEntries,
                 &MailboxEntries {
                     entries: wire_entries,
@@ -373,7 +544,7 @@ async fn dispatch(
         }
 
         FrameTag::MailboxDelete => {
-            authenticated.ok_or(Error::AuthRequired)?;
+            let deleter = authenticated.ok_or(Error::AuthRequired)?;
             let req: MailboxDelete = decode_body(body)?;
             let mailbox_id: [u8; 16] = req
                 .mailbox_id
@@ -386,11 +557,36 @@ async fn dispatch(
                 .try_into()
                 .map_err(|_| Error::MalformedFrame("entry_id must be 16 bytes"))?;
             let mut inner = state.inner.write().await;
+            // DRA-0050: metered like MailboxFetch (DRA-0049). Checked
+            // first, so a refused delete does no further work.
+            if !inner.mailbox_delete_rate_limiter.allow(deleter) {
+                return Err(Error::RateLimited);
+            }
+            if mailbox_id_belongs_to_someone_else(&inner, &mailbox_id, &deleter) {
+                return Err(Error::NotMailboxOwner);
+            }
             if let Some(entries) = inner.mailboxes.get_mut(&mailbox_id) {
                 entries.retain(|e| e.entry_id != entry_id);
             }
             drop(inner);
-            let _ = tx.send(encode(FrameTag::Ack, &Ack { ok: true }));
+            let _ = tx.try_send(encode(FrameTag::Ack, &Ack { ok: true }));
+            Ok(())
+        }
+
+        FrameTag::FetchOwnPrekeyCount => {
+            let fp = authenticated.ok_or(Error::AuthRequired)?;
+            let _req: FetchOwnPrekeyCount = decode_body(body)?;
+            let inner = state.inner.read().await;
+            let remaining = inner
+                .directory
+                .get(&fp)
+                .map(|stored| stored.one_time_prekeys.len() as u32)
+                .unwrap_or(0);
+            drop(inner);
+            let _ = tx.try_send(encode(
+                FrameTag::OwnPrekeyCount,
+                &OwnPrekeyCount { remaining },
+            ));
             Ok(())
         }
 
@@ -399,6 +595,7 @@ async fn dispatch(
         | FrameTag::BundleResult
         | FrameTag::PresenceUpdate
         | FrameTag::MailboxEntries
+        | FrameTag::OwnPrekeyCount
         | FrameTag::Ack
         | FrameTag::Error => Err(Error::MalformedFrame(
             "this frame type is server-to-client only",
@@ -406,7 +603,57 @@ async fn dispatch(
     }
 }
 
+/// DRA-0014 (`docs/DELIVERY_FAILURE_FINDINGS.md`): does `mailbox_id`
+/// match another *registered* identity's bootstrap mailbox
+/// (`bootstrap_mailbox_id`, a deterministic hash of that identity's
+/// public fingerprint) while not matching `caller`'s own? If so, this is
+/// someone else's pre-pairing inbox, not a genuine capability the caller
+/// was ever handed — reading or deleting from it is unauthorized access
+/// to (and destruction of) a third party's pending communications, not a
+/// normal mailbox operation.
+///
+/// A post-transition `mailbox_id` (`store::routing::compute_mailbox_id`)
+/// is an HKDF output derived from private routing-id material this
+/// server never sees — astronomically unlikely to collide with any
+/// `bootstrap_mailbox_id(fp)` for a real, registered `fp`, so this check
+/// does not (and cannot meaningfully) restrict ordinary post-transition
+/// mailbox access; it only closes the one case where the id itself is a
+/// public function of already-public data.
+///
+/// Scans the registered directory rather than maintaining a separate
+/// reverse index — O(directory size) per `MailboxFetch`/`MailboxDelete`
+/// call, acceptable for this project's self-hosted, small-to-moderate
+/// user base; worth a cached reverse index (`bootstrap_id -> Fingerprint`,
+/// populated in `publish_bundle`) if that ever becomes a real cost.
+fn mailbox_id_belongs_to_someone_else(
+    inner: &crate::state::Inner,
+    mailbox_id: &[u8; 16],
+    caller: &Fingerprint,
+) -> bool {
+    // DRA-0049: an O(1) index lookup. This used to scan every directory
+    // key on every call, while holding the global write lock, on a
+    // directory that is never pruned.
+    inner.bootstrap_mailbox_belongs_to_another(mailbox_id, caller)
+}
+
 async fn publish_bundle(state: &Arc<AppState>, wire: PrekeyBundleWire) -> Result<()> {
+    // DRA-0019: checked before any signature verification or directory
+    // work — `Inner::directory` is never pruned (`pruning.rs`'s module
+    // doc), so an oversized publish is a permanent resource cost, not a
+    // transient one; reject it as cheaply as possible.
+    if wire.username.len() > crate::state::MAX_USERNAME_LEN {
+        return Err(Error::UsernameTooLong);
+    }
+    // DRA-0024: same reasoning, same cheap-rejection ordering — a
+    // non-ASCII username smuggled past this point would sit in the
+    // never-pruned directory as a permanent homograph-impersonation risk.
+    if !crate::state::username_has_only_allowed_characters(&wire.username) {
+        return Err(Error::UsernameInvalidCharacters);
+    }
+    if wire.one_time_prekeys.len() > crate::state::MAX_ONE_TIME_PREKEYS_PER_PUBLISH {
+        return Err(Error::TooManyOneTimePrekeys);
+    }
+
     let core_bundle = to_core_bundle(&wire, None)?;
     core_bundle
         .verify()
@@ -453,6 +700,17 @@ async fn publish_bundle(state: &Arc<AppState>, wire: PrekeyBundleWire) -> Result
         }
     }
 
+    // DRA-0019: each key's length was previously unchecked at publish
+    // time — only validated lazily, per-key, whichever one a later
+    // `FetchBundle` happened to consume — so a malformed/oversized key
+    // could still sit in the never-pruned directory indefinitely even
+    // with the count cap above. Checked against the same fixed size a
+    // real X25519 public key always is.
+    for otp in &wire.one_time_prekeys {
+        if otp.key.len() != 32 {
+            return Err(Error::InvalidBundle("one-time prekey must be 32 bytes"));
+        }
+    }
     let mut one_time_prekeys = std::collections::HashMap::new();
     for otp in &wire.one_time_prekeys {
         one_time_prekeys.insert(otp.id, otp.key.clone());
@@ -478,7 +736,7 @@ async fn publish_bundle(state: &Arc<AppState>, wire: PrekeyBundleWire) -> Result
         bundle: wire,
         one_time_prekeys,
     };
-    inner.directory.insert(fp, stored);
+    inner.register_bundle(fp, stored);
     if let Some(persistence) = &state.persistence {
         persistence.save(&fp, inner.directory.get(&fp).expect("just inserted"));
     }
@@ -584,6 +842,72 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// DRA-0026 (`docs/DELIVERY_FAILURE_FINDINGS.md`): checked before
+/// `relay_to_peer` ever touches the target's outbound channel — unlike
+/// every other client-supplied payload this server relays or stores
+/// (`MailboxWrite`'s envelope, `PublishBundle`'s username/prekeys),
+/// nothing previously bounded a `RendezvousOffer`/`RendezvousAnswer`'s
+/// `sdp_offer`/`sdp_answer`/`ice_candidates` at all before this was
+/// added, letting any authenticated identity force the server to relay
+/// an arbitrarily large payload straight at any other connected client's
+/// WebSocket, with no relationship check and no rate limit either.
+fn validate_rendezvous_payload(sdp: &str, ice_candidates: &[String]) -> Result<()> {
+    if sdp.len() > crate::state::MAX_SDP_LEN {
+        return Err(Error::SdpTooLarge);
+    }
+    if ice_candidates.len() > crate::state::MAX_ICE_CANDIDATES
+        || ice_candidates
+            .iter()
+            .any(|c| c.len() > crate::state::MAX_ICE_CANDIDATE_LEN)
+    {
+        return Err(Error::IceCandidatesInvalid);
+    }
+    Ok(())
+}
+
+/// DRA-0045 (`docs/DELIVERY_FAILURE_FINDINGS.md`): may `from` have the
+/// server relay a rendezvous frame at `peer_fingerprint` right now?
+///
+/// Two gates, both of which the relay previously lacked entirely — its
+/// own doc comment on [`validate_rendezvous_payload`] recorded the gap as
+/// "no relationship check and no rate limit either".
+///
+/// 1. **Relationship.** The sender must have fetched the target's bundle,
+///    exactly the evidence `PresenceSubscribe` already requires
+///    (`SERVERS.md` §1.3's "only for accounts it has an established or
+///    attempted session with"). Any real caller has done this: a bundle
+///    fetch is how you obtain the keys to establish the session a call
+///    runs over in the first place. A stranger who knows only a public
+///    fingerprint has not.
+/// 2. **Rate.** Even a real peer is metered, because a relayed frame
+///    costs the *target*, not the sender — see
+///    `abuse::RendezvousRateLimiter`.
+///
+/// Checked before `relay_to_peer` so a refused frame never touches the
+/// target's outbound channel at all.
+async fn authorize_rendezvous(
+    state: &Arc<AppState>,
+    from: Fingerprint,
+    peer_fingerprint: &[u8],
+) -> Result<()> {
+    let target: Fingerprint = peer_fingerprint
+        .try_into()
+        .map_err(|_| Error::MalformedFrame("peer_fingerprint must be 32 bytes"))?;
+
+    let mut inner = state.inner.write().await;
+    let has_evidence = inner
+        .fetch_evidence
+        .get(&from)
+        .is_some_and(|fetched| fetched.contains(&target));
+    if !has_evidence {
+        return Err(Error::AuthRequired);
+    }
+    if !inner.rendezvous_rate_limiter.allow(from) {
+        return Err(Error::RateLimited);
+    }
+    Ok(())
+}
+
 /// Deliver an already-built frame to `to`'s live connection, if it has one —
 /// rendezvous is direct relay-while-online only, with no store-and-forward
 /// (that's what the Tier 1 mailbox is for). Acks the *original* sender with
@@ -591,7 +915,7 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
 async fn relay_to_peer(
     state: &Arc<AppState>,
     to: &[u8],
-    original_sender_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    original_sender_tx: &mpsc::Sender<Vec<u8>>,
     frame: Vec<u8>,
 ) -> Result<()> {
     let to_fp: Fingerprint = to
@@ -599,11 +923,11 @@ async fn relay_to_peer(
         .map_err(|_| Error::MalformedFrame("peer_fingerprint must be 32 bytes"))?;
     let inner = state.inner.read().await;
     let sent = match inner.connections.get(&to_fp) {
-        Some(peer_tx) => peer_tx.send(frame).is_ok(),
+        Some(peer_tx) => peer_tx.try_send(frame).is_ok(),
         None => false,
     };
     drop(inner);
-    let _ = original_sender_tx.send(encode(FrameTag::Ack, &Ack { ok: sent }));
+    let _ = original_sender_tx.try_send(encode(FrameTag::Ack, &Ack { ok: sent }));
     Ok(())
 }
 
@@ -628,7 +952,7 @@ async fn notify_presence(
     let inner = state.inner.read().await;
     for sub in subscribers {
         if let Some(sub_tx) = inner.connections.get(sub) {
-            let _ = sub_tx.send(frame.clone());
+            let _ = sub_tx.try_send(frame.clone());
         }
     }
 }

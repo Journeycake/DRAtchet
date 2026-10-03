@@ -18,12 +18,14 @@
 //! once at `open()` time, itself encrypted directly with the master key
 //! rather than any DEK) rather than silently producing garbage.
 
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use argon2::password_hash::SaltString;
 use argon2::Argon2;
-use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key as AeadKey, Nonce};
 use dratchet_core::account::Account;
 use dratchet_core::ratchet::RatchetState;
@@ -42,6 +44,10 @@ const IDENTITY_DEK_KEY: &str = "__identity_dek__";
 const CONTACTS_DEK_KEY: &str = "__contacts_dek__";
 const CONTENT_DEK_KEY: &str = "__content_dek__";
 const ACCOUNT_KEY: &str = "account";
+/// DRA-0056: present once every record has been checked for the pre-
+/// DRA-0041 unbound format and rewritten bound, so later opens skip the
+/// scan. Plaintext; its value carries no meaning.
+const AAD_MIGRATION_MARKER_KEY: &str = "__aad_bound_v1__";
 
 const NONCE_LEN: usize = 12;
 const DEK_LEN: usize = 32;
@@ -66,6 +72,20 @@ pub struct Db {
     identity_key: Zeroizing<[u8; 32]>,
     contacts_key: Zeroizing<[u8; 32]>,
     content_key: RwLock<Zeroizing<[u8; 32]>>,
+    // In-memory only. Starts at 0 on `create` (nothing stored yet); on
+    // `open`, `open` itself recovers it from whatever's already on disk
+    // (`messages::recover_message_sequence`) rather than resetting to 0
+    // — a same-second restart *is* a real scenario, and naively
+    // restarting this counter silently broke `(timestamp, sequence)`'s
+    // own tie-break guarantee across one (`docs/DELIVERY_FAILURE_FINDINGS.md`).
+    pub(crate) message_sequence: AtomicU64,
+    // Backs `receive_lock` (DRA-0012, `docs/DELIVERY_FAILURE_FINDINGS.md`):
+    // one `tokio::sync::Mutex` per conversation, created on first use and
+    // never removed. A `std::sync::Mutex` guards the registry itself —
+    // held only for the instant it takes to look up/insert an `Arc`
+    // clone, never across an `.await`, so it can't itself deadlock or
+    // block an async task.
+    receive_locks: Mutex<HashMap<[u8; 16], Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl Db {
@@ -101,6 +121,8 @@ impl Db {
             identity_key,
             contacts_key,
             content_key: RwLock::new(content_key),
+            message_sequence: AtomicU64::new(0),
+            receive_locks: Mutex::new(HashMap::new()),
         })
     }
 
@@ -137,7 +159,7 @@ impl Db {
             Err(Error::DecryptionFailed) => return Err(Error::WrongPassphraseOrCorrupted),
             Err(e) => return Err(e),
         };
-        if checked != KDF_CHECK_PLAINTEXT {
+        if checked.as_slice() != KDF_CHECK_PLAINTEXT {
             return Err(Error::WrongPassphraseOrCorrupted);
         }
 
@@ -145,13 +167,47 @@ impl Db {
         let contacts_key = unwrap_dek(&database, &master_key, CONTACTS_DEK_KEY)?;
         let content_key = unwrap_dek(&database, &master_key, CONTENT_DEK_KEY)?;
 
-        Ok(Db {
+        let db = Db {
             database,
             master_key,
             identity_key,
             contacts_key,
             content_key: RwLock::new(content_key),
-        })
+            message_sequence: AtomicU64::new(0),
+            receive_locks: Mutex::new(HashMap::new()),
+        };
+        // Unlike `create` (nothing stored yet, so 0 is correct),
+        // reopening an *existing* database must not let this counter
+        // restart at 0 — `crate::messages::recover_message_sequence`'s
+        // own doc explains why a fresh 0 here can silently break the
+        // `(timestamp, sequence)` tie-break across a restart that lands
+        // in the same wall-clock second as messages saved just before
+        // it.
+        db.rebind_legacy_records()?;
+        let recovered_sequence = crate::messages::recover_message_sequence(&db)?;
+        db.message_sequence
+            .store(recovered_sequence, Ordering::Relaxed);
+        Ok(db)
+    }
+
+    /// The per-conversation async lock a caller must hold across an
+    /// entire `receive_pending` call for `conversation_id`
+    /// (`docs/DELIVERY_FAILURE_FINDINGS.md` DRA-0012). Created on first
+    /// use, shared by every caller holding this same `Db` (however it's
+    /// wrapped — `Arc<Db>` in tests, `tauri::State<AppState>` in the
+    /// shipped app), and never removed — turns "never call
+    /// `receive_pending` concurrently for the same conversation" from a
+    /// caller-side invariant the type system didn't enforce into an
+    /// actual guarantee: a second overlapping call for the same
+    /// conversation now blocks on `.lock().await` until the first
+    /// finishes, rather than racing it.
+    pub fn receive_lock(&self, conversation_id: [u8; 16]) -> Arc<tokio::sync::Mutex<()>> {
+        self.receive_locks
+            .lock()
+            .unwrap()
+            .entry(conversation_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Encrypt `plaintext` under `scope`'s DEK and store it under `key`,
@@ -159,9 +215,9 @@ impl Db {
     /// `messages.rs` build their own record types on top of this.
     pub(crate) fn put_encrypted(&self, scope: Scope, key: &str, plaintext: &[u8]) -> Result<()> {
         let encrypted = match scope {
-            Scope::Identity => encrypt(&self.identity_key, plaintext),
-            Scope::Contacts => encrypt(&self.contacts_key, plaintext),
-            Scope::Content => encrypt(&self.content_key.read().unwrap(), plaintext),
+            Scope::Identity => encrypt(&self.identity_key, key.as_bytes(), plaintext),
+            Scope::Contacts => encrypt(&self.contacts_key, key.as_bytes(), plaintext),
+            Scope::Content => encrypt(&self.content_key.read().unwrap(), key.as_bytes(), plaintext),
         };
         let write_txn = self.database.begin_write()?;
         {
@@ -174,20 +230,37 @@ impl Db {
 
     /// Fetch and decrypt (under `scope`'s DEK) the value stored under
     /// `key`, if any.
-    pub(crate) fn get_encrypted(&self, scope: Scope, key: &str) -> Result<Option<Vec<u8>>> {
-        let read_txn = self.database.begin_read()?;
-        let table = read_txn.open_table(RECORDS)?;
-        match table.get(key)? {
-            Some(raw) => {
-                let plaintext = match scope {
-                    Scope::Identity => decrypt(&self.identity_key, raw.value())?,
-                    Scope::Contacts => decrypt(&self.contacts_key, raw.value())?,
-                    Scope::Content => decrypt(&self.content_key.read().unwrap(), raw.value())?,
-                };
-                Ok(Some(plaintext))
+    pub(crate) fn get_encrypted(
+        &self,
+        scope: Scope,
+        key: &str,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        // Read the raw bytes out and drop the read transaction before
+        // decrypting: the legacy-format upgrade below opens a write
+        // transaction, and holding a reader across it is needless.
+        let raw = {
+            let read_txn = self.database.begin_read()?;
+            let table = read_txn.open_table(RECORDS)?;
+            match table.get(key)? {
+                Some(raw) => raw.value().to_vec(),
+                None => return Ok(None),
             }
-            None => Ok(None),
+        };
+
+        let (plaintext, was_legacy) = match scope {
+            Scope::Identity => decrypt_record(&self.identity_key, key, &raw)?,
+            Scope::Contacts => decrypt_record(&self.contacts_key, key, &raw)?,
+            Scope::Content => decrypt_record(&self.content_key.read().unwrap(), key, &raw)?,
+        };
+
+        // DRA-0041 upgrade-on-access: a record written before the record
+        // key was bound as associated data is rewritten, now bound, the
+        // first time anything reads it.
+        if was_legacy {
+            self.put_encrypted(scope, key, &plaintext)?;
         }
+
+        Ok(Some(plaintext))
     }
 
     pub(crate) fn delete(&self, key: &str) -> Result<()> {
@@ -200,12 +273,111 @@ impl Db {
         Ok(())
     }
 
+    /// Like [`delete`](Self::delete), but removes every key in `keys` as
+    /// **one** redb transaction instead of one transaction per key.
+    /// `delete`'s per-call durability is real (each call is its own
+    /// committed transaction, so a crash between two `delete` calls never
+    /// corrupts anything already committed) — but a caller that needs to
+    /// remove several keys as a single logical unit (a bulk wipe) still
+    /// needs *this*: `delete` alone gives no all-or-nothing guarantee
+    /// across a loop of calls, so a crash mid-loop leaves a genuinely
+    /// half-applied result with nothing on disk to distinguish "already
+    /// processed" from "correctly skipped." Wrapping the whole batch in
+    /// one `write_txn` closes that gap: a crash before `commit` returns
+    /// leaves every key untouched (exactly the pre-wipe state); a crash
+    /// after leaves every key gone. No partial outcome is possible
+    /// either way. A no-op call (`keys` empty) still opens and commits an
+    /// empty transaction rather than special-casing — cheap, and keeps
+    /// this function's contract simple.
+    pub(crate) fn delete_many(&self, keys: &[String]) -> Result<()> {
+        let write_txn = self.database.begin_write()?;
+        {
+            let mut table = write_txn.open_table(RECORDS)?;
+            for key in keys {
+                table.remove(key.as_str())?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
     /// All keys currently stored whose name starts with `prefix` — a full
     /// table scan filtered in application code rather than a computed
     /// range-bound, which is the right trade for a single-user local
     /// database (not expected to hold more than a modest number of
     /// contacts/messages) over the subtlety of getting prefix-range byte
     /// arithmetic exactly right.
+    /// DRA-0056: rewrite every record still in the pre-DRA-0041 format
+    /// (encrypted with no associated data) in the bound format, once, when
+    /// the database is opened. Before this, a record was only upgraded the
+    /// first time something read it, so a record nothing reads -- an old
+    /// conversation, a contact nobody opens -- stayed relocatable
+    /// indefinitely: its ciphertext could be moved under another record's
+    /// key and would still decrypt there.
+    ///
+    /// The scope a record belongs to isn't recorded alongside it, so each
+    /// record is tried under all three scope DEKs, bound first. A record
+    /// that decrypts under none of them, bound or not, is damaged and is
+    /// left alone for the `list_*` functions to skip and report (DRA-0054).
+    /// The `__`-prefixed bootstrap records are skipped: the salt is
+    /// plaintext, and the master-key-encrypted ones are already upgraded
+    /// by `open` itself reading them. The marker is written last, so an
+    /// interrupted pass simply runs again on the next open.
+    fn rebind_legacy_records(&self) -> Result<usize> {
+        if self.raw_get(AAD_MIGRATION_MARKER_KEY)?.is_some() {
+            return Ok(0);
+        }
+        let mut rebound = 0;
+        for key in self.keys_with_prefix("")? {
+            if key.starts_with("__") {
+                continue;
+            }
+            let Some(stored) = self.raw_get(&key)? else {
+                continue;
+            };
+            let legacy = {
+                let content_key = self.content_key.read().unwrap();
+                let deks = [
+                    (Scope::Identity, &*self.identity_key),
+                    (Scope::Contacts, &*self.contacts_key),
+                    (Scope::Content, &**content_key),
+                ];
+                if deks
+                    .iter()
+                    .any(|(_, dek)| decrypt(dek, key.as_bytes(), &stored).is_ok())
+                {
+                    None
+                } else {
+                    deks.iter().find_map(|(scope, dek)| {
+                        decrypt(dek, &[], &stored)
+                            .ok()
+                            .map(|plaintext| (*scope, plaintext))
+                    })
+                }
+            };
+            if let Some((scope, plaintext)) = legacy {
+                self.put_encrypted(scope, &key, &plaintext)?;
+                rebound += 1;
+            }
+        }
+        let write_txn = self.database.begin_write()?;
+        {
+            let mut table = write_txn.open_table(RECORDS)?;
+            table.insert(AAD_MIGRATION_MARKER_KEY, &b"1"[..])?;
+        }
+        write_txn.commit()?;
+        if rebound > 0 {
+            tracing::info!(rebound, "rebound pre-DRA-0041 records to their keys");
+        }
+        Ok(rebound)
+    }
+
+    fn raw_get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        let read_txn = self.database.begin_read()?;
+        let table = read_txn.open_table(RECORDS)?;
+        Ok(table.get(key)?.map(|raw| raw.value().to_vec()))
+    }
+
     pub(crate) fn keys_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
         let read_txn = self.database.begin_read()?;
         let table = read_txn.open_table(RECORDS)?;
@@ -274,17 +446,25 @@ impl Db {
     /// brand-new contact today.
     ///
     /// Returns how many message/ratchet records were removed.
+    ///
+    /// **Ordering is the security boundary here, not an implementation
+    /// detail**: the content DEK is rotated *first*, as its own single
+    /// atomic write, before anything is deleted. The instant that commits,
+    /// every message/ratchet record already on disk is permanently
+    /// unrecoverable — encrypted under a key that no longer exists
+    /// anywhere, in memory or otherwise — regardless of whether the
+    /// delete loop below ever runs to completion. A device seized or
+    /// killed partway through this call still gets the real guarantee a
+    /// duress wipe exists for. The original implementation rotated the
+    /// key *last*, "belt-and-suspenders" after the deletes — which meant
+    /// a crash partway through that delete loop could leave some
+    /// messages still fully decryptable under the still-live old key,
+    /// the opposite of what this function is for
+    /// (`docs/DELIVERY_FAILURE_FINDINGS.md`). The delete loop is now
+    /// best-effort cleanup (reclaiming space, removing now-permanently-
+    /// undecryptable ciphertext) rather than part of the security
+    /// boundary.
     pub fn quick_wipe(&self) -> Result<usize> {
-        let mut removed = 0;
-        for key in self.keys_with_prefix("message:")? {
-            self.delete(&key)?;
-            removed += 1;
-        }
-        for key in self.keys_with_prefix("ratchet:")? {
-            self.delete(&key)?;
-            removed += 1;
-        }
-
         let fresh_content_key = random_key();
         write_master_encrypted(
             &self.database,
@@ -293,6 +473,11 @@ impl Db {
             &*fresh_content_key,
         )?;
         *self.content_key.write().unwrap() = fresh_content_key;
+
+        let mut keys = self.keys_with_prefix("message:")?;
+        keys.extend(self.keys_with_prefix("ratchet:")?);
+        let removed = keys.len();
+        self.delete_many(&keys)?;
 
         Ok(removed)
     }
@@ -316,7 +501,28 @@ impl Db {
     /// with next time the file is opened). `dratchet_app::full_wipe`
     /// documents and enforces the intended caller shape (drop this
     /// handle, then create a fresh one) at that layer.
+    ///
+    /// **Ordering is the security boundary here too**: the salt and every
+    /// wrapped DEK are destroyed first, together, in one atomic
+    /// `delete_many` transaction, before the full-table cleanup loop
+    /// below even starts. The instant that commits, this file is
+    /// permanently unopenable by any passphrase — `Db::open` needs the
+    /// salt to derive a master key at all, and the wrapped DEKs to
+    /// recover any scope key even if it somehow had one — so a device
+    /// seized or killed immediately after already gets `full_wipe`'s
+    /// real guarantee, regardless of whether the remaining scan-and-
+    /// delete below ever finishes. That loop is then just reclaiming
+    /// space, not part of the security boundary (mirrors `quick_wipe`'s
+    /// same fix, `docs/DELIVERY_FAILURE_FINDINGS.md`).
     pub fn full_wipe(&self) -> Result<()> {
+        self.delete_many(&[
+            SALT_KEY.to_string(),
+            KDF_CHECK_KEY.to_string(),
+            IDENTITY_DEK_KEY.to_string(),
+            CONTACTS_DEK_KEY.to_string(),
+            CONTENT_DEK_KEY.to_string(),
+        ])?;
+
         for key in self.keys_with_prefix("")? {
             self.delete(&key)?;
         }
@@ -330,12 +536,27 @@ fn random_key() -> Zeroizing<[u8; 32]> {
     key
 }
 
-fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
+/// Encrypt under `key`, authenticating `aad` alongside the ciphertext.
+///
+/// DRA-0041 (`docs/DELIVERY_FAILURE_FINDINGS.md`): every caller passes the
+/// record's own key here. Without it the AEAD tag covered the value but
+/// not its *location*, and a record's location is the only thing that
+/// binds it to anything -- `Message` carries no conversation id, so
+/// `message:<conversation>:<id>` is the entire binding. Anyone able to
+/// write to the database file could therefore relocate a ciphertext they
+/// could not read and have it decrypt cleanly somewhere else.
+fn encrypt(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
     let mut nonce_bytes = [0u8; NONCE_LEN];
     OsRng.fill_bytes(&mut nonce_bytes);
     let cipher = ChaCha20Poly1305::new(AeadKey::from_slice(key));
     let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce_bytes), plaintext)
+        .encrypt(
+            Nonce::from_slice(&nonce_bytes),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .expect("ChaCha20Poly1305 encryption of an unbounded-length plaintext cannot fail");
     let mut out = Vec::with_capacity(NONCE_LEN + ciphertext.len());
     out.extend_from_slice(&nonce_bytes);
@@ -343,15 +564,47 @@ fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
     out
 }
 
-fn decrypt(key: &[u8; 32], stored: &[u8]) -> Result<Vec<u8>> {
+/// DRA-0047: the recovered plaintext comes back in a [`Zeroizing`]
+/// buffer. Every scope's plaintext passes through here — the account's
+/// whole secret hierarchy, ratchet root/chain/skipped keys, and message
+/// bodies — so leaving it in a bare `Vec` meant a copy of all of it was
+/// freed unwiped on every read.
+fn decrypt(key: &[u8; 32], aad: &[u8], stored: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     if stored.len() < NONCE_LEN {
         return Err(Error::MalformedRecord("stored value shorter than a nonce"));
     }
     let (nonce_bytes, ciphertext) = stored.split_at(NONCE_LEN);
     let cipher = ChaCha20Poly1305::new(AeadKey::from_slice(key));
     cipher
-        .decrypt(Nonce::from_slice(nonce_bytes), ciphertext)
+        .decrypt(
+            Nonce::from_slice(nonce_bytes),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
+        .map(Zeroizing::new)
         .map_err(|_| Error::DecryptionFailed)
+}
+
+/// Decrypt a record stored under `record_key`, binding that key as
+/// associated data (DRA-0041).
+///
+/// Records written before DRA-0041 have no associated data at all, so a
+/// failure under the bound-key interpretation is retried with the empty
+/// AAD. The `bool` reports that legacy path, so the caller can rewrite
+/// the record in the new format on the spot -- every record is upgraded
+/// the first time it is read, and a database that has been fully read
+/// once holds no unbound records at all.
+fn decrypt_record(
+    key: &[u8; 32],
+    record_key: &str,
+    stored: &[u8],
+) -> Result<(Zeroizing<Vec<u8>>, bool)> {
+    match decrypt(key, record_key.as_bytes(), stored) {
+        Ok(plaintext) => Ok((plaintext, false)),
+        Err(_) => decrypt(key, &[], stored).map(|plaintext| (plaintext, true)),
+    }
 }
 
 /// Encrypt `plaintext` directly under the master key (never a scope DEK)
@@ -365,7 +618,7 @@ fn write_master_encrypted(
     key: &str,
     plaintext: &[u8],
 ) -> Result<()> {
-    let encrypted = encrypt(master_key, plaintext);
+    let encrypted = encrypt(master_key, key.as_bytes(), plaintext);
     let write_txn = database.begin_write()?;
     {
         let mut table = write_txn.open_table(RECORDS)?;
@@ -380,13 +633,20 @@ fn read_master_encrypted(
     database: &Database,
     master_key: &Zeroizing<[u8; 32]>,
     key: &str,
-) -> Result<Option<Vec<u8>>> {
-    let read_txn = database.begin_read()?;
-    let table = read_txn.open_table(RECORDS)?;
-    match table.get(key)? {
-        Some(raw) => Ok(Some(decrypt(master_key, raw.value())?)),
-        None => Ok(None),
+) -> Result<Option<Zeroizing<Vec<u8>>>> {
+    let raw = {
+        let read_txn = database.begin_read()?;
+        let table = read_txn.open_table(RECORDS)?;
+        match table.get(key)? {
+            Some(raw) => raw.value().to_vec(),
+            None => return Ok(None),
+        }
+    };
+    let (plaintext, was_legacy) = decrypt_record(master_key, key, &raw)?;
+    if was_legacy {
+        write_master_encrypted(database, master_key, key, &plaintext)?;
     }
+    Ok(Some(plaintext))
 }
 
 /// Unwrap (decrypt with the master key) the DEK stored under `key` —
@@ -442,6 +702,227 @@ mod tests {
         table.get(key).unwrap().unwrap().value().to_vec()
     }
 
+    /// Writes `value` verbatim under `key`, bypassing every layer of the
+    /// encryption envelope. Models an attacker who holds the `.redb` file
+    /// -- a synced/backed-up copy, a stolen device, malware running
+    /// without the passphrase -- and can rewrite bytes but cannot read
+    /// them.
+    fn write_raw_record(db: &Db, key: &str, value: &[u8]) {
+        let write_txn = db.database.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(RECORDS).unwrap();
+            table.insert(key, value).unwrap();
+        }
+        write_txn.commit().unwrap();
+    }
+
+    /// Penetration-test finding DRA-0041: a stored record's *location* was
+    /// not authenticated. `encrypt`/`decrypt` passed no associated data, so
+    /// the record key -- which is the only thing binding a message to a
+    /// conversation, since `Message` itself carries no conversation id --
+    /// was entirely outside the AEAD tag. Anyone who could write to the
+    /// database file could therefore relocate a ciphertext they could not
+    /// read from one conversation into another, and it would decrypt
+    /// cleanly under the destination key.
+    #[test]
+    fn a_message_ciphertext_cannot_be_relocated_into_another_conversation() {
+        let path = temp_db_path();
+        let db = Db::create(&path, "correct horse battery staple").unwrap();
+
+        let alice = [1u8; 16];
+        let mallory = [2u8; 16];
+
+        let message = Message {
+            id: vec![0x11; 16],
+            sender_is_local: false,
+            content: b"private words meant only for Alice".to_vec(),
+            timestamp: 1_700_000_000,
+            sequence: 0,
+            send_n: None,
+            send_dh_pub: None,
+            recv_n: None,
+            recv_dh_pub: None,
+            delivered: false,
+            uncertain: false,
+            retry_reason: None,
+            peer_message_id: None,
+            last_sent_at: None,
+        };
+        db.save_message(alice, &message).unwrap();
+
+        // The attacker copies opaque bytes from one key to another. No
+        // passphrase, no DEK, no ability to read the plaintext.
+        let stolen = raw_record(&db, &crate::messages::message_key(alice, &message.id));
+        write_raw_record(
+            &db,
+            &crate::messages::message_key(mallory, &message.id),
+            &stolen,
+        );
+
+        // Either outcome is safe: the relocated record is rejected
+        // outright (a decryption failure) or it is simply not there. What
+        // must never happen is the message surfacing in Mallory's
+        // conversation as if it had been sent there.
+        let relocated = db.list_messages(mallory);
+        assert!(
+            relocated.as_ref().map(|m| m.is_empty()).unwrap_or(true),
+            "VULNERABILITY: a message ciphertext relocated into another conversation decrypts \
+             cleanly there -- the record key that carries the entire conversation binding is \
+             not covered by the AEAD tag, so anyone with write access to the database file can \
+             re-attribute messages they cannot even read"
+        );
+
+        // The genuine record is untouched and still readable where it
+        // belongs -- the fix must bind the location, not break storage.
+        let kept = db.list_messages(alice).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].content, message.content);
+    }
+
+    /// DRA-0041, the same gap applied to session state: `ratchet:<conv>`
+    /// records live under the same unauthenticated key scheme, so a
+    /// ratchet blob could be moved -- or, with a stale copy of the file,
+    /// rolled back -- into a conversation it never belonged to.
+    #[test]
+    fn a_ratchet_blob_cannot_be_relocated_into_another_conversation() {
+        let path = temp_db_path();
+        let db = Db::create(&path, "correct horse battery staple").unwrap();
+
+        let alice = [1u8; 16];
+        let mallory = [2u8; 16];
+        db.save_ratchet(alice, &sample_ratchet(alice)).unwrap();
+
+        let stolen = raw_record(&db, &Db::ratchet_key(alice));
+        write_raw_record(&db, &Db::ratchet_key(mallory), &stolen);
+
+        let relocated = db.load_ratchet(mallory);
+        assert!(
+            relocated.as_ref().map(|r| r.is_none()).unwrap_or(true),
+            "VULNERABILITY: a ratchet blob relocated into another conversation loads cleanly \
+             there -- forcing that conversation onto chain keys and message numbers an \
+             attacker chose, which is message-key and nonce reuse"
+        );
+        assert!(db.load_ratchet(alice).unwrap().is_some());
+    }
+
+    /// DRA-0041's backward-compatibility half: every record already on
+    /// disk was written with no associated data, so binding the record
+    /// key must not lock existing users out of their own database. Such
+    /// a record still reads, and is rewritten in the bound format on the
+    /// spot -- so the unbound form disappears as soon as anything reads
+    /// it, rather than lingering as a permanently relocatable record.
+    #[test]
+    fn a_record_written_before_the_key_was_bound_still_reads_and_is_upgraded_in_place() {
+        let path = temp_db_path();
+        let db = Db::create(&path, "correct horse battery staple").unwrap();
+
+        // Exactly what pre-DRA-0041 `encrypt` produced: no AAD at all.
+        let legacy = encrypt(&db.content_key.read().unwrap(), &[], b"a value from before");
+        write_raw_record(&db, "some-record", &legacy);
+
+        assert_eq!(
+            db.get_encrypted(Scope::Content, "some-record")
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            b"a value from before",
+            "a record written before DRA-0041 must still be readable"
+        );
+
+        let upgraded = raw_record(&db, "some-record");
+        assert_ne!(upgraded, legacy, "the read must have rewritten the record");
+        assert!(
+            decrypt(&db.content_key.read().unwrap(), &[], &upgraded).is_err(),
+            "the upgraded record must no longer decrypt in the unbound legacy format"
+        );
+        assert!(
+            decrypt(&db.content_key.read().unwrap(), b"some-record", &upgraded).is_ok(),
+            "the upgraded record must decrypt bound to its own key"
+        );
+    }
+
+    /// DRA-0056: a pre-DRA-0041 record that nothing ever reads must not
+    /// stay in the relocatable, unbound format forever -- opening the
+    /// database rebinds it. Uses a contact record and a ratchet record,
+    /// neither of which `open` reads for any other reason.
+    #[test]
+    fn opening_the_database_rebinds_legacy_records_nothing_has_read() {
+        let path = temp_db_path();
+        let (contact_legacy, ratchet_legacy, ratchet_key) = {
+            let db = Db::create(&path, "pw").unwrap();
+            let contact_legacy = encrypt(&db.contacts_key, &[], b"old contact");
+            write_raw_record(&db, "contact:aa", &contact_legacy);
+            let ratchet_key = Db::ratchet_key([3u8; 16]);
+            let ratchet_legacy = encrypt(&db.content_key.read().unwrap(), &[], b"old ratchet");
+            write_raw_record(&db, &ratchet_key, &ratchet_legacy);
+            (contact_legacy, ratchet_legacy, ratchet_key)
+        };
+
+        let db = Db::open(&path, "pw").unwrap();
+        let contact_now = raw_record(&db, "contact:aa");
+        let ratchet_now = raw_record(&db, &ratchet_key);
+        assert!(
+            contact_now != contact_legacy && ratchet_now != ratchet_legacy,
+            "VULNERABILITY: after reopening, records nothing has read are still in the unbound \
+             pre-DRA-0041 format, so their ciphertext can still be moved under another record's \
+             key and decrypt there"
+        );
+        assert!(decrypt(&db.contacts_key, b"contact:aa", &contact_now).is_ok());
+        assert!(decrypt(&db.contacts_key, &[], &contact_now).is_err());
+        assert!(decrypt(
+            &db.content_key.read().unwrap(),
+            ratchet_key.as_bytes(),
+            &ratchet_now
+        )
+        .is_ok());
+    }
+
+    /// DRA-0056 guard: the pass leaves already-bound and damaged records
+    /// exactly as they were, and runs only once.
+    #[test]
+    fn the_open_time_rebind_leaves_bound_and_damaged_records_alone_and_runs_once() {
+        let path = temp_db_path();
+        let (bound_before, damaged) = {
+            let db = Db::create(&path, "pw").unwrap();
+            db.put_encrypted(Scope::Contacts, "contact:bb", b"current")
+                .unwrap();
+            write_raw_record(&db, "contact:cc", b"garbage that decrypts under nothing");
+            (raw_record(&db, "contact:bb"), raw_record(&db, "contact:cc"))
+        };
+
+        let db = Db::open(&path, "pw").unwrap();
+        assert_eq!(
+            raw_record(&db, "contact:bb"),
+            bound_before,
+            "bound record untouched"
+        );
+        assert_eq!(
+            raw_record(&db, "contact:cc"),
+            damaged,
+            "damaged record left for list_* to report"
+        );
+        assert!(db.raw_get(AAD_MIGRATION_MARKER_KEY).unwrap().is_some());
+
+        // A legacy record appearing after the marker is written is no
+        // longer the open-time pass's job: read-time upgrade still covers it.
+        let legacy = encrypt(&db.contacts_key, &[], b"late");
+        write_raw_record(&db, "contact:dd", &legacy);
+        drop(db);
+        let db = Db::open(&path, "pw").unwrap();
+        assert_eq!(
+            raw_record(&db, "contact:dd"),
+            legacy,
+            "the scan ran only once"
+        );
+        assert_eq!(
+            db.get_encrypted(Scope::Contacts, "contact:dd")
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            b"late"
+        );
+    }
+
     fn sample_contact(fingerprint: u8) -> Contact {
         Contact {
             fingerprint: vec![fingerprint; 32],
@@ -457,6 +938,12 @@ mod tests {
             wipe_include_session: false,
             peer_wipe_include_session: None,
             wipe_request_pending: false,
+            wipe_boundary_timestamp: None,
+            wipe_boundary_sequence: None,
+            peer_wipe_boundary_timestamp: None,
+            peer_wipe_boundary_sequence: None,
+            routing_confirmed: false,
+            routing_announce: Vec::new(),
         }
     }
 
@@ -479,14 +966,20 @@ mod tests {
         db.put_encrypted(Scope::Content, "k", b"hello world")
             .unwrap();
         assert_eq!(
-            db.get_encrypted(Scope::Content, "k").unwrap().unwrap(),
+            db.get_encrypted(Scope::Content, "k")
+                .unwrap()
+                .unwrap()
+                .as_slice(),
             b"hello world"
         );
         drop(db);
 
         let db = Db::open(&path, "correct horse battery staple").unwrap();
         assert_eq!(
-            db.get_encrypted(Scope::Content, "k").unwrap().unwrap(),
+            db.get_encrypted(Scope::Content, "k")
+                .unwrap()
+                .unwrap()
+                .as_slice(),
             b"hello world"
         );
     }
@@ -646,6 +1139,16 @@ mod tests {
                 sender_is_local: true,
                 content: b"gone after a quick wipe".to_vec(),
                 timestamp: 100,
+                sequence: 0,
+                send_n: None,
+                send_dh_pub: None,
+                recv_n: None,
+                recv_dh_pub: None,
+                delivered: false,
+                uncertain: false,
+                retry_reason: None,
+                peer_message_id: None,
+                last_sent_at: None,
             },
         )
         .unwrap();
@@ -699,6 +1202,16 @@ mod tests {
                 sender_is_local: true,
                 content: b"written after the wipe, under the new key".to_vec(),
                 timestamp: 200,
+                sequence: 0,
+                send_n: None,
+                send_dh_pub: None,
+                recv_n: None,
+                recv_dh_pub: None,
+                delivered: false,
+                uncertain: false,
+                retry_reason: None,
+                peer_message_id: None,
+                last_sent_at: None,
             },
         )
         .unwrap();

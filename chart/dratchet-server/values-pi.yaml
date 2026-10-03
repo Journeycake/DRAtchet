@@ -1,0 +1,46 @@
+# Overlay for a throwaway single-node k3s test cluster on a Raspberry Pi 5
+# (docs/DEPLOY_K3S_PI.md) — not a production posture. Layer over
+# values.yaml with:
+#
+#   helm upgrade --install test chart/dratchet-server \
+#     -f chart/dratchet-server/values-pi.yaml \
+#     --set image.repository=dratchet-server --set image.tag=pi-test
+#
+# (scripts/deploy-k3s-local.sh does this for you.) Mirrors
+# values-test.yaml's shape — same NodePort/debug-log reasoning applies
+# here — with two Pi-specific differences:
+#
+# - resources trimmed further still: a Pi 5's RAM (4GB or 8GB) is shared
+#   with the host OS and k3s's own system pods (coredns, traefik,
+#   local-path-provisioner, servicelb) in addition to this service, so
+#   there's less headroom to spare than a dedicated test VM.
+# - nodeSelector pins to arm64 explicitly. Redundant on an actual
+#   single-node arm64 cluster (there's nowhere else to schedule), but
+#   documents the intent and fails fast with a clear "Pending, unschedulable"
+#   instead of silently working if this overlay ever gets pointed at a
+#   mixed-arch cluster later.
+
+image:
+  repository: dratchet-server
+  tag: pi-test
+
+service:
+  type: NodePort
+
+config:
+  logLevel: "debug"
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 16Mi
+  limits:
+    cpu: 200m
+    memory: 96Mi
+
+nodeSelector:
+  kubernetes.io/arch: arm64
+
+# Same reasoning as values-test.yaml: a single-pod smoke test doesn't need
+# the production default's 30s grace window.
+terminationGracePeriodSeconds: 5

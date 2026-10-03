@@ -66,6 +66,16 @@ pub struct PairingBundle {
 /// Shared back by whoever received a [`PairingBundle`] and ran X3DH against
 /// it — everything the original bundle's owner needs to complete their side
 /// of the handshake (`core::x3dh::respond`) and derive the same root key.
+///
+/// `response_signature` (DRA-0022, `docs/DELIVERY_FAILURE_FINDINGS.md`)
+/// binds `identity_dh_public` and `ephemeral_public` to `identity_key` —
+/// unlike [`PairingBundle`], whose `identity_dh_public` is bound to
+/// `identity_key` by `identity_dh_signature` (checked by
+/// `PrekeyBundle::verify` in `handshake::initiate`), nothing previously
+/// bound *this* struct's DH material to the identity it claims to belong
+/// to, even though `x3dh::respond` uses both fields as real Diffie-Hellman
+/// inputs. See `handshake::signing_payload` for the exact signed bytes and
+/// `handshake::respond`'s doc for what verifying it closes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PairingResponse {
     #[serde(with = "serde_bytes")]
@@ -78,6 +88,8 @@ pub struct PairingResponse {
     pub used_one_time_prekey_id: Option<u32>,
     #[serde(with = "serde_bytes")]
     pub routing_id: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub response_signature: Vec<u8>,
 }
 
 /// CBOR-encode, then base64-encode, for copy-paste — the stand-in for

@@ -60,6 +60,66 @@ impl Db {
 
         let changed = contact.username.as_deref() != Some(username.as_str())
             || contact.discriminator != Some(discriminator);
+
+        // DRA-0025 (`docs/DELIVERY_FAILURE_FINDINGS.md`): the same
+        // ASCII-only floor DRA-0024 already enforces at directory
+        // registration (`server::ws::publish_bundle`) — but that only
+        // covers a *fresh registration*, not this peer-to-peer path. A
+        // contact you already have (verified or not — this payload isn't
+        // gated either) could rename themselves via `ProfileAnnounce` to
+        // a Unicode homograph of a *different*, already-known contact's
+        // handle (e.g. Cyrillic `а` standing in for Latin `a`) — a
+        // distinct string, so DRA-0016's exact-match collision check
+        // below never catches it, yet visually indistinguishable in the
+        // UI. Declined the same way as a collision: no error, no batch
+        // abort, this contact just keeps whatever it displayed before.
+        //
+        // DRA-0043: the same call now also enforces
+        // `dratchet_core::username::MAX_LEN`, which DRA-0019 had put on
+        // the directory path alone. Nothing here previously bounded an
+        // announced handle's *length* at all, so a contact could announce
+        // one limited only by the transport's 1 MiB frame cap -- entirely
+        // well-formed ASCII, so the character allowlist waved it through
+        // -- and have it persisted into their contact record and rendered
+        // in every conversation header.
+        if !dratchet_core::username::is_acceptable(&username) {
+            tracing::warn!(
+                fingerprint = %crate::db::hex(fingerprint),
+                username_len = username.len(),
+                discriminator,
+                "rejected a ProfileAnnounce with an empty, overlong, or non-ASCII username",
+            );
+            return Ok((contact, false));
+        }
+
+        // DRA-0016 (`docs/DELIVERY_FAILURE_FINDINGS.md`): `ProfileAnnounce`
+        // is protocol metadata, not chat content — `store::gate` never
+        // gates it, and nothing here previously checked the announced
+        // `username#NNNN` against every *other* locally-known contact.
+        // Without this, any contact (verified or not — the gate doesn't
+        // apply here) could announce a handle identical to a different,
+        // already-known contact's, making two distinct fingerprints
+        // display identically in the UI and inviting a user to type a
+        // message into the impostor's thread believing it's the real
+        // contact's. Declined exactly like an unrelated announce that
+        // changes nothing — no error, no batch abort, just refused: the
+        // real party (`existing_owner.fingerprint`) keeps that handle,
+        // and `fingerprint` here keeps whatever it displayed before.
+        let claimed_by_someone_else = self.list_contacts()?.iter().any(|existing_owner| {
+            existing_owner.fingerprint != contact.fingerprint
+                && existing_owner.username.as_deref() == Some(username.as_str())
+                && existing_owner.discriminator == Some(discriminator)
+        });
+        if claimed_by_someone_else {
+            tracing::warn!(
+                fingerprint = %crate::db::hex(fingerprint),
+                username,
+                discriminator,
+                "rejected a ProfileAnnounce claiming a handle another known contact already uses",
+            );
+            return Ok((contact, false));
+        }
+
         // Only a genuine change *from an already-known handle* is worth a
         // caller-visible notice — the very first announce right after
         // pairing just confirms what was already known (e.g. from
@@ -143,6 +203,12 @@ mod tests {
             wipe_include_session: false,
             peer_wipe_include_session: None,
             wipe_request_pending: false,
+            wipe_boundary_timestamp: None,
+            wipe_boundary_sequence: None,
+            peer_wipe_boundary_timestamp: None,
+            peer_wipe_boundary_sequence: None,
+            routing_confirmed: false,
+            routing_announce: Vec::new(),
         }
     }
 
@@ -193,5 +259,163 @@ mod tests {
             .record_peer_profile(&contact.fingerprint, "bob".into(), 1490)
             .unwrap();
         assert!(!changed, "re-announcing the same handle is not a change");
+    }
+
+    /// DRA-0016 (penetration test, priority 3: poisoning/corrupting a
+    /// conversation's identity). A distinct contact (a different
+    /// fingerprint entirely — never verified, since `ProfileAnnounce`
+    /// isn't gated by `store::gate` at all) announces the exact same
+    /// `username#discriminator` an already-known, unrelated contact uses.
+    /// Before the fix this silently succeeded, leaving two different
+    /// fingerprints displaying identically in the UI.
+    #[test]
+    fn record_peer_profile_refuses_to_impersonate_an_already_known_contacts_handle() {
+        let db = temp_db();
+
+        let real_bob = sample_contact(Some("bob"), Some(1490));
+        db.save_contact(&real_bob).unwrap();
+
+        let mut impostor = sample_contact(None, None);
+        impostor.fingerprint = vec![2u8; 32]; // a genuinely different identity
+        db.save_contact(&impostor).unwrap();
+
+        let (updated, changed) = db
+            .record_peer_profile(&impostor.fingerprint, "bob".into(), 1490)
+            .unwrap();
+        assert!(
+            !changed,
+            "VULNERABILITY: a distinct contact was allowed to claim another known contact's \
+             exact handle"
+        );
+        assert_eq!(
+            updated.username, None,
+            "the impostor's own contact record must not pick up the claimed handle"
+        );
+
+        // The real bob's handle must be completely untouched.
+        let real_bob_reloaded = db.load_contact(&real_bob.fingerprint).unwrap().unwrap();
+        assert_eq!(real_bob_reloaded.username.as_deref(), Some("bob"));
+        assert_eq!(real_bob_reloaded.discriminator, Some(1490));
+    }
+
+    /// DRA-0025 (penetration test, priority 3/data obfuscation: a Unicode
+    /// homograph impersonating an already-known contact via the
+    /// peer-to-peer `ProfileAnnounce` path, distinct from DRA-0024's
+    /// directory-registration fix). A different, already-known contact
+    /// ("carol") exists; the contact under test announces a Cyrillic
+    /// lookalike of "carol" — a distinct string, so DRA-0016's exact-match
+    /// collision check alone would never catch it. Before this fix, the
+    /// lookalike was accepted outright.
+    #[test]
+    fn record_peer_profile_refuses_a_unicode_homograph_of_an_already_known_contacts_handle() {
+        let db = temp_db();
+
+        let real_carol = sample_contact(Some("carol"), Some(4242));
+        db.save_contact(&real_carol).unwrap();
+
+        let mut impostor = sample_contact(None, None);
+        impostor.fingerprint = vec![2u8; 32];
+        db.save_contact(&impostor).unwrap();
+
+        // Cyrillic "с" (U+0441) in place of Latin "c" -- a distinct
+        // string, visually indistinguishable from "carol" in essentially
+        // every font.
+        let lookalike = "\u{0441}arol";
+        assert_ne!(lookalike, "carol", "sanity check: distinct strings");
+
+        let (updated, changed) = db
+            .record_peer_profile(&impostor.fingerprint, lookalike.into(), 4242)
+            .unwrap();
+        assert!(
+            !changed,
+            "VULNERABILITY: a Unicode homograph of an already-known contact's handle was \
+             accepted"
+        );
+        assert_eq!(
+            updated.username, None,
+            "the impostor's own contact record must not pick up the lookalike handle"
+        );
+
+        let real_carol_reloaded = db.load_contact(&real_carol.fingerprint).unwrap().unwrap();
+        assert_eq!(real_carol_reloaded.username.as_deref(), Some("carol"));
+    }
+
+    /// Penetration-test finding DRA-0043: DRA-0019 capped a username's
+    /// length at the directory-registration path
+    /// (`server::ws::publish_bundle`, 64 bytes) but nothing capped it on
+    /// this peer-to-peer one. A contact could therefore announce a handle
+    /// bounded only by the transport's 1 MiB frame cap and have it
+    /// persisted into their contact record and rendered in the UI. The
+    /// DRA-0025 character allowlist is no defense here: a megabyte of `a`
+    /// is perfectly well-formed ASCII.
+    #[test]
+    fn record_peer_profile_refuses_an_overlong_announced_username() {
+        let db = temp_db();
+        let contact = sample_contact(Some("bob"), Some(1490));
+        db.save_contact(&contact).unwrap();
+
+        // Well within what the 1 MiB transport cap allows through, and
+        // entirely inside the allowed character set.
+        let overlong = "a".repeat(dratchet_core::username::MAX_LEN + 1);
+        assert!(dratchet_core::username::has_only_allowed_characters(
+            &overlong
+        ));
+
+        let (updated, changed) = db
+            .record_peer_profile(&contact.fingerprint, overlong.clone(), 1490)
+            .unwrap();
+        assert!(
+            !changed,
+            "VULNERABILITY: an announced username past the length the directory path enforces \
+             was accepted over the peer-to-peer path"
+        );
+        assert_eq!(
+            updated.username.as_deref(),
+            Some("bob"),
+            "the contact must keep whatever handle it displayed before"
+        );
+
+        let reloaded = db.load_contact(&contact.fingerprint).unwrap().unwrap();
+        assert_eq!(reloaded.username.as_deref(), Some("bob"));
+    }
+
+    /// The cap must be a real boundary, not a blanket refusal: a handle
+    /// exactly at the limit is still a legitimate rename.
+    #[test]
+    fn record_peer_profile_still_accepts_a_username_exactly_at_the_limit() {
+        let db = temp_db();
+        let contact = sample_contact(Some("bob"), Some(1490));
+        db.save_contact(&contact).unwrap();
+
+        let at_limit = "a".repeat(dratchet_core::username::MAX_LEN);
+        let (updated, changed) = db
+            .record_peer_profile(&contact.fingerprint, at_limit.clone(), 1490)
+            .unwrap();
+        assert!(changed);
+        assert_eq!(updated.username.as_deref(), Some(at_limit.as_str()));
+    }
+
+    /// The fix must not block a genuine, non-colliding rename — only an
+    /// announce that collides with a *different* contact's current
+    /// handle.
+    #[test]
+    fn record_peer_profile_still_allows_a_genuine_non_colliding_rename() {
+        let db = temp_db();
+
+        let other = sample_contact(Some("carol"), Some(4242));
+        db.save_contact(&other).unwrap();
+
+        let mut renaming = sample_contact(Some("bob"), Some(1490));
+        renaming.fingerprint = vec![2u8; 32];
+        db.save_contact(&renaming).unwrap();
+
+        let (updated, changed) = db
+            .record_peer_profile(&renaming.fingerprint, "bob".into(), 9999)
+            .unwrap();
+        assert!(
+            changed,
+            "a genuine rename to an unclaimed handle must go through"
+        );
+        assert_eq!(updated.discriminator, Some(9999));
     }
 }

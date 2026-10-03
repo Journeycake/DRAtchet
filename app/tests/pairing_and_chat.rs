@@ -161,7 +161,8 @@ async fn pending_gated_send_fails_then_succeeds_after_verification_over_a_real_s
         bob.signed_prekey_secret(),
         bob_otp_secret.as_ref(),
         &init.message,
-    );
+    )
+    .unwrap();
     let bob_ratchet = RatchetState::init_as_responder(
         conv_id,
         bob_root_key,
@@ -192,6 +193,12 @@ async fn pending_gated_send_fails_then_succeeds_after_verification_over_a_real_s
         wipe_include_session: false,
         peer_wipe_include_session: None,
         wipe_request_pending: false,
+        wipe_boundary_timestamp: None,
+        wipe_boundary_sequence: None,
+        peer_wipe_boundary_timestamp: None,
+        peer_wipe_boundary_sequence: None,
+        routing_confirmed: false,
+        routing_announce: Vec::new(),
     };
     db_alice.save_contact(&alice_contact).unwrap();
     db_alice.save_ratchet(conv_id, &alice_ratchet).unwrap();
@@ -212,6 +219,12 @@ async fn pending_gated_send_fails_then_succeeds_after_verification_over_a_real_s
         wipe_include_session: false,
         peer_wipe_include_session: None,
         wipe_request_pending: false,
+        wipe_boundary_timestamp: None,
+        wipe_boundary_sequence: None,
+        peer_wipe_boundary_timestamp: None,
+        peer_wipe_boundary_sequence: None,
+        routing_confirmed: false,
+        routing_announce: Vec::new(),
     };
     db_bob.save_contact(&bob_contact).unwrap();
     db_bob.save_ratchet(conv_id, &bob_ratchet).unwrap();

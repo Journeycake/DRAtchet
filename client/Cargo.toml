@@ -32,3 +32,8 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 # For tests/integration.rs's own spawn_server() helper only, mirroring
 # server/tests/common/mod.rs::spawn_server() — see that test's doc comment.
 axum = { version = "0.7", features = ["ws"] }
+# For tests/pairing_response_mitm.rs, which independently re-derives
+# core::x3dh's HKDF root-key computation to prove DRA-0022's finding at
+# the DH-math level — same versions core/Cargo.toml pins.
+hkdf = "0.12"
+sha2 = "0.10"

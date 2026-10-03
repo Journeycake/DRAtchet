@@ -19,6 +19,10 @@
     sender_is_local: boolean;
     content: string;
     timestamp: number;
+    delivered: boolean;
+    uncertain: boolean;
+    // DRA-0060/0063/0064: why this message is offered for a resend, if it is.
+    retry_reason: "send_failed" | "expired" | "server_restarted" | null;
   };
 
   type OwnProfileDto = {
@@ -30,6 +34,14 @@
   type PairingCodeDto = {
     code: string;
     expires_at: number;
+  };
+
+  // Preview of a not-yet-sent "clear conversation" — see
+  // `dratchet_app::preview_conversation_wipe`'s doc comment for what
+  // `peer_likely_keeps` does and doesn't guarantee.
+  type WipePreviewDto = {
+    will_remove_locally: number;
+    peer_likely_keeps: number;
   };
 
   // §6.1: surfaced once at startup when `reconcile_own_profile` had to
@@ -51,11 +63,24 @@
   };
 
   const INBOX_UPDATED_EVENT = "dratchet://inbox-updated";
+  const CONNECTION_STATUS_EVENT = "dratchet://connection-status";
   const FULL_WIPE_CONFIRM_PHRASE = "DELETE";
+
+  // Live connection health (`docs/DELIVERY_FAILURE_FINDINGS.md` scenario
+  // 23): `poll_loop` now reconnects on its own after a transport failure,
+  // but silently — this is the only signal the user gets that it's
+  // happening, rather than wondering why messages stopped arriving.
+  type ConnectionStatusDto = "connected" | "reconnecting";
+  let connectionStatus = $state<ConnectionStatusDto>("connected");
 
   let contacts = $state<ContactDto[]>([]);
   let selected = $state<ContactDto | null>(null);
   let messages = $state<MessageDto[]>([]);
+  // DRA-0054: how many stored records the last list call had to skip
+  // because they could not be read (damage or tampering). Non-zero shows
+  // a notice rather than letting the gap go unexplained.
+  let unreadableContacts = $state(0);
+  let unreadableMessages = $state(0);
   let loadError = $state("");
   let draft = $state("");
   let sendError = $state("");
@@ -117,6 +142,20 @@
   let clearBusy = $state(false);
   let clearResult = $state("");
   let clearError = $state("");
+  let clearPreview: WipePreviewDto | null = $state(null);
+  let clearPreviewError = $state("");
+  // A plain (non-reactive) flag, deliberately *not* `$state`: checked and
+  // set synchronously, with no dependency on a reactive re-render ever
+  // landing. `clearBusy`'s `disabled` binding already blocks a second
+  // click under any realistic double-click timing (confirmed live — a
+  // real double-click's actual mousedown/mouseup interval always leaves
+  // enough time for Svelte to flush the disabled state first), but two
+  // click events dispatched back-to-back with literally zero delay
+  // between them — not achievable by a real mouse, but not something to
+  // leave unguarded either — can still both start running before either
+  // one's `clearBusy = true` reactive update has painted. This flag has
+  // no such gap: it's a plain synchronous variable.
+  let clearInFlight = false;
   let policyBusy = $state(false);
   let policyError = $state("");
   let pendingWipeBusy = $state(false);
@@ -125,18 +164,24 @@
   async function selectContact(contact: ContactDto) {
     selected = contact;
     messages = [];
+    unreadableMessages = 0;
     sendError = "";
     conversationMenuOpen = false;
     clearArmed = false;
     clearResult = "";
     clearError = "";
+    clearPreview = null;
+    clearPreviewError = "";
     policyError = "";
     pendingWipeError = "";
     if (!contact.verified) return;
     try {
-      messages = await invoke<MessageDto[]>("list_messages", {
-        fingerprint: contact.fingerprint,
-      });
+      const listed = await invoke<{ messages: MessageDto[]; unreadable: number }>(
+        "list_messages",
+        { fingerprint: contact.fingerprint },
+      );
+      messages = listed.messages;
+      unreadableMessages = listed.unreadable;
     } catch (e) {
       loadError = String(e);
     }
@@ -145,7 +190,11 @@
   async function refetch() {
     const previouslySelected = selected?.fingerprint;
     try {
-      contacts = await invoke<ContactDto[]>("list_contacts");
+      const listed = await invoke<{ contacts: ContactDto[]; unreadable: number }>(
+        "list_contacts",
+      );
+      contacts = listed.contacts;
+      unreadableContacts = listed.unreadable;
     } catch (e) {
       loadError = String(e);
       return;
@@ -177,11 +226,39 @@
     }
   }
 
+  // DRA-0060/0063/0064: resend a flagged message. The backend encrypts it
+  // afresh (never the original key) and the recipient drops a copy it
+  // already has, so retrying is always safe.
+  let retrying = $state<string | null>(null);
+  const RETRY_LABEL: Record<string, string> = {
+    send_failed: "Not sent",
+    expired: "Not delivered within 14 days — the server discarded it",
+    server_restarted: "Possibly lost when the server restarted",
+  };
+
+  async function retryMessage(message: MessageDto) {
+    if (!selected || retrying) return;
+    retrying = message.id;
+    try {
+      const updated = await invoke<MessageDto>("retry_message", {
+        fingerprint: selected.fingerprint,
+        messageId: message.id,
+      });
+      messages = messages.map((m) => (m.id === updated.id ? updated : m));
+    } catch (e) {
+      sendError = String(e);
+    } finally {
+      retrying = null;
+    }
+  }
+
   function toggleConversationMenu() {
     conversationMenuOpen = !conversationMenuOpen;
     clearArmed = false;
     clearResult = "";
     clearError = "";
+    clearPreview = null;
+    clearPreviewError = "";
     policyError = "";
   }
 
@@ -211,13 +288,32 @@
   }
 
   // §11.9a's "delete for everyone" — same two-click armed-confirm pattern
-  // as the Danger Zone's quick wipe, for UI consistency.
+  // as the Danger Zone's quick wipe, for UI consistency. The moment it
+  // becomes armed, also fetch a preview of how much of this side's
+  // history the peer will likely still keep after complying (an estimate
+  // — see `preview_conversation_wipe`'s doc comment) and show it inline;
+  // the existing second click becomes "confirm despite this warning."
   async function clearConversation() {
     if (!selected) return;
     if (!clearArmed) {
       clearArmed = true;
+      clearPreview = null;
+      clearPreviewError = "";
+      try {
+        clearPreview = await invoke<WipePreviewDto>("preview_conversation_wipe", {
+          fingerprint: selected.fingerprint,
+        });
+      } catch (e) {
+        clearPreviewError = String(e);
+      }
       return;
     }
+    // Checked and set synchronously, before the reactive `clearBusy`
+    // assignment below — closes the zero-delay-double-click gap
+    // `clearBusy`'s `disabled` binding alone doesn't cover (see
+    // `clearInFlight`'s own doc comment).
+    if (clearInFlight) return;
+    clearInFlight = true;
     clearBusy = true;
     clearError = "";
     clearResult = "";
@@ -227,11 +323,13 @@
       });
       clearResult = `Cleared ${removed} record${removed === 1 ? "" : "s"}.`;
       clearArmed = false;
+      clearPreview = null;
       await selectContact(selected);
     } catch (e) {
       clearError = String(e);
     } finally {
       clearBusy = false;
+      clearInFlight = false;
     }
   }
 
@@ -451,19 +549,32 @@
     }
   }
 
+  async function loadConnectionStatus() {
+    try {
+      connectionStatus = await invoke<ConnectionStatusDto>("get_connection_status");
+    } catch (e) {
+      void e;
+    }
+  }
+
   onMount(() => {
     refetch();
     loadOwnProfile();
     checkOwnDiscriminatorChangeNotice();
+    loadConnectionStatus();
     const unlisten = listen(INBOX_UPDATED_EVENT, () => {
       refetch();
       checkPeerProfileChangeNotices();
+    });
+    const unlistenConnection = listen<ConnectionStatusDto>(CONNECTION_STATUS_EVENT, (event) => {
+      connectionStatus = event.payload;
     });
     const tickInterval = setInterval(() => {
       nowTick = Date.now();
     }, 1000);
     return () => {
       unlisten.then((f) => f());
+      unlistenConnection.then((f) => f());
       clearInterval(tickInterval);
     };
   });
@@ -480,10 +591,25 @@
 <div class="shell">
   <aside class="sidebar">
     <div class="brand-row">
-      <div class="brand">DRAtchet</div>
+      <div class="brand-with-status">
+        <div class="brand">DRAtchet</div>
+        {#if connectionStatus === "reconnecting"}
+          <span class="connection-badge" title="The connection to the server dropped — retrying automatically.">
+            <span class="connection-dot"></span>Reconnecting…
+          </span>
+        {/if}
+      </div>
       <button class="settings-button" onclick={openSettings} aria-label="Settings">⚙</button>
     </div>
     <div class="search">Search conversations</div>
+    {#if unreadableContacts > 0}
+      <div class="unreadable-notice" role="status">
+        {unreadableContacts}
+        {unreadableContacts === 1 ? "saved contact" : "saved contacts"} could not be read and
+        {unreadableContacts === 1 ? "is" : "are"} not shown. The local database may be damaged
+        or have been tampered with.
+      </div>
+    {/if}
     <ul class="conversations">
       {#each contacts as contact (contact.fingerprint)}
         <li>
@@ -557,6 +683,16 @@
                 <div class="menu-error">{policyError}</div>
               {/if}
               <div class="menu-divider"></div>
+              {#if clearArmed && clearPreview && clearPreview.peer_likely_keeps > 0}
+                <div class="menu-warning">
+                  {clearPreview.peer_likely_keeps} message{clearPreview.peer_likely_keeps === 1
+                    ? ""
+                    : "s"} from before your last policy change may remain on their device.
+                </div>
+              {/if}
+              {#if clearArmed && clearPreviewError}
+                <div class="menu-error">{clearPreviewError}</div>
+              {/if}
               <button
                 class="menu-clear-button"
                 class:armed={clearArmed}
@@ -594,9 +730,41 @@
         </div>
       {/if}
       <div class="messages">
+        {#if unreadableMessages > 0}
+          <div class="unreadable-notice" role="status">
+            {unreadableMessages}
+            {unreadableMessages === 1 ? "message" : "messages"} in this conversation could not
+            be read and {unreadableMessages === 1 ? "is" : "are"} not shown. The local database
+            may be damaged or have been tampered with.
+          </div>
+        {/if}
         {#each messages as message (message.id)}
           <div class="bubble" class:local={message.sender_is_local}>
             {message.content}
+            {#if message.sender_is_local}
+              <span
+                class="delivery-status"
+                class:delivered={message.delivered}
+                class:uncertain={message.uncertain}
+                title={message.uncertain
+                  ? "Delivery uncertain — a connection interruption was detected after sending; this will resolve automatically once the conversation continues"
+                  : undefined}
+              >
+                {message.uncertain ? "?" : message.delivered ? "✓✓" : "✓"}
+              </span>
+              {#if message.retry_reason}
+                <span class="retry-notice" role="status">
+                  {RETRY_LABEL[message.retry_reason]}
+                  <button
+                    class="retry-button"
+                    disabled={retrying === message.id}
+                    onclick={() => retryMessage(message)}
+                  >
+                    {retrying === message.id ? "Retrying…" : "Retry"}
+                  </button>
+                </span>
+              {/if}
+            {/if}
           </div>
         {/each}
       </div>
@@ -885,11 +1053,54 @@
     padding-right: 8px;
   }
 
+  .brand-with-status {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+  }
+
   .brand {
     font-family: var(--display);
     font-weight: 600;
     color: var(--brass-strong);
     padding: 18px 16px;
+  }
+
+  .connection-badge {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 9px;
+    border: 1px solid var(--amber);
+    border-radius: 999px;
+    color: var(--amber);
+    font-size: 11px;
+    white-space: nowrap;
+  }
+
+  .connection-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--amber);
+    animation: connection-pulse 1.4s ease-in-out infinite;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .connection-dot {
+      animation: none;
+    }
+  }
+
+  @keyframes connection-pulse {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.35;
+    }
   }
 
   .settings-button {
@@ -999,6 +1210,15 @@
     color: var(--red);
   }
 
+  .unreadable-notice {
+    margin: 8px 12px;
+    padding: 8px 12px;
+    border: 1px solid var(--red);
+    border-radius: 6px;
+    color: var(--red);
+    font-size: 13px;
+  }
+
   .conversation-header {
     display: flex;
     align-items: center;
@@ -1101,6 +1321,13 @@
     margin-top: 6px;
   }
 
+  .menu-warning {
+    color: var(--amber);
+    font-size: 12px;
+    margin-top: 6px;
+    margin-bottom: 6px;
+  }
+
   .toast-stack {
     position: fixed;
     top: 16px;
@@ -1180,6 +1407,37 @@
     background: var(--teal-dim);
     color: var(--ink);
     align-self: flex-end;
+  }
+
+  .retry-notice {
+    display: block;
+    margin-top: 4px;
+    font-size: 11px;
+    color: var(--red);
+  }
+
+  .retry-button {
+    margin-left: 6px;
+    font-size: 11px;
+  }
+
+  .delivery-status {
+    margin-left: 6px;
+    font-size: 11px;
+    opacity: 0.5;
+    letter-spacing: -1px;
+  }
+
+  .delivery-status.delivered {
+    opacity: 0.85;
+    color: var(--teal);
+  }
+
+  .delivery-status.uncertain {
+    opacity: 0.9;
+    color: var(--amber);
+    font-weight: 600;
+    letter-spacing: 0;
   }
 
   .composer {

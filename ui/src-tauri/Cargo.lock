@@ -1232,6 +1232,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "thiserror 1.0.69",
+ "tokio",
  "tracing",
  "zeroize",
 ]
@@ -4879,16 +4880,20 @@ dependencies = [
 name = "ui"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "dratchet-app",
  "dratchet-client",
  "dratchet-core",
+ "dratchet-server",
  "dratchet-store",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
+ "tempfile",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

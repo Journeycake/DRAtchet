@@ -14,6 +14,7 @@ pub mod identity;
 pub mod payload;
 pub mod prekey;
 pub mod ratchet;
+pub mod username;
 pub mod x3dh;
 
 pub use error::{Error, Result};

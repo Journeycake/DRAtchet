@@ -210,7 +210,8 @@ async fn main() {
         bob.signed_prekey_secret(),
         bob_otp_secret.as_ref(),
         &init.message,
-    );
+    )
+    .unwrap();
     let bob_ratchet = RatchetState::init_as_responder(
         conv_id,
         bob_root_key,
@@ -242,6 +243,12 @@ async fn main() {
         wipe_include_session: false,
         peer_wipe_include_session: None,
         wipe_request_pending: false,
+        wipe_boundary_timestamp: None,
+        wipe_boundary_sequence: None,
+        peer_wipe_boundary_timestamp: None,
+        peer_wipe_boundary_sequence: None,
+        routing_confirmed: false,
+        routing_announce: Vec::new(),
     };
     db_alice
         .save_contact(&alice_contact)
@@ -266,6 +273,12 @@ async fn main() {
         wipe_include_session: false,
         peer_wipe_include_session: None,
         wipe_request_pending: false,
+        wipe_boundary_timestamp: None,
+        wipe_boundary_sequence: None,
+        peer_wipe_boundary_timestamp: None,
+        peer_wipe_boundary_sequence: None,
+        routing_confirmed: false,
+        routing_announce: Vec::new(),
     };
     db_bob
         .save_contact(&bob_contact)

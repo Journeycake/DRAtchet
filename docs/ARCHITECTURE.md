@@ -159,7 +159,7 @@ Once the root key exists, per-message crypto is entirely symmetric:
 | One-time prekey | Single session handshake | Immediately after session establishment |
 | DH ratchet keypair | Until the peer's next reply | Replaced by next DH ratchet step |
 | Per-message symmetric key | Single message | Immediately after that message is encrypted/decrypted |
-| Remote pairing code (§6.4) | Single verification attempt, ~10 min TTL | On first successful match, or expiry — whichever first |
+| Remote pairing code (§6.4) | Up to `PAIRING_CODE_MAX_ATTEMPTS` (5) verification attempts, ~10 min TTL | On first successful match, on exhausting the attempt budget, or at expiry — whichever comes first |
 | Conversation recovery key (§7, only while the *effective* policy is A or B) | Life of the conversation's effective recovery policy | Automatically, the moment the effective policy reaches Profile C (§7.2/7.3) — individual stored entries are also auto-purged at that point, not just the key |
 
 **"Discarded" means zeroized in memory, not just dropped from scope**
@@ -168,6 +168,53 @@ keys are wrapped in `zeroize::Zeroizing`, and DH secrets (`StaticSecret`,
 `SharedSecret`) zeroize themselves via x25519-dalek's `"zeroize"` feature —
 both overwrite their storage on drop rather than leaving key material
 sitting in freed memory for a debugger or core dump to find.
+
+That guarantee extends to the **serialization boundary**, which is where
+all of this material exists in the clear at once (DRA-0047,
+`docs/DELIVERY_FAILURE_FINDINGS.md`). `Account::export`,
+`RatchetState::export` and the store's decrypt path
+(`store::db::get_encrypted`) all hand back `Zeroizing<Vec<u8>>`, not a
+bare `Vec<u8>` — so the plaintext copy made on every save and every load
+is wiped when the caller drops it, rather than being freed intact. Until
+DRA-0047 it was not: the promise above held for the live structs and was
+silently lost the moment they were persisted, which happens on every
+message.
+
+**Replenishment.** A published bundle's one-time prekeys (`PublishBundle`,
+`ONE_TIME_PREKEY_BATCH = 10`, `app/src/lib.rs`) are consumed one per
+`FetchBundle` and never replaced by the server on its own — a long-lived
+account that only ever registers once will eventually exhaust its pool,
+after which every subsequent X3DH handshake against it silently drops the
+one-time-prekey DH term, weakening that session's forward secrecy with
+nothing telling either side it happened. `FetchOwnPrekeyCount` (a small,
+authenticated, field-less query — deliberately carrying no target-identity
+parameter, so it can never become a new enumeration/timing oracle for
+*other* accounts' pool sizes, per §11.8) lets a client check its own
+remaining count; `dratchet_app::replenish_prekeys_if_low` polls it on a
+slow cadence (the Tauri client checks once a minute, §"Live networking" in
+`ui/src-tauri/src/lib.rs`) and, once the pool has drained to
+`PREKEY_REPLENISH_THRESHOLD = 3`, republishes a fresh full batch under the
+exact `username#NNNN` already on record — the same
+`publish_under_candidates` path `reconcile_own_profile` (§6.1) uses to
+reclaim a handle after a restart, reused here to top up instead. This
+costs nothing extra: `server/src/ws.rs`'s `publish_bundle` never requires
+proof-of-work for a rotation/republish of an already-owned identity, only
+for a brand-new registration, so periodic replenishment is free to call
+often.
+
+**Local cleanup on republish.** Because a directory's `publish_bundle`
+replaces the previously-published one-time-prekey batch wholesale rather
+than merging into it, every id from a superseded batch becomes permanently
+unreachable — no future `FetchBundle` will ever name it again. Early
+versions of `generate_one_time_prekeys` (`core/src/account.rs`) didn't
+account for this: it only ever inserted, so those now-unreachable secrets
+stayed in `Account.one_time_prekeys` forever, growing by a full batch on
+every replenish cycle with nothing to evict them — unlike the ratchet's
+skipped-message-key cache (below), which has an explicit bound. Fixed:
+`generate_one_time_prekeys` now clears the map before inserting the new
+batch, matching the directory's own replace-not-merge semantics; covered
+by `core/src/account.rs`'s `republishing_drops_the_old_batchs_now_unreachable_secrets`
+and `many_replenish_cycles_never_grow_storage_past_one_batch` tests.
 
 ### 3.5 Message wire format: why a minimal custom format, not a general-purpose one
 
@@ -442,7 +489,7 @@ requires relay-side coordination beyond the TTL):
 | Local outbox retention | 500 messages/conversation **or** 30 days, whichever hits first | Oldest-pruned-first; pruning surfaces a visible "couldn't be delivered" notice rather than failing silently |
 | Retry trigger for a stalled outbox | Event-driven on a presence transition to online, plus a 5-minute periodic sweep while foregrounded | Avoids polling the relay/peer on a tight loop while still self-healing if a presence event was missed |
 
-### 4.6 Delivery acknowledgment
+### 4.6 Delivery acknowledgment — **v1, implemented**
 
 A message being *sent* isn't the same as it being *delivered* — the sender
 needs to know when to stop retrying (§4.5's `LocalOutbox`/`QueuedRemote`
@@ -454,7 +501,10 @@ schema message, `DeliveryAck` (§7 of `MESSAGE_SCHEMA.md`), closes this loop:
   never gets falsely acked.
 - Routed back exactly like a normal message would be: over an open Tier 0
   DataChannel if one exists, otherwise written to a Tier 1 mailbox the same
-  way — `DeliveryAck` gets no special-cased transport.
+  way — `DeliveryAck` gets no special-cased transport. (Tier 0 direct
+  delivery itself isn't implemented yet — only the Tier 1 mailbox path is
+  real code today — so in practice every `DeliveryAck` currently travels
+  the mailbox.)
 - On receipt, the sender prunes the corresponding entry from its local
   outbox/retry queue (§4.5) and the UI can show a delivered indicator.
 - **This is deliberately *delivery*, not *read*.** Whether the human on the
@@ -465,6 +515,93 @@ schema message, `DeliveryAck` (§7 of `MESSAGE_SCHEMA.md`), closes this loop:
   only; a `ReadReceipt` message would follow the identical pattern but
   should default to **off**, user-toggleable per conversation, tracked as
   an open decision in §10 rather than shipped as an unconditional default.
+
+**Implementation notes (`dratchet_app::receive_pending`, `store::messages::Message`):**
+
+- The ack is sent *after* the just-decrypted entry's `MailboxDelete` has
+  already succeeded, not immediately on decrypt — sending it earlier and
+  having that round trip itself fail would abort the whole batch before
+  the delete ran, and a still-undeleted entry gets refetched and
+  reprocessed next time, decrypting fine again (the ratchet's on-disk
+  position hasn't advanced past it either) but re-saved as a second,
+  duplicate `Message` record. Acking only after the delete has already
+  committed means a lost ack costs nothing worse than the sender's
+  delivered-indicator for that one message — never a duplicate. Found and
+  fixed during this feature's own real, no-mocks testing; see
+  `docs/DELIVERY_FAILURE_FINDINGS.md`.
+- `DeliveryAck` matches back to a locally-sent `Message` via `Message::send_n`
+  and `Message::send_dh_pub`. `n` alone is only unique *within one sending
+  chain* (every Double Ratchet DH step resets a new chain's `n` back to 0,
+  and `n = 0` colliding is the common case, not a rare one) — the first
+  implementation matched on `n` alone and documented that as a real,
+  open limitation (`docs/DELIVERY_FAILURE_FINDINGS.md` finding #28).
+  **Fixed**: `DeliveryAck` now also carries `dh_pub`
+  (`MESSAGE_SCHEMA.md` §7), and `Db::mark_message_delivered` matches
+  `(dh_pub, n)` exactly — the same pair `RatchetState`'s own
+  skipped-message-key cache already keys by, so no heuristic or tie-break
+  is needed anymore.
+- Building this feature also surfaced and fixed a more fundamental,
+  previously-undiscovered gap in §11.1's bidirectional mailbox model
+  itself — a sender could self-consume (and silently destroy) its own
+  not-yet-collected message. See §11.1's own note and
+  `docs/DELIVERY_FAILURE_FINDINGS.md` finding #27.
+
+#### 4.6a "Uncertain" delivery and the piggyback ack — **v1, implemented**
+
+`DeliveryAck` alone has a real gap, found and precisely quantified during
+this feature's own controlled server-crash fault-injection testing: a
+message can be genuinely decrypted by the recipient, but the crash window
+between "decrypted" and "`DeliveryAck` sent" (or the ack itself being lost
+in transit, or the relay's in-memory-only mailbox — §11.1 — losing it
+before the sender ever fetches it) leaves the sender's copy permanently
+reading as undelivered, with no way to tell "genuinely lost" apart from
+"still in flight." Two additions close this, modeled on TCP's cumulative
+ack behavior rather than adding a second round trip:
+
+- **`uncertain` (`store::messages::Message::uncertain`)**: set on every
+  outstanding (not yet `delivered`) sent message the moment the client
+  detects a connection interruption — `mark_pending_sends_uncertain`,
+  called from the Tauri poll loop's reconnect-succeeded path, the same
+  moment a client already knows something disrupted its session. This is a
+  local, sender-side signal only (nothing is sent over the wire to set it)
+  — it means "this message's fate is presently unknown," distinct in the
+  UI from the existing sent/delivered checkmarks.
+- **Piggyback ack (`core::payload::ChatContent::piggyback_ack`,
+  `MESSAGE_SCHEMA.md` §7a)**: every ordinary outgoing chat message now
+  optionally carries a *cumulative* ack — "I have decrypted everything up
+  through `n = highest_n` on your current sending chain" — computed from
+  `RatchetState::receiving_progress()` and riding inside the same encrypted
+  envelope as the chat text, not a separate message. Because it's
+  cumulative, a client doesn't need to remember which individual
+  `DeliveryAck`s it already sent or whether they arrived; any later message
+  on the conversation resolves every earlier uncertain send in one shot.
+  `Db::mark_messages_delivered_up_to` applies it, setting `delivered = true`
+  and clearing `uncertain` on every matching message.
+
+The two ack paths are supplementary, not a replacement of one by the
+other: `DeliveryAck` gives the fastest per-message confirmation in the
+common case; the piggyback ack is the backstop that resolves an `uncertain`
+message via ordinary continued conversation even when its dedicated ack
+never arrived. A conversation that goes permanently quiet after an
+`uncertain` send still has no way to resolve it — this is an accepted,
+documented limitation of a design that deliberately avoids adding
+keepalive/heartbeat traffic; it's the same class of gap §4.5's outbox
+retention already documents ("permanently undelivered … a chronically
+flaky connection, or a recipient who never comes back").
+
+**A false-positive-delivery bug in the first cut, found and fixed via this
+feature's own live two-instance UI testing:** the cumulative `highest_n`
+must mean "every message `0..=highest_n` was actually decrypted," not
+merely "the receive chain's position has passed `highest_n`" — those two
+diverge exactly when a message is skipped (out-of-order arrival, or
+genuinely lost, which `docs/DELIVERY_FAILURE_FINDINGS.md`'s server-crash
+testing already established as real). The first implementation conflated
+them, so a permanently-lost message could flip to `delivered: true` on the
+sender's side purely because a *later* message on the same chain was
+piggyback-acked — a real message the recipient never received, silently
+shown as confirmed. Fixed at the source
+(`RatchetState::content_delivered_contiguous`, `MESSAGE_SCHEMA.md` §7a's
+implementation note) rather than papered over above it.
 
 ## 5. Client / platform architecture
 
@@ -1218,12 +1355,20 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
    exists. Bug fixes and hardening within what's already shipped
    (correctness fixes, test coverage, documentation) are not blocked by
    this freeze — only new v2-roadmap work is.
+   **v1.5 — relay operator features** (decided Oct 2026; the v1 freeze
+   above still holds for everything else): optional relay mail
+   persistence — encrypted, fragmented, off by default except on hosts
+   under 2 GB of usable RAM, configured in `dratchet.cfg`, with Server
+   Epochs telling senders when queued mail may have been lost (see
+   `docs/adr/0001-relay-mail-persistence-is-optional.md`); then changing
+   the operator key on a live server, limits on mail held for
+   long-absent recipients, and Fragment storage off the relay host.
 3. **v2**: multi-device support (full roadmap, including the per-device
    identity model and how recovery profiles stay consistent across a
    user's own devices, in §14), group chat (MLS/RFC 9420 — full roadmap,
    including why a coordinating server becomes mandatory and how recovery
    extends to N members, in §13), SimpleX-style two-hop private message
-   routing (§11.2), prekey bundle auto-replenishment, push notifications,
+   routing (§11.2), push notifications,
    optional managed/server-escrowed passphrase-protected recovery option
    (§7 option b, §4.3), post-quantum hardening — hybrid handshake now,
    extended to the ratchet itself once that ships (§11.4), a coercion-
@@ -1363,6 +1508,25 @@ contact makes somewhere (Signal's own initial-session establishment is
 addressed by a stable identifier too, before sealed-sender-style opaque
 routing takes over); DRAtchet's version is scoped to exactly the one
 message that needs it.
+
+**A third gap, found while building `DeliveryAck` (§4.6), fixed in the
+same pass:** the final adopted fix below makes `mailbox_id` *bidirectional*
+— the identical address for both directions of a pairing — and the
+server-side implementation (`server/src/ws.rs`) originally handed a
+`MailboxFetch` caller back *every* entry in that mailbox, including its
+own not-yet-collected writes. Decrypting a self-authored envelope with the
+*receiving* side of the ratchet fails the AEAD check, gets classified as a
+per-entry content error, and — worse — still gets deleted as "processed,"
+silently destroying a message before its real recipient ever saw it. This
+was a latent risk for ordinary chat from the start (masked only by every
+existing test's choreography never having the sender poll between sending
+and the recipient's fetch); `DeliveryAck`'s ack-back-over-the-same-mailbox
+pattern turns it from a rare edge case into the common one, since it's
+common for a sender to poll again shortly after sending. **Fixed**: the
+server now tracks each `MailboxEntry`'s authenticated writer
+(`MailboxEntry::written_by`) and `MailboxFetch` excludes entries the
+fetcher itself wrote. See `docs/DELIVERY_FAILURE_FINDINGS.md` finding #27
+for the full writeup and remediation options considered.
 
 **Correction, found immediately after writing the above while implementing
 the first reference client — the "adopted fix" two paragraphs up is not
@@ -1710,6 +1874,17 @@ migrate).
   covered: a visible button is adequate for "I want to clear my own device"
   but not for the in-person-coercion threat model the decoy-passphrase form
   specifically addresses.
+- **Crash/seizure-mid-wipe ordering, fixed as `docs/DELIVERY_FAILURE_FINDINGS.md`
+  finding #34**: both tiers now do the actual crypto-shred — rotating the
+  content DEK (quick wipe) or destroying the salt and every wrapped DEK
+  (full wipe) — as one atomic first step, before the bulk record-deletion
+  loop that follows it, which is now just best-effort space reclamation.
+  The original ordering did this in the opposite order, so a device
+  seized or killed mid-wipe could leave some content still fully
+  decryptable under a key the wipe hadn't gotten around to destroying yet
+  — the exact failure this feature exists to prevent. Proven against a
+  real `SIGKILL`, not just reasoned about, in
+  `store/tests/duress_wipe_crash_consistency.rs`.
 
 ### 11.9a Per-conversation wipe ("delete for everyone") — **v1 — implemented**
 
@@ -1749,6 +1924,84 @@ conversation too, over a new pair of ratchet-encrypted protocol messages
 - **No delivery receipt**: the requester can't tell whether the peer
   complied, declined, or hasn't seen the request yet — the same fire-and-
   forget limitation every mailbox message already has.
+
+**A real desync found and fixed testing a genuinely single-sided wipe
+(`docs/DELIVERY_FAILURE_FINDINGS.md` finding #30):** the request used to
+carry no policy data of its own, relying entirely on a prior, separately-
+landed `ConversationWipePolicyAnnounce` for the recipient to know the
+requester's `include_session` preference — skip or race that announcement
+and the two sides' ratchets could silently and permanently diverge, one
+destroyed, one not, with the surviving side's next ordinary message coming
+back as a hard, unrecoverable error on the other. Fixed by having the
+request carry the requester's own preference directly
+(`MESSAGE_SCHEMA.md` §10), so most-restrictive-wins applies correctly to
+that one wipe without depending on announce-then-wait ordering at all.
+
+**Boundary-scoped wipe on the peer's side — v1.1 — implemented:** the
+behavior above (every message, unconditionally, on both sides) was the
+original v1 shape. It has an asymmetric follow-up: the *requester's own*
+device still gets the same full, unconditional local wipe described
+above — that's their own device, their own call — but a wipe request now
+only removes messages on the *peer's* side from at-or-after the moment
+the peer locally processed the requester's last `ConversationWipePolicyAnnounce`
+for that conversation. Concretely: Bob and Alice message under "no remote
+wipe," Bob changes his policy and announces it, they keep messaging, Bob
+wipes — Bob's own chat goes to zero; Alice keeps everything from before
+she processed Bob's announcement and loses everything from after, with no
+special-casing for when the wipe request itself happens to arrive.
+
+- **The boundary is derived locally, on each side, from events already
+  processed — nothing new travels on the wire.** Two independent
+  `(timestamp, sequence)` stamps (`MESSAGE_SCHEMA.md` §10's own
+  `(m.timestamp, m.sequence)` tie-break pair, reused rather than
+  reinvented): the side that *receives* an announcement stamps its own
+  local position the moment it finishes processing it
+  (`peer_wipe_boundary_timestamp`/`_sequence` on `store::Contact`) — this
+  is what later gates that side's own compliance with a wipe request from
+  that peer; the side that *sends* an announcement stamps its own
+  position the moment the send is acked (`wipe_boundary_timestamp`/
+  `_sequence`) — used only locally, to preview how much of its own
+  history the peer likely still has.
+- **`preview_conversation_wipe`, called before the request is ever
+  sent**: read-only, no network access, returns `will_remove_locally`
+  (always everything — the local wipe is unconditional) and
+  `peer_likely_keeps` (messages saved before this side's own last-acked
+  announce to that peer). The UI's "clear conversation" confirm step
+  shows this inline once armed, before the user commits — Bob sees, in
+  advance, how many messages will likely remain on Alice's device.
+- **An estimate, never a guarantee** — the same "no delivery receipt"
+  limitation the rest of this section already documents applies here too:
+  this side only knows its announce was *sent*, not that the peer
+  actually received and processed it before the wipe fires.
+- **Purely additive — a conversation where neither side has ever
+  announced a wipe policy keeps the original v1 behavior unchanged on
+  both sides**: with no boundary ever recorded, a wipe request has nothing
+  to scope against and falls back to the full, unconditional wipe
+  documented above. Both boundary fields are `Option`, `None` until the
+  first announce is sent or processed.
+- **A peer who never actually received the announcement** (lost in
+  transit, offline the whole time) never got a boundary stamped either —
+  their `peer_wipe_boundary_timestamp` stays `None`, so a wipe request
+  from that requester still falls back to the old, unscoped full wipe on
+  their side. Accepted as an inherent consequence of the boundary being
+  local and receipt-triggered rather than a guaranteed cross-device
+  handshake, not treated as a bug to work around.
+
+**Three real gaps found and fixed auditing this feature past its initial
+5-conversation acceptance pass** — a peer who *does* receive the
+announcement, but in the same poll as the wipe request itself; a crash
+mid-wipe; and a same-second restart — `docs/DELIVERY_FAILURE_FINDINGS.md`
+findings #31–33 have the full detail. In short: `apply_entry` now
+reloads the peer's `Contact` fresh before deciding on an incoming wipe
+request rather than trusting the snapshot `receive_pending` captured
+before that batch started (closing both a boundary-bypass and an
+ask-before-delete bypass at once); `wipe_conversation`/
+`wipe_conversation_since` now remove every in-scope key in one atomic
+`redb` transaction instead of one per message, so a crash can only ever
+land before or after the whole wipe, never partway through; and
+`Db::open` now recovers `message_sequence`'s true prior value from disk
+instead of naively resetting it to `0`, closing a same-second-restart
+tie-break bug the boundary feature's own comparison depends on.
 
 ## 12. Deployment models: pure peer-to-peer vs. server-based
 

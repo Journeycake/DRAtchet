@@ -69,6 +69,48 @@ pub struct Contact {
     /// local confirmation (`dratchet_app::confirm_pending_wipe`/
     /// `decline_pending_wipe`).
     pub wipe_request_pending: bool,
+    /// This side's own local "wipe boundary" — the `(timestamp, sequence)`
+    /// this side had reached (`crate::messages`' own tie-break pair) the
+    /// moment it last successfully *sent* a `ConversationWipePolicyAnnounce`
+    /// to this contact (`dratchet_app::announce_wipe_policy`). Used only
+    /// locally, to estimate — never guarantee, since no mailbox message
+    /// ever gets a delivery receipt — how much of this side's own history
+    /// likely still survives on the peer's device before a wipe request is
+    /// sent (`dratchet_app::preview_conversation_wipe`). `#[serde(default)]`
+    /// so an already-persisted `Contact` predating this field decodes as
+    /// `None` (no boundary ever recorded) rather than failing to decode.
+    #[serde(default)]
+    pub wipe_boundary_timestamp: Option<u64>,
+    #[serde(default)]
+    pub wipe_boundary_sequence: Option<u64>,
+    /// The mirror image, this side's record of the *peer's* boundary:
+    /// the `(timestamp, sequence)` this side had reached the moment it
+    /// *processed* an incoming `ConversationWipePolicyAnnounce` from this
+    /// peer (`Db::record_peer_wipe_policy`). `None` until the first such
+    /// announcement arrives. This is what actually gates this side's own
+    /// compliance with an incoming wipe request from this peer
+    /// (`Db::wipe_conversation_since`) — everything already stored before
+    /// this moment is protected; everything saved from this moment
+    /// forward is in scope. A fresh announcement overwrites it — last one
+    /// wins, no history kept.
+    #[serde(default)]
+    pub peer_wipe_boundary_timestamp: Option<u64>,
+    #[serde(default)]
+    pub peer_wipe_boundary_sequence: Option<u64>,
+    /// DRA-0066: something from the peer has been decrypted off the
+    /// routing-id mailbox, which proves the peer switched to it too. Until
+    /// then, this side can't know whether its own `RoutingIdAnnounce`
+    /// arrived (a server restart or the mailbox lifetime can lose it), so
+    /// `dratchet_app` re-sends it alongside each chat message.
+    #[serde(default)]
+    pub routing_confirmed: bool,
+    /// DRA-0066: the encrypted `RoutingIdAnnounce` envelope as first sent,
+    /// so it can be re-sent byte for byte. Re-encrypting it would use a
+    /// fresh chain position the peer may never receive, leaving a gap
+    /// that stops cumulative piggyback acks for the rest of that chain.
+    /// Empty for contacts paired before this was recorded.
+    #[serde(default, with = "serde_bytes")]
+    pub routing_announce: Vec<u8>,
 }
 
 fn contact_key(fingerprint: &[u8]) -> String {
@@ -96,16 +138,42 @@ impl Db {
         self.delete(&contact_key(fingerprint))
     }
 
+    /// DRA-0051 (`docs/DELIVERY_FAILURE_FINDINGS.md`): a record that
+    /// cannot be read is *skipped*, not fatal -- the same fix DRA-0048
+    /// applied to `messages::list_messages`, for the same reason. This
+    /// used to `collect::<Result<Vec<_>>>()` through `?`, so one
+    /// unreadable contact took the whole list with it. Losing one
+    /// damaged contact is strictly better than losing all of them, and
+    /// an attacker able to write the file could have deleted that record
+    /// outright anyway. The skip is counted and logged (never with
+    /// content) so genuine corruption stays visible.
     pub fn list_contacts(&self) -> Result<Vec<Contact>> {
-        self.keys_with_prefix(CONTACT_KEY_PREFIX)?
-            .into_iter()
-            .map(|key| {
-                let bytes = self
-                    .get_encrypted(Scope::Contacts, &key)?
-                    .ok_or(Error::MalformedRecord("contact key listed but not found"))?;
-                decode_contact(&bytes)
-            })
-            .collect()
+        Ok(self.list_contacts_counting_unreadable()?.0)
+    }
+
+    /// [`list_contacts`](Self::list_contacts), plus how many records were
+    /// skipped as unreadable (DRA-0054), so the app can tell the user
+    /// rather than only logging it.
+    pub fn list_contacts_counting_unreadable(&self) -> Result<(Vec<Contact>, usize)> {
+        let mut contacts = Vec::new();
+        let mut unreadable = 0usize;
+        for key in self.keys_with_prefix(CONTACT_KEY_PREFIX)? {
+            match self.get_encrypted(Scope::Contacts, &key) {
+                Ok(Some(bytes)) => match decode_contact(&bytes) {
+                    Ok(contact) => contacts.push(contact),
+                    Err(_) => unreadable += 1,
+                },
+                Ok(None) | Err(_) => unreadable += 1,
+            }
+        }
+        if unreadable > 0 {
+            tracing::warn!(
+                unreadable,
+                "skipped unreadable contact records while listing contacts — possible \
+                 tampering or corruption of the local database",
+            );
+        }
+        Ok((contacts, unreadable))
     }
 }
 
@@ -139,7 +207,67 @@ mod tests {
             wipe_include_session: false,
             peer_wipe_include_session: None,
             wipe_request_pending: false,
+            wipe_boundary_timestamp: None,
+            wipe_boundary_sequence: None,
+            peer_wipe_boundary_timestamp: None,
+            peer_wipe_boundary_sequence: None,
+            routing_confirmed: false,
+            routing_announce: Vec::new(),
         }
+    }
+
+    /// Penetration-test finding DRA-0051: same shape as DRA-0048
+    /// (`docs/DELIVERY_FAILURE_FINDINGS.md`), for the contact list rather
+    /// than a conversation's messages.
+    ///
+    /// `list_contacts` decoded every record with `?` inside a
+    /// `.collect::<Result<Vec<_>>>()`, so one record that failed to
+    /// decrypt short-circuited the whole collection -- losing every
+    /// other saved contact along with the damaged one. Since DRA-0041
+    /// bound each record's own key as AEAD associated data, a relocated
+    /// or rolled-back record fails its AEAD check outright rather than
+    /// decrypting into the wrong place, so planting one junk contact
+    /// record denies the owner their entire contact list -- every
+    /// conversation, every verification state -- needing no key and no
+    /// plaintext, just write access to the `.redb` file.
+    #[test]
+    fn one_unreadable_contact_does_not_deny_the_whole_contact_list() {
+        let db = temp_db();
+
+        let keep_one = sample_contact(1);
+        let planted = sample_contact(2);
+        let keep_two = sample_contact(3);
+        db.save_contact(&keep_one).unwrap();
+        db.save_contact(&planted).unwrap();
+        db.save_contact(&keep_two).unwrap();
+        assert_eq!(db.list_contacts().unwrap().len(), 3);
+
+        // An attacker with the database file overwrites one contact
+        // record's bytes with something that cannot decrypt. No key, no
+        // plaintext, no ability to read anything -- just a write.
+        let victim_key = contact_key(&planted.fingerprint);
+        {
+            let write_txn = db.database.begin_write().unwrap();
+            {
+                let mut table = write_txn.open_table(crate::db::RECORDS).unwrap();
+                table.insert(victim_key.as_str(), &b"garbage"[..]).unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+
+        let surviving = db.list_contacts().expect(
+            "VULNERABILITY: a single unreadable contact record makes the entire contact list \
+             unreadable -- anyone able to write one junk record into the database file can deny \
+             the owner access to every saved contact without decrypting any of them",
+        );
+
+        let mut fingerprints: Vec<u8> = surviving.iter().map(|c| c.fingerprint[0]).collect();
+        fingerprints.sort();
+        assert_eq!(
+            fingerprints,
+            vec![1, 3],
+            "every still-readable contact must survive; only the damaged one is lost"
+        );
     }
 
     #[test]
@@ -198,5 +326,40 @@ mod tests {
         db.save_contact(&contact).unwrap();
         db.delete_contact(&contact.fingerprint).unwrap();
         assert!(db.load_contact(&contact.fingerprint).unwrap().is_none());
+    }
+
+    /// DRA-0054: the DRA-0051 counterpart -- a skipped contact record
+    /// must be reported to the caller, not only logged, and a healthy
+    /// contact list must report zero.
+    #[test]
+    fn an_unreadable_contact_record_is_counted_for_the_caller() {
+        let db = temp_db();
+        let keep = sample_contact(1);
+        let planted = sample_contact(2);
+        db.save_contact(&keep).unwrap();
+        db.save_contact(&planted).unwrap();
+        assert_eq!(
+            db.list_contacts_counting_unreadable().unwrap().1,
+            0,
+            "a healthy contact list must report no unreadable records"
+        );
+
+        let victim_key = contact_key(&planted.fingerprint);
+        {
+            let write_txn = db.database.begin_write().unwrap();
+            {
+                let mut table = write_txn.open_table(crate::db::RECORDS).unwrap();
+                table.insert(victim_key.as_str(), &b"garbage"[..]).unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+
+        let (contacts, unreadable) = db.list_contacts_counting_unreadable().unwrap();
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(
+            unreadable, 1,
+            "VULNERABILITY: a damaged or tampered contact record vanishes from the list without \
+             the caller ever learning of it -- a whole conversation silently disappears"
+        );
     }
 }

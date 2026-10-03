@@ -44,6 +44,20 @@ impl TestClient {
         TestClient { ws }
     }
 
+    /// Wrap an already-connected stream, for a test that needs to inspect
+    /// the connect result itself first.
+    #[allow(dead_code)]
+    pub fn from_stream(ws: WsStream) -> Self {
+        TestClient { ws }
+    }
+
+    /// Close the connection cleanly (a WebSocket Close frame), so the
+    /// server sees the disconnect promptly.
+    #[allow(dead_code)]
+    pub async fn close(mut self) {
+        let _ = self.ws.close(None).await;
+    }
+
     pub async fn send<T: Serialize>(&mut self, tag: FrameTag, body: &T) {
         let frame = encode(tag, body);
         self.ws
@@ -76,10 +90,30 @@ impl TestClient {
         }
     }
 
+    /// If the server answered with an `Error` frame where the test
+    /// expected some other type, the panic names the server's actual
+    /// reason instead of a generic decode failure -- the same masking
+    /// DRA-0052 fixed in `client::net::Connection::recv`, which this
+    /// harness copied. A test that asks for `ErrorFrame` itself still
+    /// decodes it normally.
     pub async fn recv<T: DeserializeOwned>(&mut self) -> (FrameTag, T) {
         let raw = self.recv_raw().await;
         let (tag, body) = split_tag(&raw).expect("valid frame from the server");
-        let parsed: T = decode_body(body).expect("server frame decodes as expected type");
+        let parsed: T = match decode_body(body) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                if tag == FrameTag::Error {
+                    if let Ok(err) = decode_body::<ErrorFrame>(body) {
+                        panic!(
+                            "expected a {} frame, but the server refused the request: {}",
+                            std::any::type_name::<T>(),
+                            err.message
+                        );
+                    }
+                }
+                panic!("server frame decodes as expected type: {e}");
+            }
+        };
         (tag, parsed)
     }
 
@@ -93,7 +127,10 @@ impl TestClient {
     pub async fn authenticate(&mut self, account: &Account) {
         let (tag, challenge): (_, AuthChallenge) = self.recv().await;
         assert_eq!(tag, FrameTag::AuthChallenge);
-        let signature = account.identity.sign(&challenge.nonce).unwrap();
+        let signature = account
+            .identity
+            .sign_auth_challenge(&challenge.nonce)
+            .unwrap();
         let identity_key = account.identity.export_public_key().unwrap();
         self.send(
             FrameTag::AuthResponse,
@@ -113,6 +150,17 @@ impl TestClient {
     #[allow(dead_code)]
     pub async fn skip_challenge(&mut self) {
         let _: (_, AuthChallenge) = self.recv().await;
+    }
+
+    /// Like `recv_raw`, but returns `None` instead of panicking when the
+    /// connection closes or errors — for tests (DRA-0030) that specifically
+    /// want to observe transport-level rejection (e.g. a message exceeding
+    /// the server's configured size ceiling) rather than treating a closed
+    /// connection as a test failure. Unused by every other test binary —
+    /// see `send_raw`'s doc above for why that's expected.
+    #[allow(dead_code)]
+    pub async fn recv_frame_or_close(&mut self) -> Option<WsMessage> {
+        self.ws.next().await.and_then(|r| r.ok())
     }
 
     /// Like `recv`, but silently skips server-pushed frames that aren't a
@@ -144,7 +192,13 @@ impl TestClient {
 
 /// A real generated account plus its bundle already converted to the
 /// *published* wire form (`MESSAGE_SCHEMA.md` §1's batch shape) — the
-/// fixture every test starts from.
+/// fixture every test starts from. Unused by tests that only need bare
+/// `Account::generate()` accounts with no published directory entry
+/// (e.g. `single_conversation_mailbox_starvation.rs`) — see `send_raw`'s
+/// doc above for why that's expected: each test binary compiles this
+/// module separately, so it shows as unused dead code from that binary's
+/// point of view.
+#[allow(dead_code)]
 pub fn fresh_account_and_bundle(
     username: &str,
     discriminator: u16,

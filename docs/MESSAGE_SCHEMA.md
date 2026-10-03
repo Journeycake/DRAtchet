@@ -75,7 +75,9 @@ as a known gap in `ARCHITECTURE.md` §8 and as an open decision (header
 encryption) in `ARCHITECTURE.md` §10, rather than solved here.
 
 **Payload type:** the plaintext (before padding, inside what becomes
-`ciphertext`) starts with a 1-byte `payload_type` tag: `0 = chat message`,
+`ciphertext`) starts with a 1-byte `payload_type` tag: `0 = chat message`
+(content is CBOR-encoded `ChatContent` — §7a — not raw bytes, since Phase
+1.5's piggyback ack needs somewhere to ride alongside the text),
 `1 = DeliveryAck` (§7), `2 = RecoveryProfileAnnounce` (§8),
 `3 = RoutingIdAnnounce` (§7), `4 = ConversationWipePolicyAnnounce` (§10),
 `5 = ConversationWipeRequest` (§10), `6 = FirstContactContent` (§3 — the
@@ -248,14 +250,15 @@ as §6.
 | `MailboxDelete` (recipient → service, after successful decrypt) | `mailbox_id` | bytes (16) | |
 | | `entry_id` | bytes (16) | service-assigned on write, echoed back on fetch |
 | `DeliveryAck` (recipient → sender, routed like any other message) | `conversation_id` | bytes (16) | same derivation as §2 |
+| | `dh_pub` | bytes (32) | the acknowledged envelope's ratchet header `dh_pub` (§2) — which sending chain `acked_n` is a position within |
 | | `acked_n` | uint32 | the ratchet header's `n` (§2) being acknowledged |
 | `RoutingIdAnnounce` (either side → the other, routed like any other message) | `routing_id` | bytes (32) | this side's fresh, single-use routing id (`ARCHITECTURE.md` §11.1) — sent once, right after the session is established |
 
-`DeliveryAck`'s two fields (`conversation_id`, `acked_n`) are CBOR-encoded
-and become the *content* of a ratchet envelope's plaintext, tagged with
-`payload_type = 1` (§2) — it's carried as an ordinary ratchet message, not
-a separate wire format, and gets the same encryption, padding, and (for
-Tier 1) mailbox routing as a chat message. `RoutingIdAnnounce` is the same
+`DeliveryAck`'s fields (`conversation_id`, `dh_pub`, `acked_n`) are
+CBOR-encoded and become the *content* of a ratchet envelope's plaintext,
+tagged with `payload_type = 1` (§2) — it's carried as an ordinary ratchet
+message, not a separate wire format, and gets the same encryption,
+padding, and (for Tier 1) mailbox routing as a chat message. `RoutingIdAnnounce` is the same
 shape of thing, tagged `payload_type = 3` (§2) — sent over
 `bootstrap_mailbox_id` before either side has a routing-id-derived mailbox
 to use yet, and, like `DeliveryAck`, never gated by `ARCHITECTURE.md`
@@ -267,6 +270,92 @@ before or outside any given ratchet session, so they're plain CBOR over
 the WebSocket with no ratchet encryption of their own — the service has to
 be able to read routing metadata to do its job (§4.1/§4.2 of
 `ARCHITECTURE.md`), unlike message content.
+
+**Implementation note (`core::payload::DeliveryAck`, `dratchet_app`):**
+`acked_n` alone only disambiguates messages *within one sending chain* —
+every Double Ratchet DH step resets a new chain's `n` back to 0, and
+`n = 0` colliding across chains is the *common* case, not a rare one,
+since every fresh chain starts there. The original implementation shipped
+without `dh_pub` and matched acks by `n` alone (a real, documented gap —
+`docs/DELIVERY_FAILURE_FINDINGS.md` finding #28); `dh_pub` was added here
+specifically to close it — `(dh_pub, n)` together are a genuinely unique
+identifier for one message, the same pair `RatchetState`'s own
+skipped-message-key cache already keys by, so `Db::mark_message_delivered`
+now matches exactly rather than guessing.
+
+## 7a. Chat content and the piggyback delivery ack (CBOR)
+
+| Field | Type | Notes |
+|---|---|---|
+| `text` (`ChatContent`) | bytes | the actual message content — previously the entire `payload_type = 0` content; now wrapped, see below |
+| `piggyback_ack` (`ChatContent`) | optional `PiggybackAck` | present whenever the sender has received at least one message on the current chain from this conversation's peer (`RatchetState::receiving_progress`); absent otherwise (e.g. the very first message of a conversation, before anything has been received back) |
+| `dh_pub` (`PiggybackAck`) | bytes (32) | identifies which of the peer's sending chains `highest_n` is a position within — same reasoning as `DeliveryAck.dh_pub` above |
+| `highest_n` (`PiggybackAck`) | uint32 | cumulative: "I have successfully decrypted every message from `n = 0` through `n = highest_n`, inclusive, on this chain" — not a single message index |
+
+`payload_type = 0` (chat message, §2) is `ChatContent`, CBOR-encoded, not
+raw text — the wrapping this table describes. This is what lets a
+`piggyback_ack` ride inside the *same* encrypted envelope as an ordinary
+outgoing chat message, rather than as a second, separate envelope: every
+chat message a client sends doubles as a TCP-style cumulative ack of
+everything it has received so far, the same way a TCP segment's `ACK` field
+piggybacks on outgoing data instead of requiring a dedicated ack packet.
+
+**Why cumulative, and why in addition to `DeliveryAck` rather than instead
+of it:** `DeliveryAck` (§7) names one exact message and is sent once, right
+after that message is decrypted — if the sender's connection drops before
+that ack arrives (or the recipient crashes before sending it), the message
+silently reads as never delivered, even though it genuinely was received.
+`PiggybackAck` closes that gap without adding a new round trip: it costs
+nothing beyond what the recipient was already about to send (an ordinary
+reply), and being cumulative means it doesn't matter which specific
+`DeliveryAck`s were lost — any later message on the conversation resolves
+every earlier uncertain send on that chain in one shot, the same way a
+single TCP ack covering "next expected sequence" implicitly acknowledges
+every earlier byte. The two mechanisms are supplementary: `DeliveryAck`
+gives the fastest possible per-message confirmation when nothing is lost;
+`PiggybackAck` is the backstop that only matters when something was.
+
+**The "uncertain" delivery state (`dratchet_app`, `store::messages`):** a
+sent `Message` gains a `delivered: bool` (existing, set by either ack path)
+and a new `uncertain: bool`. `uncertain` is set when the client detects a
+connection interruption after a send but before that send's `delivered`
+flag has been confirmed either way (`mark_pending_sends_uncertain`, called
+from the Tauri poll loop's reconnect-succeeded path) — it is the UI-visible
+signal that a message's fate is presently unknown, distinct from "sent,
+awaiting the first ack" and from "confirmed delivered." It clears the
+moment `delivered` flips true via either `DeliveryAck` or a `PiggybackAck`
+covering that message's `(dh_pub, n)` (`Db::mark_messages_delivered_up_to`
+also clears `uncertain` on every message it marks delivered) — there is no
+separate manual dismissal, since resolution is exactly what both ack paths
+already exist to do.
+
+**Implementation note — a false-positive-delivery bug, found and fixed via
+this feature's own live UI testing (`core::ratchet::RatchetState`):**
+`receiving_progress()`'s first cut reported `recv_n - 1` — the ratchet's
+raw receive-chain position — as `highest_n`. That position advances past a
+*skipped* message (one whose key was cached for later because a
+later-numbered message arrived first, or, worse, one that's permanently
+lost and will never arrive) exactly the same way it advances past a
+genuinely-decrypted one; the two are indistinguishable from `recv_n`
+alone. A live two-instance test that killed the server between a
+recipient's real decrypt and their `DeliveryAck` reaching the sender (the
+exact scenario this feature exists to cover) caught the consequence
+directly: a message the recipient had *never actually received* — its
+envelope was gone before they could fetch it, only a later message's
+`n` was ever decrypted — still flipped to `delivered: true` on the
+sender's side, because the cumulative ack's `highest_n` had skipped past
+it. **Fixed**: `RatchetState` now tracks `content_delivered_contiguous`
+separately from `recv_n` — advanced only by a message whose content was
+*actually decrypted*, and only contiguously from `0`, exactly matching
+this table's own "every message from `n = 0` through `highest_n`,
+inclusive" contract that the code hadn't actually lived up to. A
+permanently-skipped message now correctly blocks `receiving_progress()`
+(and so every downstream `PiggybackAck`) from reporting *anything* past
+it on that chain — matching real TCP cumulative-ack semantics, where a
+gap can't be skipped either — until the next DH ratchet step starts a
+fresh chain. See `core/src/ratchet.rs`'s
+`receiving_progress_never_claims_a_permanently_skipped_message_as_delivered`
+test.
 
 ## 8. Recovery profile negotiation (CBOR) — §7.2/§7.3/§7.5 of `ARCHITECTURE.md`
 
@@ -328,11 +417,31 @@ a *general* remote-wipe capability was deliberately never built).
 the *content* of a ratchet envelope's plaintext, tagged with
 `payload_type = 4` (§2) — sent at session establishment and again any
 time the announcing side's preferences for that conversation change,
-exactly like `RecoveryProfileAnnounce` (§8). `ConversationWipeRequest`
-carries no fields at all — empty content, tagged `payload_type = 5` — the
-conversation is already identified by which ratchet/mailbox it arrived
-on. Both are ungated by `ARCHITECTURE.md` §6.5's mandatory-verification
-rule, like `RoutingIdAnnounce`: protocol machinery, not chat content.
+exactly like `RecoveryProfileAnnounce` (§8). Both are ungated by
+`ARCHITECTURE.md` §6.5's mandatory-verification rule, like
+`RoutingIdAnnounce`: protocol machinery, not chat content.
+
+`ConversationWipeRequest` (`core::payload::ConversationWipeRequestContent`,
+`payload_type = 5`) carries one field:
+
+| Field | Type | Notes |
+|---|---|---|
+| `include_session` | bool | the requester's own `include_session` preference for *this* wipe |
+
+**Implementation note — originally empty content, closed as finding #30
+(`docs/DELIVERY_FAILURE_FINDINGS.md`):** the request used to carry no
+fields at all, on the assumption that a prior `ConversationWipePolicyAnnounce`
+would always have already told the recipient everything needed. Real
+testing found that assumption breaks the moment a requester's preference
+is set locally without a separately-landed announcement (skipped, or
+racing the request) — the recipient's `effective_wipe_include_session()`
+has nothing to OR against but their own stale local state, silently
+wiping less than the requester did and leaving the two sides' ratchets
+desynced (one gone, one not, with no automatic recovery). Carrying the
+requester's own preference directly in the request closes the gap: the
+recipient now applies `own_preference OR requester's_preference` for this
+one wipe, matching §10's own documented most-restrictive-wins merge
+without depending on announce-then-wait ordering at all.
 
 **Two merge functions, computed independently and identically by both
 clients from (own preference, last-announced peer preference) — no
@@ -364,6 +473,71 @@ and `delete_contact` already provide today.
 the peer complied, declined, or hasn't seen the request yet — the same
 fire-and-forget limitation every mailbox message already has (no
 `ReadReceipt` exists either, per `ARCHITECTURE.md` §10's open decisions).
+
+**Boundary-scoped wipe on the peer's side (v1.1, `ARCHITECTURE.md` §11.9a's
+"Boundary-scoped wipe on the peer's side" note).** No new wire field:
+the boundary is a `(timestamp, sequence)` pair — the same tie-break shape
+`Db::list_messages` already sorts messages by — that each side derives
+*locally* from messages and announcements it has already processed, never
+transmitted. Two independent stamps, both `Option<u64>` pairs on
+`store::Contact`, `#[serde(default)]` so an already-persisted `Contact`
+from before this feature decodes as "no boundary ever recorded" rather
+than failing to decode:
+
+- `peer_wipe_boundary_timestamp`/`_sequence` — this side's own position
+  the moment it finished processing an incoming `ConversationWipePolicyAnnounce`
+  from that peer (`Db::record_peer_wipe_policy`). Gates this side's own
+  compliance with a future `ConversationWipeRequest` from that peer
+  (`Db::wipe_conversation_since`): every message stored before this
+  instant is protected; every message stored from this instant forward is
+  in scope. A fresh announcement always overwrites it — last one wins, no
+  history of prior boundaries kept.
+- `wipe_boundary_timestamp`/`_sequence` — the mirror image: this side's
+  own position the moment its *own* `ConversationWipePolicyAnnounce`
+  finished sending (acked by the server). Read only locally, by
+  `preview_conversation_wipe`, to estimate how much of this side's own
+  history the peer likely still has before this side sends a wipe
+  request — an estimate, not a guarantee, for the same no-delivery-receipt
+  reason as above.
+
+`sequence` breaks same-second ties the same way `Message::sequence`
+already does elsewhere in this schema (§7a). **Originally documented
+here as resetting to 0 on every `Db::create`/`open` "since a restart
+always advances the wall clock past whatever second it stopped at" — that
+claim was wrong, and closed as `docs/DELIVERY_FAILURE_FINDINGS.md`
+finding #33**: a restart landing in the same wall-clock second as
+messages saved just before it is a real scenario (a fast app relaunch,
+not just a contrived test), and a naive reset let a post-restart message
+get a `sequence` lower than a pre-restart boundary's own sequence
+component, wrongly comparing as "before" it. `Db::create` still starts
+this counter at `0` (nothing stored yet); `Db::open` now recovers its
+true prior value from whatever's already on disk instead.
+
+**No boundary ever recorded → the original v1 behavior, unchanged.** A
+conversation where neither side has ever called `announce_wipe_policy`
+has nothing to scope a wipe request against, so `wipe_conversation_since`
+is never reached — `Db::wipe_conversation` (full, unconditional) still
+runs, on both sides, exactly as documented above. Additive by
+construction: no existing wire format, merge function, or previously-
+observed behavior changed.
+
+**The requester's own local wipe is unaffected by any of this** — always
+the full, unconditional `Db::wipe_conversation`, on the requester's own
+device, regardless of whether they've ever announced anything. Only the
+*recipient's* side of an incoming wipe request is ever scoped.
+
+**Two more gaps found and fixed auditing this feature, beyond the "peer
+never received the announcement at all" limitation already noted
+above** (`docs/DELIVERY_FAILURE_FINDINGS.md` findings #31–32): a peer who
+*does* receive the announcement, but in the same mailbox poll as the wipe
+request itself, had the boundary silently ignored — `apply_entry` now
+reloads the `Contact` fresh from disk before deciding, rather than
+trusting the snapshot `receive_pending` captured before that batch
+started. And a crash mid-wipe could leave a conversation genuinely
+half-wiped — `wipe_conversation`/`wipe_conversation_since` now remove
+every in-scope key in one atomic transaction instead of one per message,
+so a crash can only land before or after the whole wipe, never partway
+through.
 
 ## 11. Profile announce (CBOR) — `ARCHITECTURE.md` §6.1
 
@@ -402,3 +576,26 @@ conversation that already exists.
 
 **No delivery receipt**, the same fire-and-forget limitation as every
 other control message in this document.
+
+## 12. Own prekey count query (CBOR) — `ARCHITECTURE.md` §3.4
+
+Not a ratchet-envelope payload — a plain request/response pair over the
+authenticated connection, following the same shape as `MailboxFetch` (§7)
+rather than anything routed through a mailbox.
+
+`FetchOwnPrekeyCount` (client → server): no fields at all. The target is
+always the caller's own authenticated identity; there is deliberately no
+way to name a different one, so this can never become a new enumeration/
+timing oracle for another account's prekey pool size (`ARCHITECTURE.md`
+§11.8).
+
+`OwnPrekeyCount` (server → client), in reply:
+
+| Field | Type | Notes |
+|---|---|---|
+| `remaining` | uint32 | how many one-time prekeys the directory still has stored for the caller's currently-published bundle; `0` if the caller has never published one |
+
+Used by `dratchet_app::replenish_prekeys_if_low`: once `remaining` has
+drained to a small threshold, the client republishes a full fresh batch
+under its existing `username#NNNN` — an ordinary `PublishBundle` (§1),
+nothing new on the write side.

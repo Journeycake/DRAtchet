@@ -54,6 +54,15 @@ config:
   # RUST_LOG-style filter for the tracing subscriber, e.g. "info" or
   # "dratchet_server=debug,info".
   logLevel: "info"
+  # Comma-separated CIDR ranges of the reverse proxy in front of dratchetd
+  # (DRA-0055). Leave empty unless `ingress.enabled: true`: with no proxy,
+  # per-address connection limits use the TCP peer address, which can't be
+  # spoofed. With the Ingress, set this to your ingress controller's pod
+  # range (e.g. "10.42.0.0/16" on a default k3s/RKE2 cluster), or every
+  # client is counted as the controller's single address. Never list a
+  # range clients can connect from directly: X-Forwarded-For from a trusted
+  # address is believed.
+  trustedProxies: ""
 
 resources:
   # A single WebSocket connection handler + a small in-memory HashMap-based

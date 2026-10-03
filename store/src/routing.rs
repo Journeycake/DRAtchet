@@ -52,6 +52,19 @@ impl Db {
         }
         Ok(contact)
     }
+
+    /// DRA-0066: record that the peer has been heard from on the
+    /// routing-id mailbox (see [`Contact::routing_confirmed`]). A no-op if
+    /// already recorded or the contact is gone.
+    pub fn mark_routing_confirmed(&self, fingerprint: &[u8]) -> Result<()> {
+        if let Some(mut contact) = self.load_contact(fingerprint)? {
+            if !contact.routing_confirmed {
+                contact.routing_confirmed = true;
+                self.save_contact(&contact)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -80,6 +93,12 @@ mod tests {
             wipe_include_session: false,
             peer_wipe_include_session: None,
             wipe_request_pending: false,
+            wipe_boundary_timestamp: None,
+            wipe_boundary_sequence: None,
+            peer_wipe_boundary_timestamp: None,
+            peer_wipe_boundary_sequence: None,
+            routing_confirmed: false,
+            routing_announce: Vec::new(),
         }
     }
 

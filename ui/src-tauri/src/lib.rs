@@ -22,21 +22,40 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use dratchet_app::{open_account, ProfileReconciliation};
+use dratchet_app::{open_account, replenish_prekeys_if_low, ProfileReconciliation};
 use dratchet_client::net::Connection;
 use dratchet_core::account::Account;
 use dratchet_store::{Contact, Db, VerificationState};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use tokio::sync::Mutex;
 
 const SERVER_URL: &str = "ws://127.0.0.1:8787/v1/ws";
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const INBOX_UPDATED_EVENT: &str = "dratchet://inbox-updated";
+const CONNECTION_STATUS_EVENT: &str = "dratchet://connection-status";
+// `replenish_prekeys_if_low` (`ARCHITECTURE.md` §3.4) is cheap but there's no
+// reason to query/republish every 2-second tick — once a minute is plenty
+// given the batch-of-10/threshold-of-3 sizing, so it only runs on every Nth
+// poll tick.
+const PREKEY_REPLENISH_CHECK_EVERY_N_TICKS: u32 = 30;
+// `poll_loop`'s reconnect backoff after a transport failure
+// (`docs/DELIVERY_FAILURE_FINDINGS.md` scenario 23): the first attempt is
+// prompt (next tick), and only repeated *reconnect* failures — not the
+// original disconnect — push the wait out further, capped so a genuinely
+// down server is retried every minute rather than abandoned.
+const RECONNECT_INITIAL_BACKOFF: Duration = POLL_INTERVAL;
+const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// DRA-0063: how often (in poll ticks) to check for sent messages that
+/// expired undelivered -- about once a minute; expiry is measured in days.
+const EXPIRY_CHECK_EVERY_N_TICKS: u32 = 30;
 
 struct AppState {
     db: Db,
     db_path: PathBuf,
+    /// Where `poll_loop` (re)connects -- `SERVER_URL` in the app; tests
+    /// point it at a real ephemeral server.
+    server_url: String,
     // Behind a `Mutex` (not just `db`/`db_path`) because
     // `register_own_profile`/`rename_own_profile`/the poll loop's
     // first-contact scan all need `&mut Account` — self-registration and
@@ -46,7 +65,11 @@ struct AppState {
     // since these calls hold it across real network `.await`s — same
     // reason `conn` already uses one.
     account: Arc<Mutex<Account>>,
-    conn: Arc<Mutex<Connection>>,
+    // DRA-0062: `None` until the first successful connection -- the app
+    // opens (history readable, messages queueable) even when the server
+    // is unreachable at launch, and `poll_loop` connects once it can.
+    // Only ever goes from `None` to `Some`, never back.
+    conn: Arc<Mutex<Option<Connection>>>,
     // Set once at startup if `reconcile_own_profile` finds this device's
     // stored discriminator was reassigned out from under it (only
     // realistically possible after the directory server lost its
@@ -59,6 +82,21 @@ struct AppState {
     // peer's `username#NNNN` genuinely changed; drained by the frontend
     // alongside every `INBOX_UPDATED_EVENT`.
     peer_profile_change_notices: StdMutex<Vec<PeerProfileChangeNoticeDto>>,
+    // Live connection health, updated by `poll_loop` as it detects a
+    // transport failure and later reconnects (`docs/DELIVERY_FAILURE_FINDINGS.md`
+    // scenario 23) — read once via `get_connection_status` and kept live
+    // after that via `CONNECTION_STATUS_EVENT`, so the UI has an honest
+    // signal instead of silence while a reconnect is in progress.
+    connection_status: StdMutex<ConnectionStatusDto>,
+}
+
+/// `poll_loop`'s live connection health, as the frontend sees it — see
+/// `AppState::connection_status`.
+#[derive(Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ConnectionStatusDto {
+    Connected,
+    Reconnecting,
 }
 
 /// A `Contact`, reshaped for the frontend: byte fields hex-encoded, a
@@ -88,6 +126,22 @@ struct MessageDto {
     sender_is_local: bool,
     content: String,
     timestamp: u64,
+    /// Only meaningful when `sender_is_local` — whether a `DeliveryAck`
+    /// has come back for this message yet (`ARCHITECTURE.md` §4.6). Always
+    /// `false` for a received message.
+    delivered: bool,
+    /// Only meaningful when `sender_is_local && !delivered` — this client
+    /// detected a connection interruption after sending this message and
+    /// before either acknowledgment path confirmed it, so there's genuine
+    /// reason to doubt whether it ever reached the relay
+    /// (`dratchet_store::Message::uncertain`'s doc). The frontend shows a
+    /// distinct indicator for this rather than the ordinary "sent,
+    /// awaiting ack" state.
+    uncertain: bool,
+    /// DRA-0060/0063/0064: set on one of this side's own messages that
+    /// should be offered a resend, and why: `"send_failed"`, `"expired"`
+    /// or `"server_restarted"`. `None` otherwise.
+    retry_reason: Option<&'static str>,
 }
 
 /// This device's own directory-facing profile (`dratchet_store::OwnProfile`),
@@ -114,6 +168,17 @@ fn to_own_profile_dto(profile: &dratchet_store::OwnProfile) -> OwnProfileDto {
 struct PairingCodeDto {
     code: String,
     expires_at: u64,
+}
+
+/// A preview of a not-yet-sent wipe request — how many messages this
+/// side's own history has (always fully removed locally) and how many of
+/// those the peer likely still keeps, given this side's last-acked wipe-
+/// policy announce (an estimate, never a guarantee — see
+/// `dratchet_app::preview_conversation_wipe`'s doc comment).
+#[derive(Serialize)]
+struct WipePreviewDto {
+    will_remove_locally: usize,
+    peer_likely_keeps: usize,
 }
 
 /// This device's own `username#NNNN` changed without the user asking —
@@ -152,12 +217,28 @@ fn to_contact_dto(contact: &Contact) -> ContactDto {
     }
 }
 
+/// DRA-0062: what every command reports while the app has not yet reached
+/// the server.
+const NOT_CONNECTED: &str = "not connected to the server yet -- retrying in the background";
+
+/// DRA-0062: the live connection, or [`NOT_CONNECTED`].
+fn connected(conn: &mut Option<Connection>) -> Result<&mut Connection, String> {
+    conn.as_mut().ok_or_else(|| NOT_CONNECTED.to_string())
+}
+
 fn to_message_dto(message: &dratchet_store::Message) -> MessageDto {
     MessageDto {
         id: hex::encode(&message.id),
         sender_is_local: message.sender_is_local,
         content: String::from_utf8_lossy(&message.content).into_owned(),
         timestamp: message.timestamp,
+        delivered: message.delivered,
+        uncertain: message.uncertain,
+        retry_reason: message.retry_reason.map(|r| match r {
+            dratchet_store::RetryReason::SendFailed => "send_failed",
+            dratchet_store::RetryReason::Expired => "expired",
+            dratchet_store::RetryReason::ServerRestarted => "server_restarted",
+        }),
     }
 }
 
@@ -176,18 +257,38 @@ mod hex {
     }
 }
 
+/// DRA-0054: `unreadable` is how many stored contact records were skipped
+/// because they could not be read (damage or tampering, DRA-0051). The
+/// frontend shows a notice when it is non-zero instead of the contact
+/// silently vanishing from the list.
+#[derive(Serialize)]
+struct ContactListDto {
+    contacts: Vec<ContactDto>,
+    unreadable: usize,
+}
+
+/// DRA-0054: the message-list counterpart of [`ContactListDto`] (DRA-0048).
+#[derive(Serialize)]
+struct MessageListDto {
+    messages: Vec<MessageDto>,
+    unreadable: usize,
+}
+
 #[tauri::command]
-fn list_contacts(state: State<AppState>) -> Result<Vec<ContactDto>, String> {
-    dratchet_app::list_contacts(&state.db)
-        .map(|contacts| contacts.iter().map(to_contact_dto).collect())
-        .map_err(|e| e.to_string())
+fn list_contacts(state: State<AppState>) -> Result<ContactListDto, String> {
+    let (contacts, unreadable) =
+        dratchet_app::list_contacts_counting_unreadable(&state.db).map_err(|e| e.to_string())?;
+    Ok(ContactListDto {
+        contacts: contacts.iter().map(to_contact_dto).collect(),
+        unreadable,
+    })
 }
 
 #[tauri::command]
 async fn list_messages(
     state: State<'_, AppState>,
     fingerprint: String,
-) -> Result<Vec<MessageDto>, String> {
+) -> Result<MessageListDto, String> {
     let fp = hex::decode(&fingerprint)?;
     let contact = state
         .db
@@ -195,9 +296,13 @@ async fn list_messages(
         .map_err(|e| e.to_string())?
         .ok_or("no such contact")?;
     let account = state.account.lock().await;
-    let messages =
-        dratchet_app::list_messages(&state.db, &account, &contact).map_err(|e| e.to_string())?;
-    Ok(messages.iter().map(to_message_dto).collect())
+    let (messages, unreadable) =
+        dratchet_app::list_messages_counting_unreadable(&state.db, &account, &contact)
+            .map_err(|e| e.to_string())?;
+    Ok(MessageListDto {
+        messages: messages.iter().map(to_message_dto).collect(),
+        unreadable,
+    })
 }
 
 #[tauri::command]
@@ -212,13 +317,62 @@ async fn send_message(
         .load_contact(&fp)
         .map_err(|e| e.to_string())?
         .ok_or("no such contact")?;
-    let mut conn = state.conn.lock().await;
+    let mut conn_guard = state.conn.lock().await;
     let account = state.account.lock().await;
-    let message =
-        dratchet_app::send_message(&state.db, &mut conn, &account, &contact, content.as_bytes())
-            .await
-            .map_err(|e| e.to_string())?;
-    Ok(to_message_dto(&message))
+    // DRA-0062: offline, the message is kept (flagged for retry) rather
+    // than refused, so nothing typed is lost while the server is away.
+    let Some(conn) = conn_guard.as_mut() else {
+        return dratchet_app::save_unsent_message(
+            &state.db,
+            &account,
+            &contact,
+            content.as_bytes(),
+        )
+        .map(|m| to_message_dto(&m))
+        .map_err(|e| e.to_string());
+    };
+    // DRA-0060: a send that failed after the message was saved comes back
+    // as that saved message, flagged for retry, not as an error -- the
+    // composer clears and the message shows in the conversation with a
+    // Retry button.
+    match dratchet_app::send_message(&state.db, conn, &account, &contact, content.as_bytes()).await
+    {
+        Ok(message) => Ok(to_message_dto(&message)),
+        Err(dratchet_app::Error::NotSent { message, cause }) => {
+            eprintln!("send_message: saved but not sent: {cause}");
+            Ok(to_message_dto(&message))
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// DRA-0060/0063/0064: resend one of this side's own messages flagged for
+/// retry, encrypted afresh (`dratchet_app::retry_message`). Returns the
+/// updated message -- still flagged if this attempt failed too.
+#[tauri::command]
+async fn retry_message(
+    state: State<'_, AppState>,
+    fingerprint: String,
+    message_id: String,
+) -> Result<MessageDto, String> {
+    let fp = hex::decode(&fingerprint)?;
+    let id = hex::decode(&message_id)?;
+    let contact = state
+        .db
+        .load_contact(&fp)
+        .map_err(|e| e.to_string())?
+        .ok_or("no such contact")?;
+    let mut conn_guard = state.conn.lock().await;
+    let conn = connected(&mut conn_guard)?;
+    let account = state.account.lock().await;
+    match dratchet_app::retry_message(&state.db, conn, &account, &contact, &id).await {
+        Ok(message) => Ok(to_message_dto(&message)),
+        Err(dratchet_app::Error::NotSent { message, cause }) => {
+            eprintln!("retry_message: still not sent: {cause}");
+            Ok(to_message_dto(&message))
+        }
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// `docs/ARCHITECTURE.md` §11.9a's per-conversation wipe policy: saves
@@ -236,11 +390,12 @@ async fn set_wipe_policy(
         .load_contact(&fp)
         .map_err(|e| e.to_string())?
         .ok_or("no such contact")?;
-    let mut conn = state.conn.lock().await;
+    let mut conn_guard = state.conn.lock().await;
+    let conn = connected(&mut conn_guard)?;
     let account = state.account.lock().await;
     dratchet_app::announce_wipe_policy(
         &state.db,
-        &mut conn,
+        conn,
         &account,
         &contact,
         ask_before_delete,
@@ -249,6 +404,29 @@ async fn set_wipe_policy(
     .await
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Read-only preview of what `request_conversation_wipe` would do right
+/// now — no network access, safe to call on every click of the "clear
+/// conversation" confirm step before the user commits.
+#[tauri::command]
+async fn preview_conversation_wipe(
+    state: State<'_, AppState>,
+    fingerprint: String,
+) -> Result<WipePreviewDto, String> {
+    let fp = hex::decode(&fingerprint)?;
+    let contact = state
+        .db
+        .load_contact(&fp)
+        .map_err(|e| e.to_string())?
+        .ok_or("no such contact")?;
+    let account = state.account.lock().await;
+    let preview = dratchet_app::preview_conversation_wipe(&state.db, &account, &contact)
+        .map_err(|e| e.to_string())?;
+    Ok(WipePreviewDto {
+        will_remove_locally: preview.will_remove_locally,
+        peer_likely_keeps: preview.peer_likely_keeps,
+    })
 }
 
 /// `docs/ARCHITECTURE.md` §11.9a's per-conversation wipe, the requesting
@@ -265,9 +443,10 @@ async fn request_conversation_wipe(
         .load_contact(&fp)
         .map_err(|e| e.to_string())?
         .ok_or("no such contact")?;
-    let mut conn = state.conn.lock().await;
+    let mut conn_guard = state.conn.lock().await;
+    let conn = connected(&mut conn_guard)?;
     let account = state.account.lock().await;
-    dratchet_app::request_conversation_wipe(&state.db, &mut conn, &account, &contact)
+    dratchet_app::request_conversation_wipe(&state.db, conn, &account, &contact)
         .await
         .map_err(|e| e.to_string())
 }
@@ -301,6 +480,17 @@ fn decline_pending_wipe(state: State<AppState>, fingerprint: String) -> Result<(
     Ok(())
 }
 
+/// This device's current live connection health — called once on
+/// startup so the UI has an accurate value before the first
+/// `CONNECTION_STATUS_EVENT` (which only fires on a *change*).
+#[tauri::command]
+fn get_connection_status(state: State<AppState>) -> ConnectionStatusDto {
+    *state
+        .connection_status
+        .lock()
+        .expect("connection_status mutex poisoned")
+}
+
 /// This device's own registered profile, if self-registration
 /// (`register_own_profile`) has ever run — `None` gates the Settings
 /// "Choose a username" form vs. the normal profile display.
@@ -321,9 +511,10 @@ async fn register_own_profile(
     state: State<'_, AppState>,
     username: String,
 ) -> Result<OwnProfileDto, String> {
-    let mut conn = state.conn.lock().await;
+    let mut conn_guard = state.conn.lock().await;
+    let conn = connected(&mut conn_guard)?;
     let mut account = state.account.lock().await;
-    let profile = dratchet_app::publish_own_bundle(&state.db, &mut conn, &mut account, &username)
+    let profile = dratchet_app::publish_own_bundle(&state.db, conn, &mut account, &username)
         .await
         .map_err(|e| e.to_string())?;
     Ok(to_own_profile_dto(&profile))
@@ -335,12 +526,12 @@ async fn rename_own_profile(
     state: State<'_, AppState>,
     new_username: String,
 ) -> Result<OwnProfileDto, String> {
-    let mut conn = state.conn.lock().await;
+    let mut conn_guard = state.conn.lock().await;
+    let conn = connected(&mut conn_guard)?;
     let mut account = state.account.lock().await;
-    let profile =
-        dratchet_app::rename_own_profile(&state.db, &mut conn, &mut account, &new_username)
-            .await
-            .map_err(|e| e.to_string())?;
+    let profile = dratchet_app::rename_own_profile(&state.db, conn, &mut account, &new_username)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(to_own_profile_dto(&profile))
 }
 
@@ -370,11 +561,12 @@ async fn add_contact(
         .load_own_profile()
         .map_err(|e| e.to_string())?
         .ok_or("choose a username for yourself first")?;
-    let mut conn = state.conn.lock().await;
+    let mut conn_guard = state.conn.lock().await;
+    let conn = connected(&mut conn_guard)?;
     let account = state.account.lock().await;
     let contact = dratchet_app::add_contact_by_username(
         &state.db,
-        &mut conn,
+        conn,
         &account,
         &own_profile,
         &username,
@@ -434,7 +626,143 @@ fn quick_wipe(state: State<AppState>) -> Result<usize, String> {
 #[tauri::command]
 fn full_wipe(state: State<AppState>, app: AppHandle) -> Result<(), String> {
     dratchet_app::full_wipe(&state.db, &state.db_path).map_err(|e| e.to_string())?;
+    // DRA-0035 (`docs/DELIVERY_FAILURE_FINDINGS.md`): `dratchet_app::full_wipe`
+    // only knows about the `.redb` file itself -- it has no idea
+    // DRA-0033's `device_passphrase` keyfile exists at all, since that's a
+    // ui/src-tauri-only concept. Left alone, `full_wipe` (ARCHITECTURE.md
+    // §11.9's device-seizure duress response, documented as destroying
+    // "everything") would leave that sibling file behind untouched,
+    // breaking its own "destroys everything" contract -- best-effort
+    // removal, matching `dratchet_app::full_wipe`'s own file-removal step.
+    let _ = std::fs::remove_file(device_passphrase_path(&state.db_path));
     app.restart();
+}
+
+/// Connect, authenticate, and reconcile this device's own registration —
+/// the full sequence `run()` performs once at startup, factored out so
+/// `poll_loop`'s reconnect-on-failure path (`docs/DELIVERY_FAILURE_FINDINGS.md`
+/// scenario 23) can produce a connection exactly as complete as the
+/// original one, including reclaiming a squatted handle if the directory
+/// forgot this device owned it — the same server-restart scenario a
+/// dropped WebSocket often coincides with, so skipping reconciliation on
+/// reconnect would silently reopen the exact gap `reconcile_own_profile`
+/// exists to close. Returns the discriminator-change notice, if
+/// reconciliation produced one, so the caller can decide where to put it.
+///
+/// Takes `url` rather than reading `SERVER_URL` itself so tests can point
+/// it at a real ephemeral test server instead of the hardcoded default.
+/// DRA-0062: the launch-time connection attempt. An unreachable server
+/// is not fatal: the app opens without a connection (history readable,
+/// messages saved for retry) and `poll_loop` connects when it can. This
+/// used to `panic!`, so the app could not even be opened offline.
+async fn connect_at_startup(
+    url: &str,
+    db: &Db,
+    account: &mut Account,
+) -> (Option<Connection>, Option<OwnDiscriminatorChangeNoticeDto>) {
+    match connect_authenticate_and_reconcile(url, db, account).await {
+        Ok((conn, notice)) => (Some(conn), notice),
+        Err(e) => {
+            eprintln!("startup: {url} unreachable, opening offline: {e}");
+            (None, None)
+        }
+    }
+}
+
+async fn connect_authenticate_and_reconcile(
+    url: &str,
+    db: &Db,
+    account: &mut Account,
+) -> Result<(Connection, Option<OwnDiscriminatorChangeNoticeDto>), String> {
+    let conn = Connection::connect(url).await?;
+    authenticate_and_reconcile(conn, db, account).await
+}
+
+/// The part of [`connect_authenticate_and_reconcile`] that needs the
+/// account, for a connection already established. `poll_loop` connects
+/// first, with no lock held (DRA-0068), and only then takes the account
+/// lock for this.
+async fn authenticate_and_reconcile(
+    mut conn: Connection,
+    db: &Db,
+    account: &mut Account,
+) -> Result<(Connection, Option<OwnDiscriminatorChangeNoticeDto>), String> {
+    conn.authenticate(account).await?;
+    // DRA-0064: before anything is sent on this connection -- a changed
+    // server boot id means the server restarted and lost every queued
+    // message, so unconfirmed sends are flagged for retry. Best-effort:
+    // never blocks the connection itself.
+    match dratchet_app::note_server_boot(db, account, &conn) {
+        Ok(0) => {}
+        Ok(n) => {
+            eprintln!("connect: server restarted; {n} unconfirmed message(s) flagged for retry")
+        }
+        Err(e) => eprintln!("connect: note_server_boot failed: {e}"),
+    }
+
+    let mut notice = None;
+    match dratchet_app::reconcile_own_profile(db, &mut conn, account).await {
+        Ok(ProfileReconciliation::DiscriminatorChanged { old, new }) => {
+            let old_handle = format!("{}#{:04}", old.username, old.discriminator);
+            let new_handle = format!("{}#{:04}", new.username, new.discriminator);
+            eprintln!(
+                "reclaiming {old_handle} failed (taken by someone else since the \
+                 directory last saw this device) — now {new_handle}"
+            );
+            if let Ok(contacts) = dratchet_app::list_contacts(db) {
+                for contact in contacts {
+                    if contact.verification_state != VerificationState::Verified {
+                        continue;
+                    }
+                    if let Err(e) =
+                        dratchet_app::announce_profile(db, &mut conn, account, &contact, &new).await
+                    {
+                        eprintln!("failed to announce new handle to a contact: {e}");
+                    }
+                }
+            }
+            notice = Some(OwnDiscriminatorChangeNoticeDto {
+                old_handle,
+                new_handle,
+            });
+        }
+        Ok(ProfileReconciliation::Unchanged(_) | ProfileReconciliation::Unregistered) => {}
+        Err(e) => eprintln!("reconcile_own_profile failed: {e}"),
+    }
+
+    Ok((conn, notice))
+}
+
+/// Update `state.connection_status` and, only if it actually changed,
+/// emit `CONNECTION_STATUS_EVENT` — repeatedly re-setting `Reconnecting`
+/// on every backoff-gated retry attempt would be a harmless but noisy
+/// no-op for the frontend, so this stays quiet unless there's something
+/// new to say.
+fn set_connection_status<R: Runtime>(
+    app_handle: &AppHandle<R>,
+    state: &AppState,
+    new_status: ConnectionStatusDto,
+) {
+    let mut status = state
+        .connection_status
+        .lock()
+        .expect("connection_status mutex poisoned");
+    if *status != new_status {
+        *status = new_status;
+        drop(status);
+        let _ = app_handle.emit(CONNECTION_STATUS_EVENT, new_status);
+    }
+}
+
+/// Whether `e` indicates the underlying transport actually failed (the
+/// WebSocket send/recv itself), as opposed to an application-level error
+/// (`NotAcknowledged`, a decode failure, etc.) that says nothing about
+/// whether the connection is still usable. Only the former should trigger
+/// `poll_loop`'s reconnect path — retrying a healthy connection because a
+/// peer's malformed entry produced some other `Error` variant would be
+/// pointless and would blow away a connection that didn't need replacing.
+fn is_connection_error(e: &dratchet_app::Error) -> bool {
+    matches!(e, dratchet_app::Error::Connection(_))
 }
 
 /// Background receive loop, spawned once in `.setup()`: every
@@ -447,70 +775,201 @@ fn full_wipe(state: State<AppState>, app: AppHandle) -> Result<(), String> {
 /// address, or `Received::wipe_activity` — a wipe-policy announcement
 /// recorded or a wipe request auto-complied/set pending, §11.9a), emits
 /// one coarse `INBOX_UPDATED_EVENT` — no fine-grained payload; the
-/// frontend just refetches.
-async fn poll_loop(app_handle: AppHandle) {
+/// frontend just refetches. Every `PREKEY_REPLENISH_CHECK_EVERY_N_TICKS`th
+/// tick it also checks `dratchet_app::replenish_prekeys_if_low` (§3.4) —
+/// silent either way, since a republished prekey batch isn't something the
+/// frontend needs to know about. On a transport-layer error from any of
+/// the above, reconnects (`connect_authenticate_and_reconcile`) on a
+/// backoff-gated retry rather than silently and permanently going dark —
+/// see `docs/DELIVERY_FAILURE_FINDINGS.md` scenario 23 for the failure
+/// mode this closes.
+async fn poll_loop<R: Runtime>(app_handle: AppHandle<R>) {
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
+    let mut tick_count: u32 = 0;
+    // Set the moment a tick's work hits a transport-layer error
+    // (`is_connection_error`); cleared the moment a reconnect succeeds.
+    // While set, ordinary tick work is skipped in favor of a
+    // backoff-gated reconnect attempt — every command shares `state.conn`
+    // behind the same `Mutex`, so healing it here heals it for the whole
+    // app, not just this loop (`docs/DELIVERY_FAILURE_FINDINGS.md`
+    // scenario 23).
+    let mut reconnect_backoff = RECONNECT_INITIAL_BACKOFF;
+    let mut next_reconnect_attempt: Option<std::time::Instant> = None;
+
     loop {
         ticker.tick().await;
+        tick_count = tick_count.wrapping_add(1);
         let state = app_handle.state::<AppState>();
 
         let mut changed = false;
-        {
-            let mut conn = state.conn.lock().await;
-            let mut account = state.account.lock().await;
-            match dratchet_app::receive_first_contact_attempts(&state.db, &mut conn, &mut account)
-                .await
-            {
-                Ok(new_contacts) if !new_contacts.is_empty() => changed = true,
-                Ok(_) => {}
-                Err(e) => eprintln!("poll: receive_first_contact_attempts failed: {e}"),
+        // DRA-0063: needs no connection, so it runs even while offline.
+        if tick_count == 1 || tick_count.is_multiple_of(EXPIRY_CHECK_EVERY_N_TICKS) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let account = state.account.lock().await;
+            match dratchet_app::mark_expired_sends(&state.db, &account, now) {
+                Ok(0) => {}
+                Ok(n) => {
+                    eprintln!("poll: {n} sent message(s) expired undelivered");
+                    // Emitted now, not via `changed`: a pending reconnect
+                    // below `continue`s past the end-of-tick emit.
+                    let _ = app_handle.emit(INBOX_UPDATED_EVENT, ());
+                }
+                Err(e) => eprintln!("poll: mark_expired_sends failed: {e}"),
+            }
+        }
+        // DRA-0062: not connected yet (the server was unreachable at
+        // launch) -- attempt it now, through the same backoff-gated path a
+        // reconnect uses.
+        if next_reconnect_attempt.is_none() && state.conn.lock().await.is_none() {
+            next_reconnect_attempt = Some(std::time::Instant::now());
+        }
+        if let Some(due) = next_reconnect_attempt {
+            if std::time::Instant::now() < due {
+                continue;
+            }
+            // DRA-0068: the connection is established before the account
+            // lock is taken, and gives up after `REQUEST_TIMEOUT`. Holding
+            // the lock across an unbounded connect left every command that
+            // needs the account -- even showing a conversation -- waiting
+            // for as long as the server accepted connections without
+            // answering.
+            let reconnected = match Connection::connect(&state.server_url).await {
+                Ok(conn) => {
+                    let mut account = state.account.lock().await;
+                    authenticate_and_reconcile(conn, &state.db, &mut account).await
+                }
+                Err(e) => Err(e.to_string()),
+            };
+            match reconnected {
+                Ok((new_conn, notice)) => {
+                    eprintln!("poll: reconnected to {}", state.server_url);
+                    // DRA-0067: the account lock is released before the
+                    // connection lock is taken. Every command takes the
+                    // connection first, then the account; holding the
+                    // account here while waiting for the connection
+                    // deadlocked against any command sent mid-reconnect.
+                    *state.conn.lock().await = Some(new_conn);
+                    // Anything sent during the outage has genuine reason
+                    // to be in doubt — see `mark_pending_sends_uncertain`'s
+                    // doc. Best-effort: a failure here shouldn't block
+                    // the reconnect itself from completing.
+                    let account = state.account.lock().await;
+                    if let Err(e) = dratchet_app::mark_pending_sends_uncertain(&state.db, &account)
+                    {
+                        eprintln!("poll: mark_pending_sends_uncertain failed: {e}");
+                    } else {
+                        changed = true;
+                    }
+                    if let Some(notice) = notice {
+                        *state
+                            .own_discriminator_change_notice
+                            .lock()
+                            .expect("own_discriminator_change_notice mutex poisoned") =
+                            Some(notice);
+                    }
+                    next_reconnect_attempt = None;
+                    reconnect_backoff = RECONNECT_INITIAL_BACKOFF;
+                    set_connection_status(&app_handle, &state, ConnectionStatusDto::Connected);
+                }
+                Err(e) => {
+                    eprintln!("poll: reconnect failed, retrying in {reconnect_backoff:?}: {e}");
+                    next_reconnect_attempt = Some(std::time::Instant::now() + reconnect_backoff);
+                    reconnect_backoff = (reconnect_backoff * 2).min(RECONNECT_MAX_BACKOFF);
+                    continue;
+                }
             }
         }
 
-        let contacts = match dratchet_app::list_contacts(&state.db) {
-            Ok(contacts) => contacts,
-            Err(e) => {
-                eprintln!("poll: list_contacts failed: {e}");
-                continue;
+        let mut connection_died = false;
+        {
+            let mut conn_guard = state.conn.lock().await;
+            let conn = conn_guard
+                .as_mut()
+                .expect("connected: checked at the top of this tick (DRA-0062)");
+            let mut account = state.account.lock().await;
+            match dratchet_app::receive_first_contact_attempts(&state.db, conn, &mut account).await
+            {
+                Ok(new_contacts) if !new_contacts.is_empty() => changed = true,
+                Ok(_) => {}
+                Err(e) => {
+                    connection_died = is_connection_error(&e);
+                    eprintln!("poll: receive_first_contact_attempts failed: {e}");
+                }
             }
-        };
 
-        for contact in contacts {
-            let mailbox_before = contact.mailbox_id.clone();
-            let received = {
-                let mut conn = state.conn.lock().await;
-                let account = state.account.lock().await;
-                dratchet_app::receive_pending(&state.db, &mut conn, &account, &contact).await
+            if !connection_died && tick_count.is_multiple_of(PREKEY_REPLENISH_CHECK_EVERY_N_TICKS) {
+                if let Err(e) = replenish_prekeys_if_low(&state.db, conn, &mut account).await {
+                    connection_died = is_connection_error(&e);
+                    eprintln!("poll: replenish_prekeys_if_low failed: {e}");
+                }
+            }
+        }
+
+        if !connection_died {
+            let contacts = match dratchet_app::list_contacts(&state.db) {
+                Ok(contacts) => contacts,
+                Err(e) => {
+                    eprintln!("poll: list_contacts failed: {e}");
+                    continue;
+                }
             };
-            match received {
-                Ok(outcome) => {
-                    if !outcome.messages.is_empty()
-                        || outcome.wipe_activity
-                        || !outcome.profile_changes.is_empty()
-                    {
+
+            for contact in contacts {
+                if connection_died {
+                    break;
+                }
+                let mailbox_before = contact.mailbox_id.clone();
+                let received = {
+                    let mut conn_guard = state.conn.lock().await;
+                    let conn = conn_guard
+                        .as_mut()
+                        .expect("connected: checked at the top of this tick (DRA-0062)");
+                    let account = state.account.lock().await;
+                    dratchet_app::receive_pending(&state.db, conn, &account, &contact).await
+                };
+                match received {
+                    Ok(outcome) => {
+                        if !outcome.messages.is_empty()
+                            || !outcome.delivered.is_empty()
+                            || outcome.wipe_activity
+                            || !outcome.profile_changes.is_empty()
+                        {
+                            changed = true;
+                        }
+                        if !outcome.profile_changes.is_empty() {
+                            let mut notices = state
+                                .peer_profile_change_notices
+                                .lock()
+                                .expect("peer_profile_change_notices mutex poisoned");
+                            notices.extend(outcome.profile_changes.into_iter().map(|n| {
+                                PeerProfileChangeNoticeDto {
+                                    fingerprint: hex::encode(&n.fingerprint),
+                                    old_handle: n.old_handle,
+                                    new_handle: n.new_handle,
+                                }
+                            }));
+                        }
+                    }
+                    Err(e) => {
+                        connection_died = is_connection_error(&e);
+                        eprintln!("poll: receive_pending failed for a contact: {e}");
+                    }
+                }
+                if let Ok(Some(updated)) = state.db.load_contact(&contact.fingerprint) {
+                    if updated.mailbox_id != mailbox_before {
                         changed = true;
                     }
-                    if !outcome.profile_changes.is_empty() {
-                        let mut notices = state
-                            .peer_profile_change_notices
-                            .lock()
-                            .expect("peer_profile_change_notices mutex poisoned");
-                        notices.extend(outcome.profile_changes.into_iter().map(|n| {
-                            PeerProfileChangeNoticeDto {
-                                fingerprint: hex::encode(&n.fingerprint),
-                                old_handle: n.old_handle,
-                                new_handle: n.new_handle,
-                            }
-                        }));
-                    }
-                }
-                Err(e) => eprintln!("poll: receive_pending failed for a contact: {e}"),
-            }
-            if let Ok(Some(updated)) = state.db.load_contact(&contact.fingerprint) {
-                if updated.mailbox_id != mailbox_before {
-                    changed = true;
                 }
             }
+        }
+
+        if connection_died {
+            eprintln!("poll: connection lost, will attempt to reconnect next tick");
+            next_reconnect_attempt = Some(std::time::Instant::now());
+            set_connection_status(&app_handle, &state, ConnectionStatusDto::Reconnecting);
         }
 
         if changed {
@@ -525,13 +984,98 @@ fn dev_db_path() -> PathBuf {
         .unwrap_or_else(|_| std::env::temp_dir().join("dratchet-dev-a.redb"))
 }
 
+/// DRA-0033 (`docs/DELIVERY_FAILURE_FINDINGS.md`): the encrypted local
+/// database's passphrase, previously the literal constant `"dev"` for
+/// every installation of the shipped app -- a fixed, publicly-known
+/// string in open-source code provides zero actual secrecy, defeating
+/// `store::db`'s entire Argon2id/ChaCha20Poly1305 encryption-at-rest
+/// design for the real product. A per-device, high-entropy (256-bit)
+/// passphrase, generated once and persisted alongside the database file
+/// it protects, is a bounded improvement: every installation now gets a
+/// distinct, unguessable secret instead of one universal constant. A
+/// real user-facing passphrase prompt (so the secret depends on
+/// something the user knows, not just something stored on the same
+/// disk as the data it protects) remains a real UI feature for future
+/// work -- see this finding's "Known residual scope" in the docs.
+fn device_passphrase_path(db_path: &std::path::Path) -> std::path::PathBuf {
+    db_path.with_extension("keyfile")
+}
+
+/// DRA-0036 (`docs/DELIVERY_FAILURE_FINDINGS.md`): returns `Zeroizing<String>`,
+/// not a plain `String` -- every other real secret this codebase holds in
+/// memory (`store::db`'s `master_key`/`identity_key`/`contacts_key`/
+/// `content_key`) is wrapped the same way specifically so the backing
+/// memory is overwritten on drop rather than left as ordinary freed
+/// heap/stack bytes a process-memory dump could recover. Before this fix,
+/// `device_passphrase` returned a bare `String` -- harmless while the
+/// value was the constant `"dev"` (DRA-0033's own pre-fix state), but a
+/// real gap once this function started returning a genuine, unique
+/// per-device secret: this was a live loose end DRA-0033 itself left
+/// behind, caught reviewing that fix's own memory-handling discipline
+/// against the rest of this codebase's established pattern.
+///
+/// DRA-0053: the keyfile is owner-only (0600 on Unix) -- created that
+/// way, and tightened if an earlier build left it at the default
+/// umask-derived mode -- since anyone who can read it can decrypt the
+/// database. A failure to persist a newly generated passphrase is an
+/// error, not something to shrug off: the caller would otherwise create
+/// a database under a secret that is gone on the next launch. Every
+/// intermediate copy (the file contents as read, the raw random bytes,
+/// the hex encoding) is `Zeroizing` too, closing DRA-0036's residual.
+fn device_passphrase(db_path: &std::path::Path) -> std::io::Result<zeroize::Zeroizing<String>> {
+    use zeroize::Zeroizing;
+
+    let keyfile_path = device_passphrase_path(db_path);
+    if let Ok(existing) = std::fs::read_to_string(&keyfile_path) {
+        let existing = Zeroizing::new(existing);
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            restrict_to_owner(&keyfile_path)?;
+            return Ok(Zeroizing::new(trimmed.to_string()));
+        }
+    }
+    let random_bytes = Zeroizing::new(dratchet_client::handshake::random_routing_id());
+    let mut passphrase = Zeroizing::new(String::with_capacity(random_bytes.len() * 2));
+    for b in random_bytes.iter() {
+        for nibble in [b >> 4, b & 0x0f] {
+            passphrase.push(char::from_digit(u32::from(nibble), 16).expect("nibble < 16"));
+        }
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(&keyfile_path)?;
+    // `mode` only applies when the file is newly created; an existing
+    // (empty) keyfile keeps whatever it had until this.
+    restrict_to_owner(&keyfile_path)?;
+    std::io::Write::write_all(&mut file, passphrase.as_bytes())?;
+    file.sync_all()?;
+    Ok(passphrase)
+}
+
+/// DRA-0053: owner read/write only. A no-op off Unix, where file
+/// permissions don't use mode bits.
+fn restrict_to_owner(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let db_path = dev_db_path();
+    let passphrase = device_passphrase(&db_path).expect("persist the device keyfile");
     let db = if db_path.exists() {
-        Db::open(&db_path, "dev").expect("open dev db")
+        Db::open(&db_path, &passphrase).expect("open dev db")
     } else {
-        Db::create(&db_path, "dev").expect("create dev db")
+        Db::create(&db_path, &passphrase).expect("create dev db")
     };
     let mut account = open_account(&db).expect("open account");
 
@@ -539,52 +1083,19 @@ pub fn run() {
     // considered ready — fails loudly if dratchetd isn't reachable,
     // matching the existing db/account `.expect(...)` posture. A real
     // server-address setting/retry UI is future work. Also reconciles
-    // this device's own registration (`dratchet_app::reconcile_own_profile`)
-    // and, if the directory forgot it owned its discriminator, broadcasts
-    // the new one to every already-Verified contact right away — closing
-    // the window between "this device reconnects" and "someone notices
-    // their handle changed" as tightly as possible.
-    let (conn, own_discriminator_change_notice) = tauri::async_runtime::block_on(async {
-        let mut conn = Connection::connect(SERVER_URL)
-            .await
-            .unwrap_or_else(|e| panic!("connect to {SERVER_URL} (is dratchetd running?): {e}"));
-        conn.authenticate(&account)
-            .await
-            .expect("authenticate with dratchetd");
-
-        let mut notice = None;
-        match dratchet_app::reconcile_own_profile(&db, &mut conn, &mut account).await {
-            Ok(ProfileReconciliation::DiscriminatorChanged { old, new }) => {
-                let old_handle = format!("{}#{:04}", old.username, old.discriminator);
-                let new_handle = format!("{}#{:04}", new.username, new.discriminator);
-                eprintln!(
-                    "startup: reclaiming {old_handle} failed (taken by someone else since \
-                         the directory last saw this device) — now {new_handle}"
-                );
-                if let Ok(contacts) = dratchet_app::list_contacts(&db) {
-                    for contact in contacts {
-                        if contact.verification_state != VerificationState::Verified {
-                            continue;
-                        }
-                        if let Err(e) =
-                            dratchet_app::announce_profile(&db, &mut conn, &account, &contact, &new)
-                                .await
-                        {
-                            eprintln!("startup: failed to announce new handle to a contact: {e}");
-                        }
-                    }
-                }
-                notice = Some(OwnDiscriminatorChangeNoticeDto {
-                    old_handle,
-                    new_handle,
-                });
-            }
-            Ok(ProfileReconciliation::Unchanged(_) | ProfileReconciliation::Unregistered) => {}
-            Err(e) => eprintln!("startup: reconcile_own_profile failed: {e}"),
-        }
-
-        (conn, notice)
-    });
+    // this device's own registration and, if the directory forgot it
+    // owned its discriminator, broadcasts the new one to every
+    // already-Verified contact right away — see
+    // `connect_authenticate_and_reconcile`'s doc, also reused by
+    // `poll_loop`'s reconnect-after-failure path so a re-established
+    // connection is never any less complete than this first one.
+    let (conn, own_discriminator_change_notice) =
+        tauri::async_runtime::block_on(connect_at_startup(SERVER_URL, &db, &mut account));
+    let starting_status = if conn.is_some() {
+        ConnectionStatusDto::Connected
+    } else {
+        ConnectionStatusDto::Reconnecting
+    };
     let conn = Arc::new(Mutex::new(conn));
     let account = Arc::new(Mutex::new(account));
 
@@ -593,16 +1104,22 @@ pub fn run() {
         .manage(AppState {
             db,
             db_path,
+            server_url: SERVER_URL.to_string(),
             account,
             conn,
             own_discriminator_change_notice: StdMutex::new(own_discriminator_change_notice),
             peer_profile_change_notices: StdMutex::new(Vec::new()),
+            // DRA-0062: `Reconnecting` if the server was unreachable at
+            // launch; `poll_loop` keeps trying and flips it once connected.
+            connection_status: StdMutex::new(starting_status),
         })
         .invoke_handler(tauri::generate_handler![
             list_contacts,
             list_messages,
             send_message,
+            retry_message,
             set_wipe_policy,
+            preview_conversation_wipe,
             request_conversation_wipe,
             confirm_pending_wipe,
             decline_pending_wipe,
@@ -614,7 +1131,8 @@ pub fn run() {
             take_own_discriminator_change_notice,
             take_peer_profile_change_notices,
             quick_wipe,
-            full_wipe
+            full_wipe,
+            get_connection_status
         ])
         .setup(|app| {
             let app_handle = app.handle().clone();
@@ -624,3 +1142,404 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+/// Real, no-mocks coverage for the two testable units behind `poll_loop`'s
+/// reconnect logic (`docs/DELIVERY_FAILURE_FINDINGS.md` scenario 23):
+/// `is_connection_error`'s classification, and
+/// `connect_authenticate_and_reconcile` actually producing a live,
+/// usable connection against a real spawned `dratchet_server::app()` (the
+/// same helper both `run()`'s startup and `poll_loop`'s reconnect path
+/// call). `poll_loop` itself runs end to end, on `tauri::test`'s mock
+/// runtime, in `retry_flow_tests`.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    async fn spawn_server() -> String {
+        let (router, _state) = dratchet_server::app();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        format!("ws://{addr}/v1/ws")
+    }
+
+    fn temp_db() -> Db {
+        let dir = tempfile::tempdir().unwrap().keep();
+        Db::create(dir.join("test.redb"), "pw").unwrap()
+    }
+
+    #[test]
+    fn is_connection_error_matches_only_the_transport_variant() {
+        assert!(is_connection_error(&dratchet_app::Error::Connection(
+            "socket closed".into()
+        )));
+        assert!(!is_connection_error(&dratchet_app::Error::NotAcknowledged));
+        assert!(!is_connection_error(&dratchet_app::Error::NoSession));
+        assert!(!is_connection_error(&dratchet_app::Error::UsernameTaken));
+        // DRA-0058: a refusal or a protocol problem must not make
+        // poll_loop tear down and re-open a working connection.
+        assert!(!is_connection_error(&dratchet_app::Error::ServerRefused {
+            code: dratchet_server::protocol::ErrorCode::RateLimited,
+            message: "rate limit exceeded".into(),
+        }));
+        assert!(!is_connection_error(&dratchet_app::Error::Protocol(
+            "unexpected frame".into()
+        )));
+    }
+
+    /// The actual risk surface: does the helper `run()` and `poll_loop`
+    /// both depend on really produce a working connection? Connects
+    /// against a real server, confirms the returned `Connection` can
+    /// genuinely be used afterward (a real `FetchOwnPrekeyCount`
+    /// round-trip), and confirms reconciliation is a no-op for an
+    /// account that's never published anything — matching what a normal,
+    /// healthy reconnect looks like.
+    #[tokio::test]
+    async fn connect_authenticate_and_reconcile_produces_a_live_usable_connection() {
+        let url = spawn_server().await;
+        let db = temp_db();
+        let mut account = open_account(&db).unwrap();
+
+        let (mut conn, notice) = connect_authenticate_and_reconcile(&url, &db, &mut account)
+            .await
+            .expect("connect + authenticate + reconcile against a real, reachable server");
+        assert!(
+            notice.is_none(),
+            "an account that's never published anything reconciles as a no-op, \
+             so there's no discriminator-change notice to surface"
+        );
+
+        // The connection really is live, not just "didn't error" — a
+        // further real round-trip on it succeeds, exactly what
+        // `poll_loop`'s very next tick immediately does after reconnecting.
+        let count = dratchet_app::replenish_prekeys_if_low(&db, &mut conn, &mut account).await;
+        assert!(
+            count.is_ok(),
+            "the connection this helper hands back must still be usable for a real \
+             follow-up call"
+        );
+    }
+
+    /// The failure path `poll_loop`'s backoff depends on: connecting to
+    /// nothing reachable must return a real `Err`, not hang or panic.
+    /// DRA-0062: the launch-time connection attempt against an unreachable
+    /// server must leave the app openable (no connection yet), not abort.
+    #[tokio::test]
+    async fn the_app_can_start_while_the_server_is_unreachable() {
+        let db = temp_db();
+        let mut account = open_account(&db).unwrap();
+        let attempt = tokio::spawn(async move {
+            connect_at_startup("ws://127.0.0.1:1/v1/ws", &db, &mut account).await
+        })
+        .await;
+        let (conn, notice) = attempt.unwrap_or_else(|_| {
+            panic!(
+                "VULNERABILITY: starting with the server unreachable aborts the app, so a user \
+                 can't even open it to read their own history while offline"
+            )
+        });
+        assert!(
+            conn.is_none(),
+            "no connection yet; poll_loop connects later"
+        );
+        assert!(notice.is_none());
+    }
+
+    /// DRA-0062: while there's no connection, commands say so instead of
+    /// panicking or hanging.
+    #[test]
+    fn commands_report_not_connected_until_the_first_connection() {
+        let mut none: Option<dratchet_client::net::Connection> = None;
+        assert_eq!(connected(&mut none).err().as_deref(), Some(NOT_CONNECTED));
+    }
+
+    #[tokio::test]
+    async fn connect_authenticate_and_reconcile_fails_cleanly_against_an_unreachable_server() {
+        let db = temp_db();
+        let mut account = open_account(&db).unwrap();
+        let result =
+            connect_authenticate_and_reconcile("ws://127.0.0.1:1/v1/ws", &db, &mut account).await;
+        assert!(
+            result.is_err(),
+            "an unreachable address must fail fast with an Err, which is what \
+             poll_loop's backoff branch is built to receive and act on"
+        );
+    }
+
+    /// Proof that a fresh connection from this helper really does replace
+    /// a dead one end to end: authenticate once, drop that connection
+    /// (simulating the transport dying), call the helper again, and
+    /// confirm the *new* connection still works for a real round-trip —
+    /// the exact sequence `poll_loop` performs when `connection_died` is
+    /// set and its backoff timer fires.
+    #[tokio::test]
+    async fn a_second_call_produces_a_working_replacement_connection() {
+        let url = spawn_server().await;
+        let db = temp_db();
+        let mut account = open_account(&db).unwrap();
+
+        let (first_conn, _) = connect_authenticate_and_reconcile(&url, &db, &mut account)
+            .await
+            .unwrap();
+        drop(first_conn); // simulates the transport dying
+
+        let (mut second_conn, _) = connect_authenticate_and_reconcile(&url, &db, &mut account)
+            .await
+            .expect("reconnecting after the first connection is gone must still succeed");
+        let ok = dratchet_app::replenish_prekeys_if_low(&db, &mut second_conn, &mut account)
+            .await
+            .is_ok();
+        assert!(ok, "the replacement connection is genuinely usable");
+    }
+
+    /// DRA-0027 (`docs/DELIVERY_FAILURE_FINDINGS.md`, penetration test
+    /// round 4, data extraction — blast-radius-of-a-future-XSS hardening):
+    /// `tauri.conf.json`'s `app.security.csp` was `null` — no Content-
+    /// Security-Policy at all, so if any future code change (a message-
+    /// rendering bug, a vulnerable dependency) ever introduced script
+    /// injection into the webview, the injected script would have
+    /// completely unrestricted network/script/style access, including
+    /// whatever the Tauri `invoke` IPC bridge exposes (contacts, message
+    /// history, wipe commands). A real CSP doesn't prevent a future XSS
+    /// bug from existing, but it bounds what an XSS can actually *do* —
+    /// exactly the belt-and-suspenders layer Tauri's own security
+    /// guidance recommends every app set explicitly rather than leaving
+    /// unset. Pinned here as a regression test (not a runtime exploit —
+    /// there's no current injection point to demonstrate against) so a
+    /// future edit can't silently null this back out or weaken it to
+    /// something permissive (`'unsafe-eval'`, a wildcard `script-src`)
+    /// without a test failing to call attention to it.
+    #[test]
+    fn tauri_conf_declares_a_real_restrictive_csp() {
+        let conf_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tauri.conf.json");
+        let raw = std::fs::read_to_string(&conf_path).expect("tauri.conf.json must be readable");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&raw).expect("tauri.conf.json must be valid JSON");
+        let csp = parsed["app"]["security"]["csp"].as_str().expect(
+            "VULNERABILITY: app.security.csp must be a real policy string, not null/absent — \
+                 an unset CSP gives any future XSS in the webview unrestricted reach",
+        );
+        assert!(
+            csp.contains("default-src 'self'"),
+            "the policy must at minimum restrict the default fetch directive to the app's own \
+             origin"
+        );
+        assert!(
+            !csp.contains("unsafe-eval"),
+            "must not permit eval()-style dynamic code execution"
+        );
+        assert!(
+            !csp.contains("script-src *") && !csp.contains("script-src: *"),
+            "must not permit loading scripts from an arbitrary origin"
+        );
+    }
+
+    /// DRA-0028 (`docs/DELIVERY_FAILURE_FINDINGS.md`, penetration test
+    /// round 4, data extraction — unused capability grant widening the
+    /// blast radius of any future webview XSS, same category as
+    /// DRA-0027): `capabilities/default.json` granted `opener:default` —
+    /// making `tauri-plugin-opener`'s `open_url`/`open_path` commands
+    /// callable from the webview via `invoke()` — even though nothing in
+    /// `ui/src` ever calls them (confirmed by grep: no `opener` import,
+    /// no `openUrl`/`openPath` call, anywhere in the frontend). An
+    /// unnecessary capability grant is exactly the kind of gap DRA-0027's
+    /// CSP doesn't cover on its own: CSP bounds *network/script* reach,
+    /// but a Tauri capability grant is a *separate* trust boundary —
+    /// injected script calling `invoke("plugin:opener|open_url", ...)`
+    /// isn't a network request the CSP's `connect-src` would catch, it's
+    /// Tauri's own IPC bridge, gated only by what capabilities/*.json
+    /// grants. With this granted-but-unused, a future XSS could have
+    /// launched an arbitrary URL/file via the OS's default handler
+    /// (phishing, or platform-specific URI-scheme-handler abuse) for no
+    /// functional benefit to the real app. The plugin stays registered
+    /// in `main.rs`/`lib.rs`'s `.plugin(tauri_plugin_opener::init())` —
+    /// removing the *capability grant* is what actually closes the
+    /// webview-reachable surface; a registered-but-ungranted plugin's
+    /// commands simply can't be invoked at all.
+    #[test]
+    fn opener_capability_is_not_granted_since_the_frontend_never_uses_it() {
+        let caps_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("capabilities")
+            .join("default.json");
+        let raw = std::fs::read_to_string(&caps_path)
+            .expect("capabilities/default.json must be readable");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&raw).expect("capabilities/default.json must be valid JSON");
+        let permissions = parsed["permissions"]
+            .as_array()
+            .expect("permissions must be an array");
+        let has_opener = permissions
+            .iter()
+            .any(|p| p.as_str().is_some_and(|s| s.starts_with("opener")));
+        assert!(
+            !has_opener,
+            "VULNERABILITY: opener:* must not be granted to the webview -- the frontend never \
+             calls any opener command, so this is unused, webview-reachable IPC surface a \
+             future XSS could abuse to launch arbitrary URLs/files"
+        );
+    }
+
+    /// DRA-0033: proves `device_passphrase` no longer returns the fixed
+    /// literal `"dev"` every installation previously shared -- a
+    /// different database path must get a different, high-entropy
+    /// (32-byte, 64 hex char) passphrase.
+    #[test]
+    fn device_passphrase_is_high_entropy_and_not_the_old_shared_constant() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("a.redb");
+        let passphrase = device_passphrase(&db_path).unwrap();
+        assert_ne!(
+            passphrase.as_str(),
+            "dev",
+            "VULNERABILITY: the local database's encryption passphrase must not be the fixed, \
+             publicly-known literal every installation previously shared -- that provides zero \
+             actual confidentiality for Argon2id/ChaCha20Poly1305 encryption-at-rest"
+        );
+        assert_eq!(
+            passphrase.len(),
+            64,
+            "expected a 32-byte value hex-encoded (256 bits of entropy)"
+        );
+    }
+
+    /// A device's passphrase must persist across restarts -- otherwise a
+    /// freshly-generated one on every launch would make an already-created
+    /// database permanently unopenable.
+    #[test]
+    fn device_passphrase_persists_across_calls_for_the_same_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("a.redb");
+        let first = device_passphrase(&db_path).unwrap();
+        let second = device_passphrase(&db_path).unwrap();
+        assert_eq!(
+            first, second,
+            "the same db path must always get back the same passphrase, or a real database \
+             created with the first one could never be reopened"
+        );
+    }
+
+    /// Two different devices/databases must never share a passphrase --
+    /// otherwise this fix would just be trading one shared constant for
+    /// another.
+    #[test]
+    fn different_db_paths_get_different_passphrases() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = device_passphrase(&dir.path().join("a.redb")).unwrap();
+        let b = device_passphrase(&dir.path().join("b.redb")).unwrap();
+        assert_ne!(a, b);
+    }
+
+    /// DRA-0035: `full_wipe`'s own keyfile cleanup, built on
+    /// `device_passphrase_path` and `remove_file`, must actually remove
+    /// the file `device_passphrase` creates -- proving the path both
+    /// functions compute is the same one, so a real `full_wipe` call
+    /// doesn't leave this file behind.
+    #[test]
+    fn device_passphrase_path_matches_what_full_wipes_cleanup_removes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("a.redb");
+        device_passphrase(&db_path).unwrap();
+        let keyfile = device_passphrase_path(&db_path);
+        assert!(
+            keyfile.exists(),
+            "device_passphrase must have created the keyfile"
+        );
+        std::fs::remove_file(&keyfile).unwrap();
+        assert!(
+            !keyfile.exists(),
+            "VULNERABILITY: full_wipe's cleanup path must actually match where \
+             device_passphrase writes the keyfile, or a duress wipe leaves it behind"
+        );
+    }
+
+    /// DRA-0053: the keyfile holds the secret that decrypts the whole
+    /// local database, so no other local account may read it.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_keyfile_is_readable_only_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("a.redb");
+        device_passphrase(&db_path).unwrap();
+        let mode = std::fs::metadata(device_passphrase_path(&db_path))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "VULNERABILITY: keyfile mode is {mode:o} -- group/other can read the secret that \
+             decrypts the local database"
+        );
+    }
+
+    /// DRA-0053: a keyfile an earlier build wrote with the default mode
+    /// is tightened the next time it is read, not left exposed forever.
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_world_readable_keyfile_is_tightened_on_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("a.redb");
+        let keyfile = device_passphrase_path(&db_path);
+        std::fs::write(&keyfile, "ab".repeat(32)).unwrap();
+        std::fs::set_permissions(&keyfile, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let passphrase = device_passphrase(&db_path).unwrap();
+        assert_eq!(
+            passphrase.as_str(),
+            "ab".repeat(32),
+            "existing secret is kept"
+        );
+        let mode = std::fs::metadata(&keyfile).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "VULNERABILITY: a pre-existing keyfile stays at mode {mode:o}, readable by other \
+             local accounts"
+        );
+    }
+
+    /// DRA-0053: if the new passphrase can't be persisted, the caller
+    /// must hear about it -- otherwise a database gets created under a
+    /// secret that no longer exists on the next launch.
+    #[test]
+    fn a_passphrase_that_cannot_be_persisted_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("missing-dir").join("a.redb");
+        let result = device_passphrase(&db_path);
+        assert!(
+            result.is_err(),
+            "VULNERABILITY: device_passphrase handed back a secret it failed to save; a \
+             database created with it could never be reopened"
+        );
+    }
+
+    /// DRA-0054: `+page.svelte` reads `contacts`/`messages` and
+    /// `unreadable` off these two responses by name; a renamed field would
+    /// silently hide the notice again, so pin the wire shape.
+    #[test]
+    fn list_dtos_carry_the_unreadable_count_under_the_names_the_frontend_reads() {
+        let contacts = serde_json::to_value(ContactListDto {
+            contacts: Vec::new(),
+            unreadable: 2,
+        })
+        .unwrap();
+        assert_eq!(contacts["unreadable"], 2);
+        assert!(contacts["contacts"].is_array());
+
+        let messages = serde_json::to_value(MessageListDto {
+            messages: Vec::new(),
+            unreadable: 1,
+        })
+        .unwrap();
+        assert_eq!(messages["unreadable"], 1);
+        assert!(messages["messages"].is_array());
+    }
+}
+
+#[cfg(test)]
+mod retry_flow_tests;
