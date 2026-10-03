@@ -242,6 +242,38 @@ fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// DRA-0073: refuse two configured names for one directory (a symlink,
+/// `./a` beside `a`, an absolute path beside a relative one, a bind
+/// mount). The configuration check compares the names only. Each
+/// directory's Fragments are swept against its own position in the list,
+/// so an aliased pair would delete every entry's other Fragment at the
+/// next start, and splitting would gain nothing.
+fn refuse_aliased_dirs(dirs: &[PathBuf]) -> std::io::Result<()> {
+    let mut seen = HashMap::new();
+    for dir in dirs {
+        #[cfg(unix)]
+        let id = {
+            use std::os::unix::fs::MetadataExt;
+            let meta = fs::metadata(dir)?;
+            (meta.dev(), meta.ino())
+        };
+        #[cfg(not(unix))]
+        let id = fs::canonicalize(dir)?;
+        if let Some(first) = seen.insert(id, dir) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "fragment directories {} and {} are the same directory; give each \
+                     Fragment its own directory, ideally on different volumes",
+                    first.display(),
+                    dir.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn sync_dir(dir: &Path) {
     if let Ok(d) = fs::File::open(dir) {
         let _ = d.sync_all();
@@ -258,6 +290,7 @@ impl MailStore {
         for dir in fragment_dirs {
             ensure_private_dir(dir)?;
         }
+        refuse_aliased_dirs(fragment_dirs)?;
         if let Some(parent) = index_path.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent)?;

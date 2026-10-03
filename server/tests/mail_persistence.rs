@@ -448,3 +448,58 @@ fn the_store_reopens_directories_it_created() {
     )
     .is_ok());
 }
+
+fn pending(entry_id: u8) -> dratchet_server::mailstore::PendingEntry {
+    dratchet_server::mailstore::PendingEntry {
+        mailbox_id: MAILBOX,
+        entry_id: [entry_id; 16],
+        envelope: envelope(300),
+        expires_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600,
+        written_by: [0x11; 32],
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn one_directory_named_twice_is_refused_rather_than_losing_every_entry() {
+    use dratchet_server::mailstore::MailStore;
+    let store = Store::new();
+    let real = store.root.join("a");
+    std::fs::create_dir_all(&real).unwrap();
+    let alias = store.root.join("alias");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    let mut mail = store.settings(KEY, Duration::from_secs(1));
+    mail.fragment_dirs = vec![real.clone(), alias];
+
+    let first = MailStore::open(&mail.index_db, &mail.fragment_dirs, &KEY);
+    if let Ok(opened) = first {
+        opened.store.save(&[pending(1)]).unwrap();
+        opened.store.mark_clean_shutdown().unwrap();
+        drop(opened);
+        let reopened = MailStore::open(&mail.index_db, &mail.fragment_dirs, &KEY).unwrap();
+        let readable = matches!(reopened.store.read_envelope(&[1; 16]), Ok(Some(_)));
+        panic!(
+            "VULNERABILITY: two names for one fragment directory were accepted; after a clean \
+             restart the saved entry is {}",
+            if readable {
+                "still readable"
+            } else {
+                "gone (its other Fragment was swept as an orphan)"
+            }
+        );
+    }
+    assert!(
+        first_err_mentions_same_directory(&mail),
+        "the store names the aliased directories"
+    );
+}
+
+fn first_err_mentions_same_directory(mail: &MailPersistence) -> bool {
+    dratchet_server::mailstore::MailStore::open(&mail.index_db, &mail.fragment_dirs, &KEY)
+        .err()
+        .is_some_and(|e| e.to_string().contains("are the same directory"))
+}
