@@ -19,7 +19,7 @@
 //! instances of this app at.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use dratchet_app::{open_account, replenish_prekeys_if_low, ProfileReconciliation};
@@ -56,20 +56,15 @@ struct AppState {
     /// Where `poll_loop` (re)connects -- `SERVER_URL` in the app; tests
     /// point it at a real ephemeral server.
     server_url: String,
-    // Behind a `Mutex` (not just `db`/`db_path`) because
-    // `register_own_profile`/`rename_own_profile`/the poll loop's
-    // first-contact scan all need `&mut Account` — self-registration and
-    // discovering a first-contact attempt both consume one-time-prekey
-    // secrets that have to survive in memory (and get persisted back to
-    // `db`) between calls. `tokio::sync::Mutex`, not `std::sync::Mutex`,
-    // since these calls hold it across real network `.await`s — same
-    // reason `conn` already uses one.
-    account: Arc<Mutex<Account>>,
-    // DRA-0062: `None` until the first successful connection -- the app
-    // opens (history readable, messages queueable) even when the server
-    // is unreachable at launch, and `poll_loop` connects once it can.
-    // Only ever goes from `None` to `Some`, never back.
-    conn: Arc<Mutex<Option<Connection>>>,
+    // The live connection and the account, behind one lock. Commands and
+    // the poll loop need both together (a send needs the account's keys
+    // and the connection); two separate locks deadlocked when one path
+    // took them in the opposite order to the others (DRA-0067). With one
+    // lock there is no order to get wrong. `tokio::sync::Mutex`, since
+    // it's held across network `.await`s. Account-only reads (showing a
+    // conversation) wait behind network work either way: the poll loop
+    // already held the account during every exchange.
+    session: Mutex<Session>,
     // Set once at startup if `reconcile_own_profile` finds this device's
     // stored discriminator was reassigned out from under it (only
     // realistically possible after the directory server lost its
@@ -88,6 +83,20 @@ struct AppState {
     // after that via `CONNECTION_STATUS_EVENT`, so the UI has an honest
     // signal instead of silence while a reconnect is in progress.
     connection_status: StdMutex<ConnectionStatusDto>,
+}
+
+/// What [`AppState::session`] guards.
+struct Session {
+    /// DRA-0062: `None` until the first successful connection -- the app
+    /// opens (history readable, messages queueable) even when the server
+    /// is unreachable at launch, and `poll_loop` connects once it can.
+    /// Only ever goes from `None` to `Some`, never back.
+    conn: Option<Connection>,
+    /// `register_own_profile`/`rename_own_profile`/the poll loop's
+    /// first-contact scan need `&mut Account`: self-registration and
+    /// discovering a first-contact attempt both consume one-time-prekey
+    /// secrets that have to survive in memory between calls.
+    account: Account,
 }
 
 /// `poll_loop`'s live connection health, as the frontend sees it — see
@@ -295,9 +304,10 @@ async fn list_messages(
         .load_contact(&fp)
         .map_err(|e| e.to_string())?
         .ok_or("no such contact")?;
-    let account = state.account.lock().await;
+    let session = state.session.lock().await;
+    let account = &session.account;
     let (messages, unreadable) =
-        dratchet_app::list_messages_counting_unreadable(&state.db, &account, &contact)
+        dratchet_app::list_messages_counting_unreadable(&state.db, account, &contact)
             .map_err(|e| e.to_string())?;
     Ok(MessageListDto {
         messages: messages.iter().map(to_message_dto).collect(),
@@ -317,26 +327,23 @@ async fn send_message(
         .load_contact(&fp)
         .map_err(|e| e.to_string())?
         .ok_or("no such contact")?;
-    let mut conn_guard = state.conn.lock().await;
-    let account = state.account.lock().await;
+    let mut session = state.session.lock().await;
+    let Session {
+        conn: conn_guard,
+        account,
+    } = &mut *session;
     // DRA-0062: offline, the message is kept (flagged for retry) rather
     // than refused, so nothing typed is lost while the server is away.
     let Some(conn) = conn_guard.as_mut() else {
-        return dratchet_app::save_unsent_message(
-            &state.db,
-            &account,
-            &contact,
-            content.as_bytes(),
-        )
-        .map(|m| to_message_dto(&m))
-        .map_err(|e| e.to_string());
+        return dratchet_app::save_unsent_message(&state.db, account, &contact, content.as_bytes())
+            .map(|m| to_message_dto(&m))
+            .map_err(|e| e.to_string());
     };
     // DRA-0060: a send that failed after the message was saved comes back
     // as that saved message, flagged for retry, not as an error -- the
     // composer clears and the message shows in the conversation with a
     // Retry button.
-    match dratchet_app::send_message(&state.db, conn, &account, &contact, content.as_bytes()).await
-    {
+    match dratchet_app::send_message(&state.db, conn, account, &contact, content.as_bytes()).await {
         Ok(message) => Ok(to_message_dto(&message)),
         Err(dratchet_app::Error::NotSent { message, cause }) => {
             eprintln!("send_message: saved but not sent: {cause}");
@@ -362,10 +369,13 @@ async fn retry_message(
         .load_contact(&fp)
         .map_err(|e| e.to_string())?
         .ok_or("no such contact")?;
-    let mut conn_guard = state.conn.lock().await;
-    let conn = connected(&mut conn_guard)?;
-    let account = state.account.lock().await;
-    match dratchet_app::retry_message(&state.db, conn, &account, &contact, &id).await {
+    let mut session = state.session.lock().await;
+    let Session {
+        conn: conn_guard,
+        account,
+    } = &mut *session;
+    let conn = connected(conn_guard)?;
+    match dratchet_app::retry_message(&state.db, conn, account, &contact, &id).await {
         Ok(message) => Ok(to_message_dto(&message)),
         Err(dratchet_app::Error::NotSent { message, cause }) => {
             eprintln!("retry_message: still not sent: {cause}");
@@ -390,13 +400,16 @@ async fn set_wipe_policy(
         .load_contact(&fp)
         .map_err(|e| e.to_string())?
         .ok_or("no such contact")?;
-    let mut conn_guard = state.conn.lock().await;
-    let conn = connected(&mut conn_guard)?;
-    let account = state.account.lock().await;
+    let mut session = state.session.lock().await;
+    let Session {
+        conn: conn_guard,
+        account,
+    } = &mut *session;
+    let conn = connected(conn_guard)?;
     dratchet_app::announce_wipe_policy(
         &state.db,
         conn,
-        &account,
+        account,
         &contact,
         ask_before_delete,
         include_session,
@@ -420,8 +433,9 @@ async fn preview_conversation_wipe(
         .load_contact(&fp)
         .map_err(|e| e.to_string())?
         .ok_or("no such contact")?;
-    let account = state.account.lock().await;
-    let preview = dratchet_app::preview_conversation_wipe(&state.db, &account, &contact)
+    let session = state.session.lock().await;
+    let account = &session.account;
+    let preview = dratchet_app::preview_conversation_wipe(&state.db, account, &contact)
         .map_err(|e| e.to_string())?;
     Ok(WipePreviewDto {
         will_remove_locally: preview.will_remove_locally,
@@ -443,10 +457,13 @@ async fn request_conversation_wipe(
         .load_contact(&fp)
         .map_err(|e| e.to_string())?
         .ok_or("no such contact")?;
-    let mut conn_guard = state.conn.lock().await;
-    let conn = connected(&mut conn_guard)?;
-    let account = state.account.lock().await;
-    dratchet_app::request_conversation_wipe(&state.db, conn, &account, &contact)
+    let mut session = state.session.lock().await;
+    let Session {
+        conn: conn_guard,
+        account,
+    } = &mut *session;
+    let conn = connected(conn_guard)?;
+    dratchet_app::request_conversation_wipe(&state.db, conn, account, &contact)
         .await
         .map_err(|e| e.to_string())
 }
@@ -463,8 +480,9 @@ async fn confirm_pending_wipe(
         .load_contact(&fp)
         .map_err(|e| e.to_string())?
         .ok_or("no such contact")?;
-    let account = state.account.lock().await;
-    dratchet_app::confirm_pending_wipe(&state.db, &account, &contact).map_err(|e| e.to_string())
+    let session = state.session.lock().await;
+    let account = &session.account;
+    dratchet_app::confirm_pending_wipe(&state.db, account, &contact).map_err(|e| e.to_string())
 }
 
 /// The "Decline" side of an incoming wipe request.
@@ -511,10 +529,13 @@ async fn register_own_profile(
     state: State<'_, AppState>,
     username: String,
 ) -> Result<OwnProfileDto, String> {
-    let mut conn_guard = state.conn.lock().await;
-    let conn = connected(&mut conn_guard)?;
-    let mut account = state.account.lock().await;
-    let profile = dratchet_app::publish_own_bundle(&state.db, conn, &mut account, &username)
+    let mut session = state.session.lock().await;
+    let Session {
+        conn: conn_guard,
+        account,
+    } = &mut *session;
+    let conn = connected(conn_guard)?;
+    let profile = dratchet_app::publish_own_bundle(&state.db, conn, &mut *account, &username)
         .await
         .map_err(|e| e.to_string())?;
     Ok(to_own_profile_dto(&profile))
@@ -526,10 +547,13 @@ async fn rename_own_profile(
     state: State<'_, AppState>,
     new_username: String,
 ) -> Result<OwnProfileDto, String> {
-    let mut conn_guard = state.conn.lock().await;
-    let conn = connected(&mut conn_guard)?;
-    let mut account = state.account.lock().await;
-    let profile = dratchet_app::rename_own_profile(&state.db, conn, &mut account, &new_username)
+    let mut session = state.session.lock().await;
+    let Session {
+        conn: conn_guard,
+        account,
+    } = &mut *session;
+    let conn = connected(conn_guard)?;
+    let profile = dratchet_app::rename_own_profile(&state.db, conn, &mut *account, &new_username)
         .await
         .map_err(|e| e.to_string())?;
     Ok(to_own_profile_dto(&profile))
@@ -561,13 +585,16 @@ async fn add_contact(
         .load_own_profile()
         .map_err(|e| e.to_string())?
         .ok_or("choose a username for yourself first")?;
-    let mut conn_guard = state.conn.lock().await;
-    let conn = connected(&mut conn_guard)?;
-    let account = state.account.lock().await;
+    let mut session = state.session.lock().await;
+    let Session {
+        conn: conn_guard,
+        account,
+    } = &mut *session;
+    let conn = connected(conn_guard)?;
     let contact = dratchet_app::add_contact_by_username(
         &state.db,
         conn,
-        &account,
+        account,
         &own_profile,
         &username,
         discriminator,
@@ -789,7 +816,7 @@ async fn poll_loop<R: Runtime>(app_handle: AppHandle<R>) {
     // Set the moment a tick's work hits a transport-layer error
     // (`is_connection_error`); cleared the moment a reconnect succeeds.
     // While set, ordinary tick work is skipped in favor of a
-    // backoff-gated reconnect attempt — every command shares `state.conn`
+    // backoff-gated reconnect attempt — every command shares `state.session`
     // behind the same `Mutex`, so healing it here heals it for the whole
     // app, not just this loop (`docs/DELIVERY_FAILURE_FINDINGS.md`
     // scenario 23).
@@ -808,8 +835,9 @@ async fn poll_loop<R: Runtime>(app_handle: AppHandle<R>) {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let account = state.account.lock().await;
-            match dratchet_app::mark_expired_sends(&state.db, &account, now) {
+            let session = state.session.lock().await;
+            let account = &session.account;
+            match dratchet_app::mark_expired_sends(&state.db, account, now) {
                 Ok(0) => {}
                 Ok(n) => {
                     eprintln!("poll: {n} sent message(s) expired undelivered");
@@ -823,7 +851,7 @@ async fn poll_loop<R: Runtime>(app_handle: AppHandle<R>) {
         // DRA-0062: not connected yet (the server was unreachable at
         // launch) -- attempt it now, through the same backoff-gated path a
         // reconnect uses.
-        if next_reconnect_attempt.is_none() && state.conn.lock().await.is_none() {
+        if next_reconnect_attempt.is_none() && state.session.lock().await.conn.is_none() {
             next_reconnect_attempt = Some(std::time::Instant::now());
         }
         if let Some(due) = next_reconnect_attempt {
@@ -838,26 +866,22 @@ async fn poll_loop<R: Runtime>(app_handle: AppHandle<R>) {
             // answering.
             let reconnected = match Connection::connect(&state.server_url).await {
                 Ok(conn) => {
-                    let mut account = state.account.lock().await;
-                    authenticate_and_reconcile(conn, &state.db, &mut account).await
+                    let mut session = state.session.lock().await;
+                    authenticate_and_reconcile(conn, &state.db, &mut session.account).await
                 }
                 Err(e) => Err(e.to_string()),
             };
             match reconnected {
                 Ok((new_conn, notice)) => {
                     eprintln!("poll: reconnected to {}", state.server_url);
-                    // DRA-0067: the account lock is released before the
-                    // connection lock is taken. Every command takes the
-                    // connection first, then the account; holding the
-                    // account here while waiting for the connection
-                    // deadlocked against any command sent mid-reconnect.
-                    *state.conn.lock().await = Some(new_conn);
+                    let mut session = state.session.lock().await;
+                    session.conn = Some(new_conn);
                     // Anything sent during the outage has genuine reason
                     // to be in doubt — see `mark_pending_sends_uncertain`'s
                     // doc. Best-effort: a failure here shouldn't block
                     // the reconnect itself from completing.
-                    let account = state.account.lock().await;
-                    if let Err(e) = dratchet_app::mark_pending_sends_uncertain(&state.db, &account)
+                    if let Err(e) =
+                        dratchet_app::mark_pending_sends_uncertain(&state.db, &session.account)
                     {
                         eprintln!("poll: mark_pending_sends_uncertain failed: {e}");
                     } else {
@@ -885,12 +909,15 @@ async fn poll_loop<R: Runtime>(app_handle: AppHandle<R>) {
 
         let mut connection_died = false;
         {
-            let mut conn_guard = state.conn.lock().await;
+            let mut session = state.session.lock().await;
+            let Session {
+                conn: conn_guard,
+                account,
+            } = &mut *session;
             let conn = conn_guard
                 .as_mut()
                 .expect("connected: checked at the top of this tick (DRA-0062)");
-            let mut account = state.account.lock().await;
-            match dratchet_app::receive_first_contact_attempts(&state.db, conn, &mut account).await
+            match dratchet_app::receive_first_contact_attempts(&state.db, conn, &mut *account).await
             {
                 Ok(new_contacts) if !new_contacts.is_empty() => changed = true,
                 Ok(_) => {}
@@ -901,7 +928,7 @@ async fn poll_loop<R: Runtime>(app_handle: AppHandle<R>) {
             }
 
             if !connection_died && tick_count.is_multiple_of(PREKEY_REPLENISH_CHECK_EVERY_N_TICKS) {
-                if let Err(e) = replenish_prekeys_if_low(&state.db, conn, &mut account).await {
+                if let Err(e) = replenish_prekeys_if_low(&state.db, conn, &mut *account).await {
                     connection_died = is_connection_error(&e);
                     eprintln!("poll: replenish_prekeys_if_low failed: {e}");
                 }
@@ -923,12 +950,15 @@ async fn poll_loop<R: Runtime>(app_handle: AppHandle<R>) {
                 }
                 let mailbox_before = contact.mailbox_id.clone();
                 let received = {
-                    let mut conn_guard = state.conn.lock().await;
+                    let mut session = state.session.lock().await;
+                    let Session {
+                        conn: conn_guard,
+                        account,
+                    } = &mut *session;
                     let conn = conn_guard
                         .as_mut()
                         .expect("connected: checked at the top of this tick (DRA-0062)");
-                    let account = state.account.lock().await;
-                    dratchet_app::receive_pending(&state.db, conn, &account, &contact).await
+                    dratchet_app::receive_pending(&state.db, conn, account, &contact).await
                 };
                 match received {
                     Ok(outcome) => {
@@ -1096,8 +1126,7 @@ pub fn run() {
     } else {
         ConnectionStatusDto::Reconnecting
     };
-    let conn = Arc::new(Mutex::new(conn));
-    let account = Arc::new(Mutex::new(account));
+    let session = Mutex::new(Session { conn, account });
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -1105,8 +1134,7 @@ pub fn run() {
             db,
             db_path,
             server_url: SERVER_URL.to_string(),
-            account,
-            conn,
+            session,
             own_discriminator_change_notice: StdMutex::new(own_discriminator_change_notice),
             peer_profile_change_notices: StdMutex::new(Vec::new()),
             // DRA-0062: `Reconnecting` if the server was unreachable at

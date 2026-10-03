@@ -1434,12 +1434,11 @@ Explicitly out of scope for v1 (call out, don't silently ignore):
   leaning toward shipping it, but off-by-default is the part that isn't
   negotiable given the Signal/WhatsApp/iMessage precedent of treating it as
   more sensitive than delivery confirmation.
-- `ProfileAnnounce` (§6.1) has no rate limit: an already-`Verified`
-  contact could send an unbounded stream of them, each triggering a
-  `Db::record_peer_profile` write and a UI toast. Low severity (requires
-  an existing verified relationship to exploit; worst case is toast/DB
-  churn, not data loss or a security bypass), deferred rather than fixed
-  pending real usage — same posture as the other low-stakes items above.
+- ~~`ProfileAnnounce` (§6.1) has no rate limit~~ — resolved by DRA-0070:
+  a contact's handle changes still update the contact immediately, but
+  the "changed their handle" notice is shown at most once per contact
+  every 10 minutes, with any change held back announced once the window
+  passes.
 - Tier 0 connection budget and Tier 1 TTL (§4.5): 10s and 14 days are
   reasonable starting defaults, not measured — tune once there's real
   network/usage data, especially the TTL if a server-based deployment (§12)
