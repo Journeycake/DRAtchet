@@ -29,6 +29,8 @@ serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 redb = "2"
 sha2 = "0.10"
+chacha20poly1305 = "0.10"
+toml = "0.8"
 futures-util = "0.3"
 thiserror = "1"
 rand_core = { version = "0.6", features = ["getrandom"] }
@@ -43,9 +45,12 @@ clap = { version = "4", features = ["derive", "env"] }
 # style native dependency this workspace has otherwise avoided.
 dialoguer = { version = "0.11", optional = true }
 serde_json = { version = "1", optional = true }
+# Bold red for the mail persistence warning; already in the tree through
+# dialoguer.
+console = { version = "0.15", optional = true }
 
 [features]
-wizard = ["dep:dialoguer", "dep:serde_json"]
+wizard = ["dep:dialoguer", "dep:serde_json", "dep:console"]
 
 [dev-dependencies]
 tokio-tungstenite = "0.21"

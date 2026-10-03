@@ -5,6 +5,7 @@ The relay holds queued mail in memory only by default, so a seized server disk y
 ## Consequences
 
 - The single checkmark (Accepted) waits until the message is on disk, so saves run every 0–15 s (default 10 s) and early when the memory area reaches half its limit (default one tenth of usable RAM); clients wait that interval plus their normal timeout for the checkmark.
-- A clean shutdown that completes its last save keeps the Server Epoch; a start without that, a rebuild that drops a Sealed Message, or a lost or replaced store advances it.
+- A clean shutdown that completes its last save keeps the Server Epoch. A start without that, a rebuild that drops a Sealed Message, index rows changed on disk without the key, or a lost or replaced store advances it. Restoring a whole older copy of the store isn't detected; recipients already ignore mail they've collected.
+- Fragments are unreadable without the key, but someone who can read every storage location can pair a message's Fragments by size and write time.
 - When the relay refuses mail it doesn't say why, so its memory state can't be probed.
 - Changing the key on a live server, limits on mail for long-absent recipients, and Fragment storage off the relay host are deferred to v1.5 planning.

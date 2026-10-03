@@ -1,0 +1,26 @@
+# dratchet.cfg — dratchetd settings (TOML). Copy to dratchet.cfg in the
+# working directory, or point --config / DRATCHETD_CONFIG at it.
+# Environment variables and flags override anything here. Unknown keys are
+# an error. See server/README.md and docs/adr/0001.
+
+# bind = "127.0.0.1:8787"
+# directory_db = "/var/lib/dratchetd/directory.redb"
+# trusted_proxies = ""
+
+# Save queued mail to disk. Off by default, except on hosts with under
+# 2 GB of usable memory.
+# persist_mailboxes = true
+
+# At least two, ideally on different volumes.
+# fragment_dirs = ["/srv/dratchetd/fragments-a", "/srv/dratchetd/fragments-b"]
+# mailbox_index_db = "/var/lib/dratchetd/mailbox-index.redb"
+
+# Seconds between saves, 0-15 (0 saves on every write).
+# flush_interval = 10
+
+# Bytes of unsaved mail held in memory; default a tenth of usable memory.
+# memory_limit = 209715200
+
+# A file holding the 64-hex-character key, readable only by its owner.
+# The key itself never goes in this file (or use DRATCHETD_MAILBOX_KEY).
+# mailbox_key_file = "/etc/dratchetd/mailbox.key"

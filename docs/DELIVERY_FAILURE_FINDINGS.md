@@ -110,6 +110,10 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0066 | Medium | `app/src/lib.rs:939 (reannounce_routing_id_if_unconfirmed), app/src/lib.rs:1161 (receive_pending confirms the switch), app/src/lib.rs:1648 (announce_routing_id keeps the envelope); store/src/contacts.rs:106 (Contact::routing_confirmed, routing_announce)` | [`d739e0f`](https://github.com/Journeycake/dratchet/commit/d739e0f7d688b6c4cc0fa0c1037400b205318f32) | this doc |
 | DRA-0067 | Medium | `ui/src-tauri/src/lib.rs:821 (poll_loop reconnect)` | [`bc8e05b`](https://github.com/Journeycake/dratchet/commit/bc8e05b4e85ca4fa6e09929be07c26fd46c58009) | this doc |
 | DRA-0068 | Medium | `client/src/net.rs:81 (Connection::connect_with_timeout); ui/src-tauri/src/lib.rs:833 (poll_loop reconnect)` | [`970ffcc`](https://github.com/Journeycake/dratchet/commit/970ffcc9436f63178c35bafdaf5fc6ba1c64f0d9) | this doc |
+| DRA-0071 | Low | `server/src/mailstore.rs:221 (ensure_private_dir)` | [`07bcb62`](https://github.com/Journeycake/dratchet/commit/07bcb6224ea738eaa74d14fa6e5decf6a83c9848) | this doc |
+| DRA-0072 | Medium | `server/src/ws.rs:684 (read_saved_envelopes); server/src/mailstore.rs:776 (MailStore::read_envelope)` | [`a71570a`](https://github.com/Journeycake/dratchet/commit/a71570a18777d665fe36b67b604dfc0dc370f836) | this doc |
+| DRA-0073 | Low | `server/src/mailstore.rs:317 (refuse_aliased_dirs)` | [`a2624d8`](https://github.com/Journeycake/dratchet/commit/a2624d812fa09ff0cd1ce966c23c02c89501df59) | this doc |
+| DRA-0074 | Low | `server/src/mailstore.rs:136 (StoreState), :162 (continuing_epoch), :494 (put_state)` | [`c98810c`](https://github.com/Journeycake/dratchet/commit/c98810c6baf6dd8656d1f268e4b742dfc325e153) | this doc |
 
 
 ## Summary
@@ -4483,3 +4487,100 @@ Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D w
 - **Authenticating still holds the account lock.** A server that completes the WebSocket handshake and then goes silent makes commands that need the account wait up to `REQUEST_TIMEOUT` per step. That's bounded, but noticeable.
 - **20 seconds is a constant**, as in DRA-0061.
 
+## DRA-0071: the mail store took over any directory it was pointed at (found in the persistence security check; confirmed real, fixed) — **LOW**
+
+> **DRA-0071** · Location: `server/src/mailstore.rs:221 (ensure_private_dir)` · Fix: [`07bcb62`](https://github.com/Journeycake/dratchet/commit/07bcb6224ea738eaa74d14fa6e5decf6a83c9848)
+
+At startup the mail store (`docs/adr/0001`) treated every configured fragment directory as its own. It restricted each one to its owner (mode 0700), deleted every `*.frag` file it didn't recognise, and deleted all of them when the key changed. Pointing `fragment_dirs` at an existing shared directory by mistake, such as a data directory or a mount used by something else, would change that directory's permissions and delete any files in it with that suffix. A relay running as root could do this to a system directory.
+
+Rated **Low**: it takes an operator misconfiguration, but the damage lands outside the relay and can't be undone.
+
+### Confirmation
+
+`server/tests/mail_persistence.rs`, `a_store_never_takes_over_a_directory_it_did_not_create`. A fragment directory that already exists has mode 0755 and holds someone else's `report.frag`. Opening the store changed the mode to 700 and deleted the file, and the test failed with its `VULNERABILITY:` assertion.
+
+### Fixed
+
+A fragment directory is the store's own only if the store created it, or adopted it while it was empty. Either way it writes a `.dratchet-fragments` marker. A directory that exists, isn't empty and has no marker is refused with an error asking for an empty or new directory, before anything in it is touched.
+
+Guard: `the_store_reopens_directories_it_created`, covering restarts and adopting an existing empty directory. The test helper that counts Fragments now counts only `*.frag` files, since the marker lives alongside them.
+
+Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (364 passed).
+
+### Known residual scope
+
+- **A marked directory is trusted.** Copying the marker into another directory makes the store treat that directory as its own.
+- **The index database path isn't checked the same way.** It's a single file the store creates.
+- **This check covered robustness, not adversarial attacks.** It looked at the code's handling of operator configuration. The adversarial pass on the stored data (reading, linking, tampering, replay, epoch spoofing) is part of the scheduled full test and penetration test. The existing tests already cover tampered and missing Fragments and a wrong key.
+
+## DRA-0072: a fetch racing a save started a new Server Epoch for every client (found in the persistence test and penetration test; confirmed real, fixed) — **MEDIUM**
+
+> **DRA-0072** · Location: `server/src/ws.rs:684 (read_saved_envelopes); server/src/mailstore.rs:776 (MailStore::read_envelope)` · Fix: [`a71570a`](https://github.com/Journeycake/dratchet/commit/a71570a18777d665fe36b67b604dfc0dc370f836)
+
+With persistence on, a `MailboxFetch` lists the mailbox's entries under the state lock, then releases the lock and reads the saved ones from disk. If an entry was deleted, or expired, and a save removed it from the mail store in that window, the read found no index record. `read_saved_envelopes` treated any failed read as lost mail and advanced the Server Epoch. Every client of the relay then offered Retry for all of its undelivered messages.
+
+Any signed-in user could trigger this on purpose and repeatedly. They needed only a mailbox holding saved mail written by a second identity, and to race a fetch of it against a `MailboxDelete` around a save. The save interval is advertised in `AuthChallenge`, and a zero interval saves on every write. It could also happen with no one trying, when an entry expired while a fetch was reading it.
+
+Rated **Medium**: no mail is read or lost, but a single account can repeatedly flood every user of the relay with Retry offers, each of which costs a ratchet chain position when taken. That turns the DRA-0064 signal into noise.
+
+### Confirmation
+
+`server/src/ws.rs`, `tests::an_entry_collected_during_a_fetch_is_not_treated_as_lost`. It saves two entries, captures what a fetch would list, deletes one entry and runs a save (which removes it from the store), then runs the fetch's disk read. The epoch advanced, and the test failed with its `VULNERABILITY:` assertion.
+
+### Fixed
+
+`MailStore::read_envelope` returns `Ok(None)` for an entry the store no longer holds. The fetch skips that entry, since it was collected or expired. Only an entry that is still indexed but can't be read back (a missing Fragment, a failed checksum or failed decryption) counts as lost and advances the epoch. The same test checks that the remaining entry is still delivered.
+
+Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
+
+## DRA-0073: one fragment directory under two names lost every saved entry at the next start (found in the persistence test and penetration test; confirmed real, fixed) — **LOW**
+
+> **DRA-0073** · Location: `server/src/mailstore.rs:317 (refuse_aliased_dirs)` · Fix: [`a2624d8`](https://github.com/Journeycake/dratchet/commit/a2624d812fa09ff0cd1ce966c23c02c89501df59)
+
+The configuration check that persistence has "at least two different `fragment_dirs`" compares the names as written. A symlink, `./a` beside `a`, an absolute path beside a relative one, or a bind mount all passed while naming one directory. Both of every Sealed Message's Fragments then landed in the same place. At the next start, even a clean one, the orphan sweep checks each directory's files against that directory's position in the list, so it deleted every entry's other Fragment. All persisted mail was lost on every restart. The loss surfaced as a new epoch only when each entry was next fetched.
+
+Rated **Low**: it takes an operator misconfiguration, like DRA-0071, but it silently defeats the whole feature.
+
+### Confirmation
+
+`server/tests/mail_persistence.rs`, `one_directory_named_twice_is_refused_rather_than_losing_every_entry`. It configures a directory and a symlink to it, saves an entry, records a clean shutdown and reopens. The entry was gone, and the test failed with its `VULNERABILITY:` assertion.
+
+### Fixed
+
+`MailStore::open` compares the fragment directories' device and inode numbers (the canonical path off Unix) once they exist. It refuses to open with an error naming both directories. Guard: `the_store_reopens_directories_it_created`.
+
+## DRA-0074: the mail store's state could be edited on disk to hide lost mail (found in the persistence test and penetration test; confirmed real, fixed) — **LOW**
+
+> **DRA-0074** · Location: `server/src/mailstore.rs:136 (StoreState), :162 (continuing_epoch), :494 (put_state)` · Fix: [`c98810c`](https://github.com/Journeycake/dratchet/commit/c98810c6baf6dd8656d1f268e4b742dfc325e153)
+
+The Server Epoch number and the clean-shutdown flag were stored in plaintext, and nothing recorded which index rows the store had written. Someone with write access to the relay's disk but not its key could do either of these without the relay advancing its epoch:
+
+- Delete an Accepted entry's index row. Its Fragments were then removed as orphans.
+- Mark a crashed run as clean.
+
+Senders were never offered Retry. The loss surfaced only as the 14-day undelivered notice (DRA-0063).
+
+Rated **Low**: it needs write access to the relay's disk. The loss is still caught eventually by the 14-day notice. Nothing is read or forged.
+
+### Confirmation
+
+`server/tests/mail_persistence.rs`:
+
+- `deleting_an_index_row_on_disk_still_advances_the_epoch` removes one row with redb directly after a clean stop.
+- `marking_a_crashed_run_clean_on_disk_still_advances_the_epoch` sets the plaintext flag after a crash.
+
+Both failed with their `VULNERABILITY:` assertions.
+
+### Fixed
+
+The store's state is now one record sealed under the index key: the store id, the epoch number, the clean flag, and a SHA-256 manifest of every index row id. It's rewritten in the same transaction as every change to the index: a save, a removal, the rebuild at startup, an epoch advance and the clean-shutdown record. At startup:
+
+- A missing or unreadable state record starts a new store id.
+- A manifest that doesn't match the rows actually on disk advances the epoch.
+
+Guards: `an_untouched_clean_store_keeps_its_epoch`, `deleting_the_sealed_state_record_starts_a_new_epoch`, and the existing restart, crash and damaged-store tests.
+
+### Known residual scope
+
+- **Rollback of the whole store.** Replacing the index and Fragments together with an older, consistent copy still verifies, because nothing off the disk records how far the store had got. The recipient is handed mail it has already collected. `app/tests/server_epoch_persistence.rs`, `a_rolled_back_mail_store_redelivers_nothing_the_recipient_shows_twice` (added in [`a9d92ea`](https://github.com/Journeycake/dratchet/commit/a9d92eaad85afaedce8c42e27d6ae34465d84cbc)), shows the recipient displays nothing twice and the conversation carries on. Closing this would need a counter kept off the relay's disk.
+- **Fragments can be paired by their files.** A message's Fragments are written at the same moment and differ in size by at most a byte. Someone who can read every fragment directory can pair them and see when each message was queued, but not its content, mailbox or sender. This is documented in `server/src/mailstore.rs` and ADR 0001 and isn't counted as a finding. Off-relay Fragment storage (v1.5 planning) is where it would be addressed.

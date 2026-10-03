@@ -181,6 +181,26 @@ pub struct MailboxEntry {
     /// pattern turns this from a rare, easily-avoided-by-test-choreography
     /// edge case into the common one (`docs/DELIVERY_FAILURE_FINDINGS.md`).
     pub written_by: Fingerprint,
+    /// `docs/adr/0001`: whether this entry is in the mail store on disk.
+    /// Once it is, `envelope` is emptied -- memory only holds mail not yet
+    /// saved -- and fetches read it back from the store.
+    pub saved: bool,
+    /// The save that will cover this entry; its writer is acknowledged
+    /// once `AppState::flushed` reaches this value.
+    pub flush_seq: u64,
+}
+
+impl MailboxEntry {
+    pub fn new(envelope: Vec<u8>, expires_at: SystemTime, written_by: Fingerprint) -> Self {
+        MailboxEntry {
+            entry_id: random_16(),
+            envelope,
+            expires_at,
+            written_by,
+            saved: false,
+            flush_seq: 0,
+        }
+    }
 }
 
 /// DRA-0045 (`docs/DELIVERY_FAILURE_FINDINGS.md`) — how many frames may
@@ -250,6 +270,26 @@ pub struct Inner {
     /// (`ARCHITECTURE.md` §11.8); surfacing it to the affected user is
     /// future client work, not something this server-only phase can do.
     pub otp_exhaustion_attempts: HashMap<Fingerprint, u32>,
+    /// `docs/adr/0001`: bytes of queued mail held in memory (not yet
+    /// saved). Kept as a running total; recounted exactly at each save and
+    /// before any refusal, since removals elsewhere don't update it.
+    pub memory_bytes: u64,
+    /// The sequence number the next save will carry.
+    pub next_flush_seq: u64,
+}
+
+impl Inner {
+    /// Exact bytes of unsaved queued mail.
+    pub fn recount_memory(&mut self) -> u64 {
+        self.memory_bytes = self
+            .mailboxes
+            .values()
+            .flatten()
+            .filter(|e| !e.saved)
+            .map(|e| e.envelope.len() as u64)
+            .sum();
+        self.memory_bytes
+    }
 }
 
 impl Inner {
@@ -306,23 +346,129 @@ pub struct AppState {
     /// DRA-0055 — reverse proxies whose `X-Forwarded-For` is believed.
     /// Empty by default; set once at startup by `src/main.rs`.
     pub trusted_proxies: std::sync::RwLock<crate::address::TrustedProxies>,
-    /// DRA-0064: random per process, sent in every `AuthChallenge`, so a
-    /// client can tell the server restarted (and its in-memory mailboxes
-    /// with it).
-    pub boot_id: [u8; 16],
+    /// The Server Epoch, sent in every `AuthChallenge` (DRA-0064,
+    /// `docs/adr/0001`): a client that sees it change offers Retry for its
+    /// undelivered messages. Without a mail store it is random per
+    /// process, since every restart loses queued mail.
+    pub epoch: std::sync::RwLock<crate::mailstore::Epoch>,
+    /// `Some` when mailbox persistence is on.
+    pub mail_store: Option<Arc<crate::mailstore::MailStore>>,
+    /// How often queued mail is saved (0: on every write). Advertised to
+    /// clients, which wait this much longer for a write's checkmark.
+    pub save_interval: Duration,
+    /// Most bytes of unsaved mail held in memory before writes are refused;
+    /// half of it triggers an early save.
+    pub memory_limit: u64,
+    /// Wakes the save task early (a write with a zero interval, or memory
+    /// at half its limit).
+    pub flush_notify: tokio::sync::Notify,
+    /// The sequence number of the last completed save.
+    pub flushed: tokio::sync::watch::Sender<u64>,
+    /// One save at a time (the save loop and a shutdown's final save).
+    pub flush_lock: tokio::sync::Mutex<()>,
+}
+
+/// The memory limit used when no setting gives one: a tenth of usable
+/// memory (`crate::config`).
+pub fn default_memory_limit() -> u64 {
+    crate::config::usable_memory()
+        .map(|m| m / 10)
+        .unwrap_or(crate::config::FALLBACK_MEMORY_LIMIT)
 }
 
 impl AppState {
-    pub fn new() -> Arc<Self> {
+    fn build(
+        inner: Inner,
+        persistence: Option<crate::persistence::Persistence>,
+        connection_cap: usize,
+        mail_store: Option<(Arc<crate::mailstore::MailStore>, Duration)>,
+        memory_limit: u64,
+    ) -> Arc<Self> {
+        let epoch = match &mail_store {
+            Some((store, _)) => store.epoch(),
+            None => crate::mailstore::Epoch {
+                store_id: random_16(),
+                number: 0,
+            },
+        };
+        let (save_interval, mail_store) = match mail_store {
+            Some((store, interval)) => (interval, Some(store)),
+            None => (Duration::ZERO, None),
+        };
         Arc::new(AppState {
-            inner: RwLock::new(Inner::default()),
-            persistence: None,
+            inner: RwLock::new(Inner {
+                next_flush_seq: 1,
+                ..inner
+            }),
+            persistence,
             active_connections: AtomicUsize::new(0),
-            connection_cap: MAX_CONCURRENT_CONNECTIONS,
+            connection_cap,
             address_limiter: Default::default(),
             trusted_proxies: Default::default(),
-            boot_id: random_16(),
+            epoch: std::sync::RwLock::new(epoch),
+            mail_store,
+            save_interval,
+            memory_limit,
+            flush_notify: tokio::sync::Notify::new(),
+            flushed: tokio::sync::watch::channel(0).0,
+            flush_lock: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// The Server Epoch as clients compare it.
+    pub fn epoch_wire_id(&self) -> Vec<u8> {
+        self.epoch.read().expect("epoch lock").wire_id()
+    }
+
+    pub fn new() -> Arc<Self> {
+        Self::build(
+            Inner::default(),
+            None,
+            MAX_CONCURRENT_CONNECTIONS,
+            None,
+            default_memory_limit(),
+        )
+    }
+
+    /// `docs/adr/0001`: state over a mail store already opened (and
+    /// rebuilt), with its restored entries placed back in their mailboxes.
+    pub fn with_mail_store(
+        persistence: Option<crate::persistence::Persistence>,
+        opened: crate::mailstore::OpenedStore,
+        save_interval: Duration,
+        memory_limit: u64,
+    ) -> Arc<Self> {
+        let mut inner = Inner::default();
+        if let Some(p) = &persistence {
+            load_directory(&mut inner, p);
+        }
+        for r in opened.restored {
+            inner
+                .mailboxes
+                .entry(r.mailbox_id)
+                .or_default()
+                .push(MailboxEntry {
+                    entry_id: r.entry_id,
+                    envelope: Vec::new(),
+                    expires_at: SystemTime::UNIX_EPOCH + Duration::from_secs(r.expires_at),
+                    written_by: r.written_by,
+                    saved: true,
+                    flush_seq: 0,
+                });
+        }
+        if let Some(why) = opened.advanced_because {
+            tracing::warn!(
+                epoch = opened.epoch.number,
+                "mail store: new server epoch ({why}); clients will offer to resend undelivered mail"
+            );
+        }
+        Self::build(
+            inner,
+            persistence,
+            MAX_CONCURRENT_CONNECTIONS,
+            Some((Arc::new(opened.store), save_interval)),
+            memory_limit,
+        )
     }
 
     /// Like [`AppState::new`], but with a caller-chosen connection cap —
@@ -331,15 +477,7 @@ impl AppState {
     /// instead of the real `MAX_CONCURRENT_CONNECTIONS`.
     #[allow(dead_code)]
     pub fn new_with_connection_cap(cap: usize) -> Arc<Self> {
-        Arc::new(AppState {
-            inner: RwLock::new(Inner::default()),
-            persistence: None,
-            active_connections: AtomicUsize::new(0),
-            connection_cap: cap,
-            address_limiter: Default::default(),
-            trusted_proxies: Default::default(),
-            boot_id: random_16(),
-        })
+        Self::build(Inner::default(), None, cap, None, default_memory_limit())
     }
 
     /// Like [`AppState::new`], but the directory is seeded from — and
@@ -348,28 +486,30 @@ impl AppState {
     /// caller.
     pub fn with_persistence(persistence: crate::persistence::Persistence) -> Arc<Self> {
         let mut inner = Inner::default();
-        for (fp, stored) in persistence.load_all() {
-            let username_key = UsernameKey {
-                username: stored.bundle.username.clone(),
-                discriminator: stored.bundle.discriminator,
-            };
-            inner.username_index.insert(username_key, fp);
-            inner.register_bundle(fp, stored);
-        }
-        tracing::info!(
-            recovered = inner.directory.len(),
-            "directory persistence: loaded from disk"
-        );
-        Arc::new(AppState {
-            inner: RwLock::new(inner),
-            persistence: Some(persistence),
-            active_connections: AtomicUsize::new(0),
-            connection_cap: MAX_CONCURRENT_CONNECTIONS,
-            address_limiter: Default::default(),
-            trusted_proxies: Default::default(),
-            boot_id: random_16(),
-        })
+        load_directory(&mut inner, &persistence);
+        Self::build(
+            inner,
+            Some(persistence),
+            MAX_CONCURRENT_CONNECTIONS,
+            None,
+            default_memory_limit(),
+        )
     }
+}
+
+fn load_directory(inner: &mut Inner, persistence: &crate::persistence::Persistence) {
+    for (fp, stored) in persistence.load_all() {
+        let username_key = UsernameKey {
+            username: stored.bundle.username.clone(),
+            discriminator: stored.bundle.discriminator,
+        };
+        inner.username_index.insert(username_key, fp);
+        inner.register_bundle(fp, stored);
+    }
+    tracing::info!(
+        recovered = inner.directory.len(),
+        "directory persistence: loaded from disk"
+    );
 }
 
 pub fn now_unix() -> u64 {

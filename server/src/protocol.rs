@@ -99,6 +99,16 @@ pub struct AuthChallenge {
     /// ignores it).
     #[serde(default, with = "serde_bytes")]
     pub server_boot_id: Vec<u8>,
+    /// `docs/adr/0001`: the Server Epoch number behind `server_boot_id`
+    /// (which now carries the whole epoch: mail store id and number).
+    /// For logs; clients compare `server_boot_id`.
+    #[serde(default)]
+    pub server_epoch: u64,
+    /// `docs/adr/0001`: with mailbox persistence on, a write's `Ack` waits
+    /// for the next save, which can take this long. Clients wait this much
+    /// longer than usual for it. 0 from a relay without persistence.
+    #[serde(default)]
+    pub save_interval_ms: u32,
 }
 
 /// Self-certifying: carries the raw public key itself rather than a claimed
@@ -403,6 +413,8 @@ mod tests {
     fn round_trips_a_typed_frame() {
         let body = AuthChallenge {
             server_boot_id: Vec::new(),
+            server_epoch: 0,
+            save_interval_ms: 0,
             nonce: vec![7u8; 32],
         };
         let frame = encode(FrameTag::AuthChallenge, &body);
@@ -440,6 +452,8 @@ mod tests {
     fn byte_fields_encode_as_cbor_byte_strings_not_integer_arrays() {
         let body = AuthChallenge {
             server_boot_id: Vec::new(),
+            server_epoch: 0,
+            save_interval_ms: 0,
             nonce: vec![1, 2, 3],
         };
         let frame = encode(FrameTag::AuthChallenge, &body);

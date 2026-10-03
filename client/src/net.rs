@@ -61,6 +61,10 @@ impl From<NetError> for String {
 /// holding whatever lock guarded the connection the whole time.
 pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// docs/adr/0001: the longest save interval a relay may advertise; extra
+/// wait beyond [`REQUEST_TIMEOUT`] is capped at this.
+pub const MAX_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
 pub struct Connection {
     ws: WsStream,
     request_timeout: std::time::Duration,
@@ -109,6 +113,12 @@ impl Connection {
     /// (empty before [`authenticate`](Self::authenticate), or from a server
     /// that predates it). A change since the last connection means the
     /// server restarted and lost every queued message.
+    /// The current request timeout (after [`authenticate`](Self::authenticate),
+    /// it includes the relay's save interval).
+    pub fn request_timeout(&self) -> std::time::Duration {
+        self.request_timeout
+    }
+
     pub fn server_boot_id(&self) -> &[u8] {
         &self.server_boot_id
     }
@@ -207,6 +217,14 @@ impl Connection {
     pub async fn authenticate(&mut self, account: &Account) -> Result<(), NetError> {
         let (tag, challenge): (_, AuthChallenge) = self.recv().await?;
         self.server_boot_id = challenge.server_boot_id.clone();
+        // docs/adr/0001: a relay that saves mail to disk acknowledges a
+        // write only after its next save, up to `save_interval_ms` later.
+        // Wait that much longer, but never more than the largest interval
+        // a relay may configure, so a relay can't stall the client by
+        // advertising a huge one.
+        self.request_timeout +=
+            std::time::Duration::from_millis(u64::from(challenge.save_interval_ms))
+                .min(MAX_SAVE_INTERVAL);
         if tag != FrameTag::AuthChallenge {
             return Err(NetError::Protocol(format!(
                 "expected AuthChallenge, got {tag:?}"

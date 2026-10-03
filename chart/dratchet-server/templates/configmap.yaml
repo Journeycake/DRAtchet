@@ -8,3 +8,14 @@ data:
   DRATCHETD_BIND: "0.0.0.0:{{ .Values.service.port }}"
   RUST_LOG: {{ .Values.config.logLevel | quote }}
   DRATCHETD_TRUSTED_PROXIES: {{ .Values.config.trustedProxies | quote }}
+  # docs/adr/0001: always set explicitly. Left unset, dratchetd turns
+  # persistence on by itself whenever its memory limit is under 2 GB.
+  DRATCHETD_PERSIST_MAILBOXES: {{ .Values.mailPersistence.enabled | quote }}
+  {{- if .Values.mailPersistence.enabled }}
+  DRATCHETD_FRAGMENT_DIRS: {{ include "dratchet-server.fragmentDirs" . | quote }}
+  DRATCHETD_MAILBOX_INDEX_DB: "{{ include "dratchet-server.mailDataRoot" . }}/mail-index/store/index.redb"
+  DRATCHETD_FLUSH_INTERVAL: {{ .Values.mailPersistence.flushInterval | quote }}
+  {{- with .Values.mailPersistence.memoryLimit }}
+  DRATCHETD_MEMORY_LIMIT: {{ . | quote }}
+  {{- end }}
+  {{- end }}
