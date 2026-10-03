@@ -4456,7 +4456,7 @@ Validation: `ui/src-tauri` `cargo fmt --check`, `cargo clippy --all-targets -- -
 ### Known residual scope
 
 - **Commands still wait while a reconnect holds the account lock.** That includes connecting itself, with no time limit on the attempt (DRA-0068).
-- **The order is a convention, not enforced.** A future code path that holds the account lock while waiting for the connection lock would bring it back. One lock around both would rule that out, at the cost of serializing reads behind the network.
+- ~~**The order is a convention, not enforced.**~~ Closed later (roadmap item 7): the connection and the account now sit behind a single `session` lock in `ui/src-tauri`, so there is no order to get wrong. Account-only reads already waited behind network work, since the poll loop held the account during every exchange.
 
 ## DRA-0068: a server that accepted connections but never answered froze the desktop app (DRA-0061's residual, extended to connecting; confirmed real, fixed) — **MEDIUM**
 
