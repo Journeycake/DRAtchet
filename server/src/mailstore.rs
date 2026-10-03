@@ -7,15 +7,23 @@
 //! under a key derived from the operator's key -- split into **Fragments**,
 //! one per configured fragment directory, each in its own file named by a
 //! random UUID. An index database maps each entry to its Fragments and the
-//! SHA-256 of its Sealed Message; every index record is itself encrypted,
-//! so only the key holder can tell which Fragments belong together.
+//! SHA-256 of its Sealed Message. Every index record is itself encrypted,
+//! so the index doesn't say which Fragments belong together. The files
+//! themselves can, though: a message's Fragments are written at the same
+//! moment and differ in size by at most a byte, so someone who can read
+//! every fragment directory can pair them up and see when each message
+//! was queued, though not what it says or who it's for.
 //!
 //! The store also owns the **Server Epoch**: a store id plus a counter,
 //! sent to every client. It advances whenever queued mail may have been
 //! lost -- a start after a run that didn't finish its last save, an entry
-//! that couldn't be rebuilt, or a store that was lost or can't be read
-//! with the current key -- so clients can offer Retry for their
-//! undelivered messages (DRA-0064).
+//! that couldn't be rebuilt, index rows on disk that aren't the ones the
+//! store left, or a store that was lost or can't be read with the current
+//! key -- so clients can offer Retry for their undelivered messages
+//! (DRA-0064). The epoch, the clean-shutdown flag and a manifest of the
+//! index rows are kept in one record sealed under the key (DRA-0074).
+//! Replacing the whole store with an older copy still verifies; nothing
+//! off the disk records how far it had got.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
