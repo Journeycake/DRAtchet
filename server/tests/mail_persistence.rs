@@ -503,3 +503,117 @@ fn first_err_mentions_same_directory(mail: &MailPersistence) -> bool {
         .err()
         .is_some_and(|e| e.to_string().contains("are the same directory"))
 }
+
+/// Removes one row from the mail store's index, as someone with write
+/// access to its disk (but not its key) could.
+fn delete_index_row(index_db: &std::path::Path, entry_id: [u8; 16]) {
+    const INDEX: redb::TableDefinition<&[u8], &[u8]> =
+        redb::TableDefinition::new("mailstore_index");
+    let db = redb::Database::open(index_db).unwrap();
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(INDEX).unwrap();
+        assert!(table.remove(entry_id.as_slice()).unwrap().is_some());
+    }
+    txn.commit().unwrap();
+}
+
+fn set_clean_flag(index_db: &std::path::Path) {
+    const META: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("mailstore_meta");
+    let db = redb::Database::open(index_db).unwrap();
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(META).unwrap();
+        table.insert("clean_shutdown", [1u8].as_slice()).unwrap();
+    }
+    txn.commit().unwrap();
+}
+
+#[test]
+fn deleting_an_index_row_on_disk_still_advances_the_epoch() {
+    use dratchet_server::mailstore::MailStore;
+    let store = Store::new();
+    let mail = store.settings(KEY, Duration::from_secs(1));
+    let opened = MailStore::open(&mail.index_db, &mail.fragment_dirs, &KEY).unwrap();
+    opened.store.save(&[pending(1), pending(2)]).unwrap();
+    opened.store.mark_clean_shutdown().unwrap();
+    let before = opened.store.epoch();
+    drop(opened);
+
+    delete_index_row(&mail.index_db, [2; 16]);
+
+    let reopened = MailStore::open(&mail.index_db, &mail.fragment_dirs, &KEY).unwrap();
+    assert_eq!(reopened.restored.len(), 1);
+    assert_ne!(
+        reopened.epoch, before,
+        "VULNERABILITY: an Accepted entry was removed from disk without the key and the relay \
+         kept the same Server Epoch, so its sender is never offered Retry"
+    );
+}
+
+#[test]
+fn marking_a_crashed_run_clean_on_disk_still_advances_the_epoch() {
+    use dratchet_server::mailstore::MailStore;
+    let store = Store::new();
+    let mail = store.settings(KEY, Duration::from_secs(1));
+    let opened = MailStore::open(&mail.index_db, &mail.fragment_dirs, &KEY).unwrap();
+    opened.store.save(&[pending(1)]).unwrap();
+    let before = opened.store.epoch();
+    drop(opened); // a crash: no clean-shutdown record
+
+    set_clean_flag(&mail.index_db);
+
+    let reopened = MailStore::open(&mail.index_db, &mail.fragment_dirs, &KEY).unwrap();
+    assert_ne!(
+        reopened.epoch, before,
+        "VULNERABILITY: flipping the clean-shutdown flag on disk, without the key, hid a crash \
+         from clients"
+    );
+}
+
+/// Guard: an untouched store reopened after a clean stop keeps its epoch.
+#[test]
+fn an_untouched_clean_store_keeps_its_epoch() {
+    use dratchet_server::mailstore::MailStore;
+    let store = Store::new();
+    let mail = store.settings(KEY, Duration::from_secs(1));
+    let opened = MailStore::open(&mail.index_db, &mail.fragment_dirs, &KEY).unwrap();
+    opened.store.save(&[pending(1), pending(2)]).unwrap();
+    opened
+        .store
+        .retain(&[[1u8; 16]].into_iter().collect())
+        .unwrap();
+    opened.store.mark_clean_shutdown().unwrap();
+    let before = opened.store.epoch();
+    drop(opened);
+    let reopened = MailStore::open(&mail.index_db, &mail.fragment_dirs, &KEY).unwrap();
+    assert_eq!(reopened.restored.len(), 1);
+    assert_eq!(reopened.epoch, before);
+}
+
+#[test]
+fn deleting_the_sealed_state_record_starts_a_new_epoch() {
+    use dratchet_server::mailstore::MailStore;
+    const META: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("mailstore_meta");
+    let store = Store::new();
+    let mail = store.settings(KEY, Duration::from_secs(1));
+    let opened = MailStore::open(&mail.index_db, &mail.fragment_dirs, &KEY).unwrap();
+    opened.store.save(&[pending(1)]).unwrap();
+    opened.store.mark_clean_shutdown().unwrap();
+    let before = opened.store.epoch();
+    drop(opened);
+
+    let db = redb::Database::open(&mail.index_db).unwrap();
+    let txn = db.begin_write().unwrap();
+    txn.delete_table(META).unwrap();
+    txn.commit().unwrap();
+    drop(db);
+
+    let reopened = MailStore::open(&mail.index_db, &mail.fragment_dirs, &KEY).unwrap();
+    assert_ne!(reopened.epoch, before);
+    assert_eq!(
+        reopened.restored.len(),
+        1,
+        "the entries themselves still rebuild"
+    );
+}

@@ -34,9 +34,13 @@ use crate::state::{random_16, Fingerprint, MailboxId};
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("mailstore_meta");
 const INDEX: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mailstore_index");
 
-const META_STORE_ID: &str = "store_id";
-const META_EPOCH: &str = "epoch";
-const META_CLEAN: &str = "clean_shutdown";
+/// One index row as stored: entry id, sealed [`IndexRecord`].
+type Row = (Vec<u8>, Vec<u8>);
+/// The sealed state record and key check, as stored (either may be absent).
+type SealedMeta = (Option<Vec<u8>>, Option<Vec<u8>>);
+
+/// The sealed [`StoreState`] record (DRA-0074).
+const META_STATE: &str = "state";
 const META_KEY_CHECK: &str = "key_check";
 const KEY_CHECK_PLAINTEXT: &[u8] = b"dratchet mailstore key check v1";
 const FRAGMENT_SUFFIX: &str = ".frag";
@@ -115,6 +119,60 @@ struct IndexRecord {
     fragments: Vec<(u8, String)>,
     #[serde(with = "serde_bytes")]
     checksum: Vec<u8>,
+}
+
+/// The store's own state, sealed under the index key so it can't be
+/// changed without the key (DRA-0074). It's rewritten in the same
+/// transaction as every change to the index.
+#[derive(Serialize, Deserialize)]
+struct StoreState {
+    #[serde(with = "serde_bytes")]
+    store_id: Vec<u8>,
+    number: u64,
+    /// Every queued entry was saved before the run that wrote this ended.
+    clean: bool,
+    /// [`manifest`] of every index row this record describes.
+    #[serde(with = "serde_bytes")]
+    manifest: Vec<u8>,
+}
+
+/// SHA-256 over the sorted ids of a set of index rows: removing, adding or
+/// renaming any row changes it.
+fn manifest<'a>(ids: impl IntoIterator<Item = &'a [u8; 16]>) -> [u8; 32] {
+    let mut ids: Vec<&[u8; 16]> = ids.into_iter().collect();
+    ids.sort_unstable();
+    let mut h = Sha256::new();
+    for id in ids {
+        h.update(id);
+    }
+    h.finalize().into()
+}
+
+/// Why a store reopened with its own state record starts a new epoch, if
+/// it does: the last run didn't finish its last save, or the index rows on
+/// disk aren't the ones that run left (DRA-0074).
+fn continuing_epoch(advanced_because: &mut Option<&'static str>, state: &StoreState, rows: &[Row]) {
+    let present = {
+        let mut ids: Vec<&[u8]> = rows.iter().map(|(k, _)| k.as_slice()).collect();
+        ids.sort_unstable();
+        let mut h = Sha256::new();
+        for id in ids {
+            // A row whose id isn't 16 bytes was never written by the store;
+            // hashing its length too keeps it from posing as two others.
+            if id.len() != 16 {
+                h.update(b"\xffbad row");
+                h.update((id.len() as u64).to_be_bytes());
+            }
+            h.update(id);
+        }
+        <[u8; 32]>::from(h.finalize())
+    };
+    if present.as_slice() != state.manifest.as_slice() {
+        tracing::error!("mail store: the index on disk was changed outside the relay");
+        *advanced_because = Some("the index was changed outside the relay");
+    } else if !state.clean {
+        *advanced_because = Some("previous run did not finish its last save");
+    }
 }
 
 pub struct OpenedStore {
@@ -314,43 +372,55 @@ impl MailStore {
             }),
         };
 
-        let (meta_store_id, meta_epoch, meta_clean, meta_key_check) = store.read_meta()?;
+        let (sealed_state, key_check) = store.read_meta()?;
+        let mut rows = store.read_rows()?;
+        let key_ok = key_check
+            .as_deref()
+            .and_then(|kc| open_bytes(&store.index, META_KEY_CHECK.as_bytes(), kc))
+            .is_some_and(|pt| pt == KEY_CHECK_PLAINTEXT);
+        let saved_state = sealed_state
+            .as_deref()
+            .and_then(|s| open_bytes(&store.index, META_STATE.as_bytes(), s))
+            .and_then(|pt| ciborium::from_reader::<StoreState, _>(pt.as_slice()).ok())
+            .and_then(|s| Some((<[u8; 16]>::try_from(s.store_id.as_slice()).ok()?, s)));
+
+        let new_store_id = || Epoch {
+            store_id: random_16(),
+            number: 1,
+        };
         let mut advanced_because: Option<&'static str> = None;
-        let mut epoch = match meta_store_id {
-            None => {
-                advanced_because = Some("new mail store");
-                Epoch {
-                    store_id: random_16(),
-                    number: 1,
-                }
+        // Whether `epoch` continues the stored one, and so has to count up
+        // to advance (a new store id is already a new epoch).
+        let mut continues = false;
+        let mut to_remove: Vec<Vec<u8>> = Vec::new();
+        let mut epoch = if key_check.is_some() && !key_ok {
+            tracing::error!(
+                "mail store: the configured key does not open the existing store; \
+                 its queued mail is unreadable and is being discarded"
+            );
+            store.remove_all_fragments()?;
+            to_remove = rows.drain(..).map(|(k, _)| k).collect();
+            advanced_because = Some("store unreadable with the current key");
+            new_store_id()
+        } else if let Some((store_id, state)) = saved_state {
+            continuing_epoch(&mut advanced_because, &state, &rows);
+            continues = true;
+            Epoch {
+                store_id,
+                number: state.number,
             }
-            Some(store_id) => {
-                let key_ok = meta_key_check
-                    .as_deref()
-                    .and_then(|kc| open_bytes(&store.index, META_KEY_CHECK.as_bytes(), kc))
-                    .is_some_and(|pt| pt == KEY_CHECK_PLAINTEXT);
-                let number = meta_epoch.unwrap_or(0);
-                if !key_ok {
-                    tracing::error!(
-                        "mail store: the configured key does not open the existing store; \
-                         its queued mail is unreadable and is being discarded"
-                    );
-                    store.wipe()?;
-                    advanced_because = Some("store unreadable with the current key");
-                    Epoch {
-                        store_id: random_16(),
-                        number: number + 1,
-                    }
-                } else {
-                    if !meta_clean {
-                        advanced_because = Some("previous run did not finish its last save");
-                    }
-                    Epoch { store_id, number }
-                }
-            }
+        } else if sealed_state.is_none() && key_check.is_none() && rows.is_empty() {
+            advanced_because = Some("new mail store");
+            new_store_id()
+        } else {
+            // DRA-0074: without a readable state record nothing on disk
+            // can be vouched for, so start a new epoch outright.
+            advanced_because = Some("the store's state record is missing or unreadable");
+            new_store_id()
         };
 
-        let (restored, dropped) = store.rebuild()?;
+        let (restored, dropped, removed) = store.rebuild(rows);
+        to_remove.extend(removed);
         if dropped > 0 {
             tracing::error!(
                 dropped,
@@ -360,14 +430,22 @@ impl MailStore {
         }
         store.remove_orphan_fragments()?;
 
-        if advanced_because.is_some()
-            && meta_store_id.is_some()
-            && epoch.number == meta_epoch.unwrap_or(0)
-        {
+        if advanced_because.is_some() && continues {
             epoch.number += 1;
         }
-        store.write_meta(&epoch, false)?;
         *store.epoch.lock().expect("epoch lock") = epoch;
+        {
+            let records = store.records.lock().expect("records lock");
+            let txn = store.db.begin_write().map_err(db_err)?;
+            {
+                let mut table = txn.open_table(INDEX).map_err(db_err)?;
+                for k in &to_remove {
+                    table.remove(k.as_slice()).map_err(db_err)?;
+                }
+            }
+            store.put_state(&txn, &epoch, false, &manifest(records.keys()))?;
+            txn.commit().map_err(db_err)?;
+        }
         Ok(OpenedStore {
             store,
             restored,
@@ -376,64 +454,71 @@ impl MailStore {
         })
     }
 
-    #[allow(clippy::type_complexity)]
-    fn read_meta(
-        &self,
-    ) -> Result<(Option<[u8; 16]>, Option<u64>, bool, Option<Vec<u8>>), StoreError> {
+    fn read_meta(&self) -> Result<SealedMeta, StoreError> {
         let txn = self.db.begin_read().map_err(db_err)?;
         let table = match txn.open_table(META) {
             Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok((None, None, false, None)),
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok((None, None)),
             Err(e) => return Err(db_err(e)),
         };
         let get = |k: &str| -> Result<Option<Vec<u8>>, StoreError> {
             Ok(table.get(k).map_err(db_err)?.map(|v| v.value().to_vec()))
         };
-        let store_id = get(META_STORE_ID)?.and_then(|v| v.as_slice().try_into().ok());
-        let epoch = get(META_EPOCH)?
-            .and_then(|v| v.as_slice().try_into().ok())
-            .map(u64::from_be_bytes);
-        let clean = get(META_CLEAN)?.is_some_and(|v| v == [1]);
-        let key_check = get(META_KEY_CHECK)?;
-        Ok((store_id, epoch, clean, key_check))
+        Ok((get(META_STATE)?, get(META_KEY_CHECK)?))
     }
 
-    fn write_meta(&self, epoch: &Epoch, clean: bool) -> Result<(), StoreError> {
-        let key_check = seal_bytes(&self.index, META_KEY_CHECK.as_bytes(), KEY_CHECK_PLAINTEXT);
-        let txn = self.db.begin_write().map_err(db_err)?;
-        {
-            let mut table = txn.open_table(META).map_err(db_err)?;
-            table
-                .insert(META_STORE_ID, epoch.store_id.as_slice())
-                .map_err(db_err)?;
-            table
-                .insert(META_EPOCH, epoch.number.to_be_bytes().as_slice())
-                .map_err(db_err)?;
-            table
-                .insert(META_CLEAN, [u8::from(clean)].as_slice())
-                .map_err(db_err)?;
-            table
-                .insert(META_KEY_CHECK, key_check.as_slice())
-                .map_err(db_err)?;
+    fn read_rows(&self) -> Result<Vec<Row>, StoreError> {
+        let txn = self.db.begin_read().map_err(db_err)?;
+        match txn.open_table(INDEX) {
+            Ok(table) => Ok(table
+                .iter()
+                .map_err(db_err)?
+                .filter_map(|r| r.ok())
+                .map(|(k, v)| (k.value().to_vec(), v.value().to_vec()))
+                .collect()),
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(Vec::new()),
+            Err(e) => Err(db_err(e)),
         }
+    }
+
+    /// Write the sealed state record (and the key check) inside `txn`,
+    /// which must also hold any change to the index it describes.
+    fn put_state(
+        &self,
+        txn: &redb::WriteTransaction,
+        epoch: &Epoch,
+        clean: bool,
+        manifest: &[u8; 32],
+    ) -> Result<(), StoreError> {
+        let state = seal_bytes(
+            &self.index,
+            META_STATE.as_bytes(),
+            &cbor(&StoreState {
+                store_id: epoch.store_id.to_vec(),
+                number: epoch.number,
+                clean,
+                manifest: manifest.to_vec(),
+            }),
+        );
+        let key_check = seal_bytes(&self.index, META_KEY_CHECK.as_bytes(), KEY_CHECK_PLAINTEXT);
+        let mut table = txn.open_table(META).map_err(db_err)?;
+        table.insert(META_STATE, state.as_slice()).map_err(db_err)?;
+        table
+            .insert(META_KEY_CHECK, key_check.as_slice())
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Write the state record on its own, with the index unchanged.
+    fn write_state(&self, epoch: &Epoch, clean: bool) -> Result<(), StoreError> {
+        let records = self.records.lock().expect("records lock");
+        let txn = self.db.begin_write().map_err(db_err)?;
+        self.put_state(&txn, epoch, clean, &manifest(records.keys()))?;
         txn.commit().map_err(db_err)
     }
 
-    /// Discard every index record and Fragment (the store can't be read).
-    fn wipe(&self) -> Result<(), StoreError> {
-        let txn = self.db.begin_write().map_err(db_err)?;
-        {
-            let mut table = txn.open_table(INDEX).map_err(db_err)?;
-            let keys: Vec<Vec<u8>> = table
-                .iter()
-                .map_err(db_err)?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
-                .collect();
-            for k in keys {
-                table.remove(k.as_slice()).map_err(db_err)?;
-            }
-        }
-        txn.commit().map_err(db_err)?;
+    /// Discard every Fragment (the store can't be read with this key).
+    fn remove_all_fragments(&self) -> Result<(), StoreError> {
         for dir in &self.dirs {
             for entry in fs::read_dir(dir)? {
                 let path = entry?.path();
@@ -445,22 +530,10 @@ impl MailStore {
         Ok(())
     }
 
-    /// Rebuild every entry. Returns the survivors and how many were
-    /// dropped because they couldn't be read back intact.
-    fn rebuild(&self) -> Result<(Vec<RestoredEntry>, usize), StoreError> {
-        let rows: Vec<(Vec<u8>, Vec<u8>)> = {
-            let txn = self.db.begin_read().map_err(db_err)?;
-            match txn.open_table(INDEX) {
-                Ok(table) => table
-                    .iter()
-                    .map_err(db_err)?
-                    .filter_map(|r| r.ok())
-                    .map(|(k, v)| (k.value().to_vec(), v.value().to_vec()))
-                    .collect(),
-                Err(redb::TableError::TableDoesNotExist(_)) => Vec::new(),
-                Err(e) => return Err(db_err(e)),
-            }
-        };
+    /// Rebuild every entry from the index rows. Returns the survivors, how
+    /// many were dropped because they couldn't be read back intact, and
+    /// the rows to remove (dropped or expired).
+    fn rebuild(&self, rows: Vec<Row>) -> (Vec<RestoredEntry>, usize, Vec<Vec<u8>>) {
         let now = now_unix();
         let mut restored = Vec::new();
         let mut to_remove = Vec::new();
@@ -514,18 +587,7 @@ impl MailStore {
                 }
             }
         }
-        drop(records);
-        if !to_remove.is_empty() {
-            let txn = self.db.begin_write().map_err(db_err)?;
-            {
-                let mut table = txn.open_table(INDEX).map_err(db_err)?;
-                for k in &to_remove {
-                    table.remove(k.as_slice()).map_err(db_err)?;
-                }
-            }
-            txn.commit().map_err(db_err)?;
-        }
-        Ok((restored, dropped))
+        (restored, dropped, to_remove)
     }
 
     /// Reassemble, verify and decrypt one Sealed Message.
@@ -648,6 +710,7 @@ impl MailStore {
         for dir in &self.dirs {
             sync_dir(dir);
         }
+        let mut records = self.records.lock().expect("records lock");
         let txn = self.db.begin_write().map_err(db_err)?;
         {
             let mut table = txn.open_table(INDEX).map_err(db_err)?;
@@ -658,8 +721,12 @@ impl MailStore {
                     .map_err(db_err)?;
             }
         }
+        let after: HashSet<&[u8; 16]> = records
+            .keys()
+            .chain(new_records.iter().map(|(id, _)| id))
+            .collect();
+        self.put_state(&txn, &self.epoch(), false, &manifest(after))?;
         txn.commit().map_err(db_err)?;
-        let mut records = self.records.lock().expect("records lock");
         for (entry_id, record) in new_records {
             records.insert(entry_id, record);
         }
@@ -669,10 +736,8 @@ impl MailStore {
     /// Remove every stored entry not in `live` (collected or expired since
     /// it was saved). Index records go first, then their Fragments.
     pub fn retain(&self, live: &HashSet<[u8; 16]>) -> Result<usize, StoreError> {
-        let gone: Vec<([u8; 16], IndexRecord)> = self
-            .records
-            .lock()
-            .expect("records lock")
+        let mut records = self.records.lock().expect("records lock");
+        let gone: Vec<([u8; 16], IndexRecord)> = records
             .iter()
             .filter(|(id, _)| !live.contains(*id))
             .map(|(id, r)| (*id, r.clone()))
@@ -687,8 +752,9 @@ impl MailStore {
                 table.remove(id.as_slice()).map_err(db_err)?;
             }
         }
+        let after = records.keys().filter(|id| live.contains(*id));
+        self.put_state(&txn, &self.epoch(), false, &manifest(after))?;
         txn.commit().map_err(db_err)?;
-        let mut records = self.records.lock().expect("records lock");
         for (id, record) in &gone {
             records.remove(id);
             self.delete_fragments(record);
@@ -715,10 +781,13 @@ impl MailStore {
     /// Queued mail may have been lost while running (a saved entry failed
     /// to read back): move to a new epoch.
     pub fn advance_epoch(&self) -> Result<Epoch, StoreError> {
-        let mut epoch = self.epoch.lock().expect("epoch lock");
-        epoch.number += 1;
-        self.write_meta(&epoch, false)?;
-        Ok(*epoch)
+        let next = {
+            let mut epoch = self.epoch.lock().expect("epoch lock");
+            epoch.number += 1;
+            *epoch
+        };
+        self.write_state(&next, false)?;
+        Ok(next)
     }
 
     pub fn epoch(&self) -> Epoch {
@@ -729,7 +798,7 @@ impl MailStore {
     /// next start keeps the same epoch.
     pub fn mark_clean_shutdown(&self) -> Result<(), StoreError> {
         let epoch = self.epoch();
-        self.write_meta(&epoch, true)
+        self.write_state(&epoch, true)
     }
 
     pub fn stored_count(&self) -> usize {
