@@ -111,7 +111,7 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0067 | Medium | `ui/src-tauri/src/lib.rs:821 (poll_loop reconnect)` | [`bc8e05b`](https://github.com/Journeycake/dratchet/commit/bc8e05b4e85ca4fa6e09929be07c26fd46c58009) | this doc |
 | DRA-0068 | Medium | `client/src/net.rs:81 (Connection::connect_with_timeout); ui/src-tauri/src/lib.rs:833 (poll_loop reconnect)` | [`970ffcc`](https://github.com/Journeycake/dratchet/commit/970ffcc9436f63178c35bafdaf5fc6ba1c64f0d9) | this doc |
 | DRA-0069 | High | `client/src/net.rs:80 (is_server_push), client/src/net.rs:188 (Connection::recv_raw)` | [`3bbfc72`](https://github.com/Journeycake/dratchet/commit/3bbfc72306352c60957c1c8b825671651dd1da28) | this doc |
-| DRA-0070 | Low | `app/src/lib.rs:1586 (throttle_profile_notices); store/src/profile.rs:439 (profile notice state)` | pending | this doc |
+| DRA-0070 | Low | `app/src/lib.rs:1586 (throttle_profile_notices); store/src/profile.rs:439 (profile notice state)` | [`042e5a4`](https://github.com/Journeycake/dratchet/commit/042e5a4b8aabdb9cd89b2db7f5438a758c2a93d1) | this doc |
 
 
 ## Summary
@@ -4516,7 +4516,7 @@ Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D w
 
 ## DRA-0070: a contact could flood your notifications with handle changes (`ARCHITECTURE.md` §10 open item; confirmed real, fixed) — **LOW**
 
-> **DRA-0070** · Location: `app/src/lib.rs:1586 (throttle_profile_notices); store/src/profile.rs:439 (profile notice state)` · Fix: pending
+> **DRA-0070** · Location: `app/src/lib.rs:1586 (throttle_profile_notices); store/src/profile.rs:439 (profile notice state)` · Fix: [`042e5a4`](https://github.com/Journeycake/dratchet/commit/042e5a4b8aabdb9cd89b2db7f5438a758c2a93d1)
 
 Every `ProfileAnnounce` from a contact whose handle differed from the stored one was recorded and returned as a `ProfileChangeNotice`, which the desktop app shows as a toast. Nothing limited how many. A contact could rename themselves in a loop and raise one notice per message. `ARCHITECTURE.md` §10 had listed this as a deferred low-severity item.
 
