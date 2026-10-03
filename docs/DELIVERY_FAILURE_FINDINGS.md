@@ -111,6 +111,7 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0067 | Medium | `ui/src-tauri/src/lib.rs:821 (poll_loop reconnect)` | [`bc8e05b`](https://github.com/Journeycake/dratchet/commit/bc8e05b4e85ca4fa6e09929be07c26fd46c58009) | this doc |
 | DRA-0068 | Medium | `client/src/net.rs:81 (Connection::connect_with_timeout); ui/src-tauri/src/lib.rs:833 (poll_loop reconnect)` | [`970ffcc`](https://github.com/Journeycake/dratchet/commit/970ffcc9436f63178c35bafdaf5fc6ba1c64f0d9) | this doc |
 | DRA-0069 | High | `client/src/net.rs:80 (is_server_push), client/src/net.rs:188 (Connection::recv_raw)` | [`3bbfc72`](https://github.com/Journeycake/dratchet/commit/3bbfc72306352c60957c1c8b825671651dd1da28) | this doc |
+| DRA-0070 | Low | `app/src/lib.rs:1586 (throttle_profile_notices); store/src/profile.rs:439 (profile notice state)` | pending | this doc |
 
 
 ## Summary
@@ -4512,4 +4513,32 @@ Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D w
 
 - **Anyone with a user's handle can still push frames at them.** The client now ignores them, but the server still relays up to its rate limit. Restricting rendezvous to verified contacts would be a server-side change to the rendezvous design.
 - **Nothing reads the set-aside frames yet.** The desktop app never calls `take_pushes`, so pushed frames are held (at most 64) and dropped. That's by design until direct P2P (Tier 0) or presence lands.
+
+## DRA-0070: a contact could flood your notifications with handle changes (`ARCHITECTURE.md` §10 open item; confirmed real, fixed) — **LOW**
+
+> **DRA-0070** · Location: `app/src/lib.rs:1586 (throttle_profile_notices); store/src/profile.rs:439 (profile notice state)` · Fix: pending
+
+Every `ProfileAnnounce` from a contact whose handle differed from the stored one was recorded and returned as a `ProfileChangeNotice`, which the desktop app shows as a toast. Nothing limited how many. A contact could rename themselves in a loop and raise one notice per message. `ARCHITECTURE.md` §10 had listed this as a deferred low-severity item.
+
+Rated **Low**: it needs an existing contact, and the harm is notification and storage churn, not disclosure or loss.
+
+### Confirmation
+
+`app/tests/profile_announce_flood.rs`, `a_contact_cannot_flood_handle_change_notices`. After pairing settles, Alice sends 20 handle changes and Bob reads his mail as the desktop loop does. Before the fix he was given 20 notices, and the test failed with its `VULNERABILITY:` assertion. With only the new throttle disabled, it fails the same way.
+
+### Fixed
+
+`receive_pending` passes its handle changes through `throttle_profile_notices`:
+- **The contact is always updated.** The contact list shows the newest handle, as before.
+- **At most one notice per contact per 10 minutes** (`PROFILE_NOTICE_INTERVAL_SECS`), and at most one per pass. Each notice runs from the handle last shown to the current one. The time and handle of the last notice are stored per contact in the encrypted contacts scope.
+- **A change inside the window isn't hidden.** It's announced on the first pass after the window ends, so a contact can't rename once (notice shown) and then quickly again (no notice) to slip a second change past you.
+
+Guard: `a_change_inside_the_quiet_period_is_announced_once_it_ends`. The existing `profile_reconciliation` tests, where a single change notifies immediately, pass unchanged.
+
+Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (349 passed).
+
+### Known residual scope
+
+- **Each announce still writes the contact record.** That's bounded by how much mail the relay lets a contact send (DRA-0017, DRA-0018), the same as chat messages.
+- **A rename sent while Bob's side is mid-switch to the Conversation Mailbox is lost.** As seen while writing this test, a control message during that handover suffers the same problem as DRA-0066, whose re-send covers chat sends only.
 
