@@ -64,6 +64,11 @@ pub const MAILBOX_TTL_SECS: u32 = 14 * 24 * 60 * 60;
 /// between this device and the server.
 pub const EXPIRY_GRACE_SECS: u64 = 60 * 60;
 
+/// DRA-0070: at most one "contact changed their handle" notice per contact
+/// in this many seconds. Changes inside the window still update the
+/// contact; the notice for them comes once the window has passed.
+pub const PROFILE_NOTICE_INTERVAL_SECS: u64 = 10 * 60;
+
 /// DRA-0064: call right after authenticating, before sending anything on
 /// the new connection. If the server's boot id differs from the one this
 /// device saw last, the server restarted and its in-memory mailboxes --
@@ -1309,6 +1314,7 @@ pub async fn receive_pending(
     if !session_wiped {
         db.save_ratchet(conv_id, &ratchet)?;
     }
+    let profile_changes = throttle_profile_notices(db, contact, profile_changes, now_unix())?;
     // DRA-0066: mail from the peer on the routing-id mailbox proves the
     // peer has this side's routing id, so the re-announcing can stop.
     if fetched_from_routing_mailbox && decrypted_any && !contact.routing_confirmed {
@@ -1570,6 +1576,46 @@ pub struct ProfileChangeNotice {
     pub fingerprint: Vec<u8>,
     pub old_handle: String,
     pub new_handle: String,
+}
+
+/// DRA-0070: turn this pass's handle changes into at most one notice, and
+/// none if one was shown for this contact within
+/// [`PROFILE_NOTICE_INTERVAL_SECS`]. A change held back that way is
+/// announced on the first pass after the window, from the handle last
+/// shown to the current one, so a quick second rename can't go unseen.
+fn throttle_profile_notices(
+    db: &Db,
+    contact: &Contact,
+    changes: Vec<ProfileChangeNotice>,
+    now: u64,
+) -> Result<Vec<ProfileChangeNotice>> {
+    let Some(current) = db.load_contact(&contact.fingerprint)? else {
+        return Ok(Vec::new());
+    };
+    let Some(username) = current.username.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let current_handle = format!("{username}#{:04}", current.discriminator.unwrap_or(0));
+    let state = db.load_profile_notice_state(&contact.fingerprint)?;
+    let (due, last_shown) = match &state {
+        Some((shown_at, handle)) => (
+            now >= shown_at.saturating_add(PROFILE_NOTICE_INTERVAL_SECS),
+            Some(handle.clone()),
+        ),
+        // Never notified: only a change seen in this pass can start one.
+        None => (true, changes.first().map(|c| c.old_handle.clone())),
+    };
+    match last_shown {
+        Some(old_handle) if due && old_handle != current_handle => {
+            db.save_profile_notice_state(&contact.fingerprint, now, &current_handle)?;
+            Ok(vec![ProfileChangeNotice {
+                fingerprint: contact.fingerprint.clone(),
+                old_handle,
+                new_handle: current_handle,
+            }])
+        }
+        _ => Ok(Vec::new()),
+    }
 }
 
 /// What [`receive_pending`] actually did on one call.

@@ -419,3 +419,48 @@ mod tests {
         assert_eq!(updated.discriminator, Some(9999));
     }
 }
+
+/// DRA-0070: when this device last showed a "contact changed their handle"
+/// notice for a contact, and the handle it showed then.
+#[derive(Serialize, Deserialize)]
+struct ProfileNoticeState {
+    shown_at: u64,
+    handle: String,
+}
+
+fn profile_notice_key(fingerprint: &[u8]) -> String {
+    let hex: String = fingerprint.iter().map(|b| format!("{b:02x}")).collect();
+    format!("profile_notice:{hex}")
+}
+
+impl Db {
+    /// DRA-0070: the last handle-change notice shown for this contact, as
+    /// (Unix time shown, handle shown), if any.
+    pub fn load_profile_notice_state(&self, fingerprint: &[u8]) -> Result<Option<(u64, String)>> {
+        let Some(bytes) = self.get_encrypted(Scope::Contacts, &profile_notice_key(fingerprint))?
+        else {
+            return Ok(None);
+        };
+        let state: ProfileNoticeState = ciborium::from_reader(bytes.as_slice())
+            .map_err(|_| Error::MalformedRecord("profile notice state"))?;
+        Ok(Some((state.shown_at, state.handle)))
+    }
+
+    pub fn save_profile_notice_state(
+        &self,
+        fingerprint: &[u8],
+        shown_at: u64,
+        handle: &str,
+    ) -> Result<()> {
+        let mut bytes = Vec::new();
+        ciborium::into_writer(
+            &ProfileNoticeState {
+                shown_at,
+                handle: handle.to_string(),
+            },
+            &mut bytes,
+        )
+        .map_err(|_| Error::MalformedRecord("profile notice state"))?;
+        self.put_encrypted(Scope::Contacts, &profile_notice_key(fingerprint), &bytes)
+    }
+}

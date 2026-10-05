@@ -6,7 +6,7 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use dratchet_app::{
@@ -120,8 +120,7 @@ fn app_state(db: Db, account: Account, conn: Option<Connection>, server_url: &st
         db,
         db_path: PathBuf::new(),
         server_url: server_url.to_string(),
-        account: Arc::new(Mutex::new(account)),
-        conn: Arc::new(Mutex::new(conn)),
+        session: Mutex::new(Session { conn, account }),
         own_discriminator_change_notice: StdMutex::new(None),
         peer_profile_change_notices: StdMutex::new(Vec::new()),
         connection_status: StdMutex::new(status),
@@ -162,7 +161,8 @@ fn invoke(webview: &WebviewWindow<MockRuntime>, cmd: &str, args: Value) -> Resul
 }
 
 fn conversation(state: &AppState, contact: &Contact) -> [u8; 16] {
-    let account = on_runtime(state.account.lock());
+    let session = on_runtime(state.session.lock());
+    let account = &session.account;
     dratchet_core::conversation_id(
         account.identity.fingerprint().as_bytes(),
         &contact.fingerprint,
@@ -172,11 +172,12 @@ fn conversation(state: &AppState, contact: &Contact) -> [u8; 16] {
 /// Connect `state` to `url` the way `poll_loop` does.
 fn connect_now(state: &AppState, url: &str) {
     on_runtime(async {
-        let mut account = state.account.lock().await;
-        let (conn, _) = connect_authenticate_and_reconcile(url, &state.db, &mut account)
+        let mut session = state.session.lock().await;
+        let account = &mut session.account;
+        let (conn, _) = connect_authenticate_and_reconcile(url, &state.db, account)
             .await
             .unwrap();
-        *state.conn.lock().await = Some(conn);
+        session.conn = Some(conn);
     });
 }
 
