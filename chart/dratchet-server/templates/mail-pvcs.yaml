@@ -1,0 +1,42 @@
+{{- /*
+docs/adr/0001: one PersistentVolumeClaim per fragment directory, plus one
+for the encrypted index. Put fragment volumes on different storage
+classes/backends where you can: holding one of them yields no complete
+message. Skipped with mailPersistence.ephemeral (emptyDir instead).
+*/ -}}
+{{- $mp := .Values.mailPersistence -}}
+{{- if and $mp.enabled (not $mp.ephemeral) }}
+{{- $root := . }}
+{{- range $mp.fragments }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "dratchet-server.fullname" $root }}-fragments-{{ .name }}
+  labels:
+    {{- include "dratchet-server.labels" $root | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- with .storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .size }}
+{{- end }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "dratchet-server.fullname" . }}-mail-index
+  labels:
+    {{- include "dratchet-server.labels" . | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- with $mp.index.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $mp.index.size }}
+{{- end }}

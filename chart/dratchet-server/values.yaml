@@ -64,6 +64,54 @@ config:
   # address is believed.
   trustedProxies: ""
 
+# Queued-mail persistence (docs/adr/0001, server/README.md "Queued mail").
+#
+# dratchetd counts the container's memory limit as its usable memory, and
+# turns persistence on by itself below 2 GB, which every pod under this
+# chart's `resources` is. So the chart always sets it explicitly. With it
+# on, each queued message is encrypted with the key below and split into
+# Fragments across the `fragments` volumes; a sender's checkmark waits until
+# its message is on disk, and a clean pod shutdown makes a final save so
+# clients don't see a new server epoch (and a Retry prompt) on restart.
+#
+# Turning it off keeps queued mail in memory only: a restart loses it and
+# clients offer to resend, and once unsaved mail fills `memoryLimit`, new
+# writes are refused.
+mailPersistence:
+  enabled: true
+  # Seconds between saves, 0-15 (0 saves on every write).
+  flushInterval: 10
+  # Bytes of unsaved mail held in memory. Empty: a tenth of the container's
+  # memory limit. Half of it triggers an early save.
+  memoryLimit: ""
+  key:
+    # An existing Secret holding the 64-hex-character key (e.g. from your
+    # secrets manager). Takes precedence over `generate`.
+    existingSecret: ""
+    secretKey: key
+    # Without an existing Secret, generate a random key into a Secret this
+    # chart owns, reused on every upgrade. Set false to make an install
+    # without `existingSecret` fail instead.
+    generate: true
+  # One volume per fragment directory: at least two, with different names.
+  # Use different storage classes or backends where you can, so no single
+  # volume holds a complete message.
+  fragments:
+    - name: a
+      size: 1Gi
+      storageClass: ""
+    - name: b
+      size: 1Gi
+      storageClass: ""
+  # The encrypted index of which Fragments make up which message.
+  index:
+    size: 256Mi
+    storageClass: ""
+  # emptyDir instead of PersistentVolumeClaims: queued mail survives a
+  # container restart but not the pod being replaced. For test clusters
+  # without a storage provisioner.
+  ephemeral: false
+
 resources:
   # A single WebSocket connection handler + a small in-memory HashMap-based
   # store is lightweight; these are conservative starting points, not a

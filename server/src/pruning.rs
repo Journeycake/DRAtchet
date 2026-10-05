@@ -226,6 +226,8 @@ mod tests {
             envelope: vec![1, 2, 3],
             expires_at: SystemTime::now() + expires_in,
             written_by: [0u8; 32],
+            saved: false,
+            flush_seq: 0,
         }
     }
 
@@ -236,6 +238,8 @@ mod tests {
             // Already in the past.
             expires_at: SystemTime::now() - Duration::from_secs(1),
             written_by: [0u8; 32],
+            saved: false,
+            flush_seq: 0,
         }
     }
 

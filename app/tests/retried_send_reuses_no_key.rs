@@ -60,6 +60,8 @@ async fn spawn_relay_that_loses_the_ack(stored: mpsc::UnboundedSender<Vec<u8>>) 
                     &AuthChallenge {
                         nonce: vec![7u8; 32],
                         server_boot_id: Vec::new(),
+                        server_epoch: 0,
+                        save_interval_ms: 0,
                     },
                 );
                 ws.send(WsMessage::Binary(challenge)).await.unwrap();

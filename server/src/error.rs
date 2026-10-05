@@ -94,6 +94,9 @@ pub enum Error {
     /// `state::MAX_ICE_CANDIDATE_LEN`.
     #[error("too many or too large ICE candidates")]
     IceCandidatesInvalid,
+    /// `docs/adr/0001`: the relay can't take this write right now.
+    #[error("write not accepted")]
+    WriteRefused,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -123,6 +126,10 @@ impl Error {
             Error::UsernameInvalidCharacters => ErrorCode::UsernameInvalidCharacters,
             Error::SdpTooLarge => ErrorCode::SdpTooLarge,
             Error::IceCandidatesInvalid => ErrorCode::IceCandidatesInvalid,
+            // Deliberately uninformative (`docs/adr/0001`): why the relay
+            // turned a write away (memory full, a failed save) is its
+            // own state, not something to tell whoever is probing it.
+            Error::WriteRefused => ErrorCode::Unspecified,
         }
     }
 }

@@ -1201,6 +1201,7 @@ name = "dratchet-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "chacha20poly1305",
  "ciborium",
  "clap",
  "dratchet-core",
@@ -1212,6 +1213,7 @@ dependencies = [
  "sha2",
  "thiserror 1.0.69",
  "tokio",
+ "toml 0.8.2",
  "tracing",
  "tracing-subscriber",
  "x25519-dalek",
