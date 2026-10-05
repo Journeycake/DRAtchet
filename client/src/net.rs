@@ -67,6 +67,21 @@ pub struct Connection {
     server_boot_id: Vec<u8>,
     /// DRA-0065: set once a send or receive fails at the transport level.
     lost: bool,
+    /// DRA-0069: frames the server pushed unprompted, set aside so they're
+    /// never taken as a reply. Bounded; the oldest are dropped first.
+    pushes: std::collections::VecDeque<Vec<u8>>,
+}
+
+/// DRA-0069: most unprompted frames kept for [`Connection::take_pushes`].
+pub const MAX_HELD_PUSHES: usize = 64;
+
+/// DRA-0069: frame types the server sends without being asked -- relayed
+/// rendezvous frames and presence updates. Never a reply to a request.
+pub fn is_server_push(tag: FrameTag) -> bool {
+    matches!(
+        tag,
+        FrameTag::RendezvousOffer | FrameTag::RendezvousAnswer | FrameTag::PresenceUpdate
+    )
 }
 
 impl Connection {
@@ -96,6 +111,7 @@ impl Connection {
             request_timeout: REQUEST_TIMEOUT,
             server_boot_id: Vec::new(),
             lost: false,
+            pushes: std::collections::VecDeque::new(),
         })
     }
 
@@ -109,6 +125,12 @@ impl Connection {
     /// (empty before [`authenticate`](Self::authenticate), or from a server
     /// that predates it). A change since the last connection means the
     /// server restarted and lost every queued message.
+    /// DRA-0069: the frames the server pushed unprompted since the last
+    /// call, oldest first (at most [`MAX_HELD_PUSHES`]).
+    pub fn take_pushes(&mut self) -> Vec<Vec<u8>> {
+        self.pushes.drain(..).collect()
+    }
+
     pub fn server_boot_id(&self) -> &[u8] {
         &self.server_boot_id
     }
@@ -154,16 +176,31 @@ impl Connection {
 
     /// Wait for the next binary frame, skipping any non-binary control
     /// frames the underlying transport surfaces.
+    ///
+    /// DRA-0069: frames the server pushes unprompted ([`is_server_push`])
+    /// are set aside for [`take_pushes`](Self::take_pushes), never returned
+    /// here, so they can't be read as the reply to a request. The timeout
+    /// covers the whole wait, however many such frames arrive meanwhile.
     pub async fn recv_raw(&mut self) -> Result<Vec<u8>, NetError> {
         if self.lost {
             return Err(Self::already_lost());
         }
+        let deadline = tokio::time::Instant::now() + self.request_timeout;
         let failure = loop {
-            let Ok(next) = tokio::time::timeout(self.request_timeout, self.ws.next()).await else {
+            let Ok(next) = tokio::time::timeout_at(deadline, self.ws.next()).await else {
                 break self.timed_out();
             };
             match next {
-                Some(Ok(WsMessage::Binary(b))) => return Ok(b),
+                Some(Ok(WsMessage::Binary(b))) => {
+                    if split_tag(&b).is_ok_and(|(tag, _)| is_server_push(tag)) {
+                        if self.pushes.len() == MAX_HELD_PUSHES {
+                            self.pushes.pop_front();
+                        }
+                        self.pushes.push_back(b);
+                        continue;
+                    }
+                    return Ok(b);
+                }
                 Some(Ok(_)) => continue,
                 Some(Err(e)) => break NetError::Connection(format!("connection error: {e}")),
                 None => break NetError::Connection("connection closed".to_string()),

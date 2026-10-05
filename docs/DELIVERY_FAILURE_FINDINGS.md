@@ -110,6 +110,8 @@ Every tracked finding, by ID. The ID is also the Bug ID in the project's Notion 
 | DRA-0066 | Medium | `app/src/lib.rs:939 (reannounce_routing_id_if_unconfirmed), app/src/lib.rs:1161 (receive_pending confirms the switch), app/src/lib.rs:1648 (announce_routing_id keeps the envelope); store/src/contacts.rs:106 (Contact::routing_confirmed, routing_announce)` | [`d739e0f`](https://github.com/Journeycake/dratchet/commit/d739e0f7d688b6c4cc0fa0c1037400b205318f32) | this doc |
 | DRA-0067 | Medium | `ui/src-tauri/src/lib.rs:821 (poll_loop reconnect)` | [`bc8e05b`](https://github.com/Journeycake/dratchet/commit/bc8e05b4e85ca4fa6e09929be07c26fd46c58009) | this doc |
 | DRA-0068 | Medium | `client/src/net.rs:81 (Connection::connect_with_timeout); ui/src-tauri/src/lib.rs:833 (poll_loop reconnect)` | [`970ffcc`](https://github.com/Journeycake/dratchet/commit/970ffcc9436f63178c35bafdaf5fc6ba1c64f0d9) | this doc |
+| DRA-0069 | High | `client/src/net.rs:80 (is_server_push), client/src/net.rs:188 (Connection::recv_raw)` | [`3bbfc72`](https://github.com/Journeycake/dratchet/commit/3bbfc72306352c60957c1c8b825671651dd1da28) | this doc |
+| DRA-0070 | Low | `app/src/lib.rs:1586 (throttle_profile_notices); store/src/profile.rs:439 (profile notice state)` | [`042e5a4`](https://github.com/Journeycake/dratchet/commit/042e5a4b8aabdb9cd89b2db7f5438a758c2a93d1) | this doc |
 
 
 ## Summary
@@ -4454,7 +4456,7 @@ Validation: `ui/src-tauri` `cargo fmt --check`, `cargo clippy --all-targets -- -
 ### Known residual scope
 
 - **Commands still wait while a reconnect holds the account lock.** That includes connecting itself, with no time limit on the attempt (DRA-0068).
-- **The order is a convention, not enforced.** A future code path that holds the account lock while waiting for the connection lock would bring it back. One lock around both would rule that out, at the cost of serializing reads behind the network.
+- ~~**The order is a convention, not enforced.**~~ Closed later (roadmap item 7): the connection and the account now sit behind a single `session` lock in `ui/src-tauri`, so there is no order to get wrong. Account-only reads already waited behind network work, since the poll loop held the account during every exchange.
 
 ## DRA-0068: a server that accepted connections but never answered froze the desktop app (DRA-0061's residual, extended to connecting; confirmed real, fixed) — **MEDIUM**
 
@@ -4482,4 +4484,61 @@ Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D w
 
 - **Authenticating still holds the account lock.** A server that completes the WebSocket handshake and then goes silent makes commands that need the account wait up to `REQUEST_TIMEOUT` per step. That's bounded, but noticeable.
 - **20 seconds is a constant**, as in DRA-0061.
+
+## DRA-0069: any account could knock another user's connection permanently out of step with one relayed frame (DRA-0061 residual; confirmed real, fixed) — **HIGH**
+
+> **DRA-0069** · Location: `client/src/net.rs:80 (is_server_push), client/src/net.rs:188 (Connection::recv_raw)` · Fix: [`3bbfc72`](https://github.com/Journeycake/dratchet/commit/3bbfc72306352c60957c1c8b825671651dd1da28)
+
+Every exchange on `net::Connection` is request/response, and `recv` took the next frame off the socket, whatever it was. But the server also sends frames nobody asked for: `RendezvousOffer` and `RendezvousAnswer` relayed from another account (`relay_to_peer`), and `PresenceUpdate`s to subscribers. Relaying a rendezvous frame needs only fetch evidence (`authorize_rendezvous`), so any account that knows a user's `username#NNNN` can fetch their bundle and push a frame into their live connection. The desktop app uses neither rendezvous nor presence, so nothing on its side expects one.
+
+The victim's next request read the pushed frame as its reply and failed to decode it. Its real reply stayed queued and was read by the request after, which failed the same way. From then on every exchange got the previous one's reply. These are protocol errors, which correctly don't trigger a reconnect (DRA-0058), so the desktop app stayed broken until something else replaced the connection: no mail received, no sends, no prekey upkeep. The server's rendezvous rate limit (a burst of 10) is no obstacle, since one frame is enough.
+
+Rated **High**: a remote attacker with nothing more than an account and the victim's handle can deny service to any online user, indefinitely. Where two consecutive replies have the same type (an `Ack` read as another request's `Ack`), a request could also be reported with the wrong outcome; that wasn't separately demonstrated.
+
+### Confirmation
+
+`app/tests/unsolicited_push_desync.rs`, `an_unsolicited_relayed_frame_does_not_knock_the_connection_out_of_step`. Alice registers and stays connected. Mallory fetches Alice's bundle by handle and relays one `RendezvousOffer` at her (the server reports it delivered). Alice then does three rounds of the desktop poll loop's own work: a prekey check and an inbox scan. Before the fix, all six calls failed with "body did not decode as expected CBOR shape", and the test failed with its `VULNERABILITY:` assertion. With only the new check disabled (`is_server_push` returning false), it fails the same way.
+
+### Fixed
+
+`Connection::recv_raw` sets aside any frame whose type is a server push (`is_server_push`: `RendezvousOffer`, `RendezvousAnswer`, `PresenceUpdate`) instead of returning it, so a pushed frame is never read as a reply. The frames aren't lost: `take_pushes()` returns them, oldest first, keeping at most 64 (`MAX_HELD_PUSHES`) and dropping the oldest beyond that. The request timeout (DRA-0061) now covers the whole wait, so a stream of pushes can't stretch it.
+
+Guards, in the same file:
+- `a_pushed_frame_is_kept_for_take_pushes`: the relayed offer is retrievable, with its content, exactly once.
+- `pushed_frames_do_not_extend_the_request_timeout`: a stand-in server that never replies but pushes a presence update every 200 ms still times out on schedule.
+
+Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (347 passed).
+
+### Known residual scope
+
+- **Anyone with a user's handle can still push frames at them.** The client now ignores them, but the server still relays up to its rate limit. Restricting rendezvous to verified contacts would be a server-side change to the rendezvous design.
+- **Nothing reads the set-aside frames yet.** The desktop app never calls `take_pushes`, so pushed frames are held (at most 64) and dropped. That's by design until direct P2P (Tier 0) or presence lands.
+
+## DRA-0070: a contact could flood your notifications with handle changes (`ARCHITECTURE.md` §10 open item; confirmed real, fixed) — **LOW**
+
+> **DRA-0070** · Location: `app/src/lib.rs:1586 (throttle_profile_notices); store/src/profile.rs:439 (profile notice state)` · Fix: [`042e5a4`](https://github.com/Journeycake/dratchet/commit/042e5a4b8aabdb9cd89b2db7f5438a758c2a93d1)
+
+Every `ProfileAnnounce` from a contact whose handle differed from the stored one was recorded and returned as a `ProfileChangeNotice`, which the desktop app shows as a toast. Nothing limited how many. A contact could rename themselves in a loop and raise one notice per message. `ARCHITECTURE.md` §10 had listed this as a deferred low-severity item.
+
+Rated **Low**: it needs an existing contact, and the harm is notification and storage churn, not disclosure or loss.
+
+### Confirmation
+
+`app/tests/profile_announce_flood.rs`, `a_contact_cannot_flood_handle_change_notices`. After pairing settles, Alice sends 20 handle changes and Bob reads his mail as the desktop loop does. Before the fix he was given 20 notices, and the test failed with its `VULNERABILITY:` assertion. With only the new throttle disabled, it fails the same way.
+
+### Fixed
+
+`receive_pending` passes its handle changes through `throttle_profile_notices`:
+- **The contact is always updated.** The contact list shows the newest handle, as before.
+- **At most one notice per contact per 10 minutes** (`PROFILE_NOTICE_INTERVAL_SECS`), and at most one per pass. Each notice runs from the handle last shown to the current one. The time and handle of the last notice are stored per contact in the encrypted contacts scope.
+- **A change inside the window isn't hidden.** It's announced on the first pass after the window ends, so a contact can't rename once (notice shown) and then quickly again (no notice) to slip a second change past you.
+
+Guard: `a_change_inside_the_quiet_period_is_announced_once_it_ends`. The existing `profile_reconciliation` tests, where a single change notifies immediately, pass unchanged.
+
+Validation: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (349 passed).
+
+### Known residual scope
+
+- **Each announce still writes the contact record.** That's bounded by how much mail the relay lets a contact send (DRA-0017, DRA-0018), the same as chat messages.
+- **A rename sent while Bob's side is mid-switch to the Conversation Mailbox is lost.** As seen while writing this test, a control message during that handover suffers the same problem as DRA-0066, whose re-send covers chat sends only.
 
